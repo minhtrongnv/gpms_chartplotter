@@ -1,0 +1,409 @@
+//! Render-engine resolver: turns the S-52 semantics carried by Surface calls
+//! into drawable facts for pixel surfaces — color token -> RGB at the scene
+//! palette, and the mariner display gates (display category, viewing groups,
+//! SCAMIN) evaluated at the scene zoom.
+//!
+//! Tile surfaces (MVT/MLT) never resolve: they serialize tokens/names verbatim
+//! and the MapLibre client resolves live (the color tables + the
+//! mariner expressions). The resolver mirrors those exact semantics so the
+//! two styling paths can't silently drift; each gate cites the expression it
+//! mirrors.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const rs = @import("surface.zig");
+const mariner = @import("style").mariner;
+
+pub const Settings = mariner.Settings;
+
+// ---- colors ---------------------------------------------------------------
+
+/// The three S-52 palettes (S-101 ColorProfiles/colorProfile.xml).
+pub const PaletteId = enum(u2) { day, dusk, night };
+
+pub const Rgb = struct { r: u8, g: u8, b: u8 };
+
+/// Token -> RGB for all three palettes, parsed once from colorProfile.xml —
+/// the same source style.colorTablesJson serializes for the MapLibre client
+/// (parse mirrored from src/style/style.zig; keep in sync). Token keys are
+/// slices INTO `xml`, so the xml must outlive the Colors (the embedded
+/// catalogue profile is static, so this is free in practice).
+pub const Colors = struct {
+    maps: [3]std.StringHashMapUnmanaged(Rgb),
+
+    const xml_names = [3][]const u8{ "Day", "Dusk", "Night" };
+
+    pub fn init(a: Allocator, xml: []const u8) !Colors {
+        var c = Colors{ .maps = .{ .empty, .empty, .empty } };
+        errdefer c.deinit(a);
+        for (xml_names, 0..) |name, i| {
+            const block = findPalette(xml, name) orelse continue;
+            try collectItems(a, block, &c.maps[i]);
+        }
+        return c;
+    }
+
+    pub fn deinit(self: *Colors, a: Allocator) void {
+        for (&self.maps) |*m| m.deinit(a);
+    }
+
+    /// Resolve a color token (e.g. "DEPMS") at a palette; null for an unknown
+    /// token — the caller decides the fallback (the style uses magenta #ff00ff
+    /// to make unmapped tokens visible; a pixel surface should do the same).
+    pub fn get(self: *const Colors, palette: PaletteId, token: []const u8) ?Rgb {
+        return self.maps[@intFromEnum(palette)].get(token);
+    }
+};
+
+// Read the decimal byte inside the first <tag>NNN</tag> within `s` — the
+// <red>/<green>/<blue> children of an <item>'s <srgb> block (unambiguous: the
+// sibling <cie> block carries <x>/<y>/<L>). Mirrors style.zig tagByte.
+fn tagByte(s: []const u8, comptime tag: []const u8) ?u8 {
+    const open = "<" ++ tag ++ ">";
+    const i = std.mem.indexOf(u8, s, open) orelse return null;
+    const rest = s[i + open.len ..];
+    const close = std.mem.indexOfScalar(u8, rest, '<') orelse return null;
+    const num = std.mem.trim(u8, rest[0..close], " \t\r\n");
+    return std.fmt.parseInt(u8, num, 10) catch null;
+}
+
+// The slice of `xml` covering one <palette name="NAME"> … </palette>.
+fn findPalette(xml: []const u8, name: []const u8) ?[]const u8 {
+    var buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buf, "<palette name=\"{s}\"", .{name}) catch return null;
+    const start = std.mem.indexOf(u8, xml, needle) orelse return null;
+    const after = xml[start..];
+    const end = std.mem.indexOf(u8, after, "</palette>") orelse after.len;
+    return after[0..end];
+}
+
+fn collectItems(a: Allocator, block: []const u8, map: *std.StringHashMapUnmanaged(Rgb)) !void {
+    const open = "<item token=\"";
+    var rest = block;
+    while (std.mem.indexOf(u8, rest, open)) |ti| {
+        const after = rest[ti + open.len ..];
+        const q = std.mem.indexOfScalar(u8, after, '"') orelse break;
+        const token = after[0..q];
+        const item_end = std.mem.indexOf(u8, after, "</item>") orelse after.len;
+        const item = after[0..item_end];
+        rest = after[item_end..];
+        const r = tagByte(item, "red") orelse continue;
+        const g = tagByte(item, "green") orelse continue;
+        const b = tagByte(item, "blue") orelse continue;
+        try map.put(a, token, .{ .r = r, .g = g, .b = b });
+    }
+}
+
+// ---- depth shading (SEABED01) ------------------------------------------------
+
+/// S-52 SEABED01: a depth area's DRVAL1/DRVAL2 against the mariner's contours ->
+/// a depth colour token. Mirrors mariner.seabedTokenExpr (the `case` the MapLibre
+/// client evaluates on the tile's drval1/drval2 props) — keep the two in step.
+///
+/// The rules bake the fill token against the FIXED bake context (portray.Context's
+/// defaults: safety/deep 30 m, shallow 2 m), because a baked tile must serve every
+/// mariner. So the baked token is NOT the mariner's shading, and a resolving surface
+/// has to redo this the way the style does: deepest band first, `>=` on DRVAL1 and
+/// `>` on DRVAL2 per spec, so an area whose range straddles a contour takes the
+/// SHALLOWER shade.
+pub fn seabedToken(d: rs.DepthRange, m: *const Settings) []const u8 {
+    const d1: f64 = d.d1;
+    const d2: f64 = d.d2;
+    const band = struct {
+        fn at(dd1: f64, dd2: f64, x: f64) bool {
+            return dd1 >= x and dd2 > x;
+        }
+    }.at;
+    if (!m.four_shade_water) {
+        if (band(d1, d2, m.safety_contour)) return "DEPDW";
+        if (band(d1, d2, 0)) return "DEPVS";
+        return "DEPIT";
+    }
+    // S-52 orders the ladder shallow <= safety <= deep. Un-normalized, a
+    // safety contour DEEPER than the deep contour let the deep test match
+    // first and shaded genuinely UNSAFE water in the white deep shade.
+    const eff_deep = @max(m.deep_contour, m.safety_contour);
+    const eff_shallow = @min(m.shallow_contour, m.safety_contour);
+    if (band(d1, d2, eff_deep)) return "DEPDW";
+    if (band(d1, d2, m.safety_contour)) return "DEPMD";
+    if (band(d1, d2, eff_shallow)) return "DEPMS";
+    if (band(d1, d2, 0)) return "DEPVS";
+    return "DEPIT";
+}
+
+// ---- display gates ----------------------------------------------------------
+
+/// S-52 §10.3.4 display-category gate — mirrors mariner.categoryFilter:
+/// the effective category is the feature's `cat` (0 base / 1 standard /
+/// 2 other; null defaults to standard, like the style's coalesce), except
+/// ISODGR01 which rides the isolated-dangers-shallow toggle instead of its
+/// baked category. The data-quality overlay is shown iff the overlay is on
+/// (then regardless of category), hidden otherwise.
+pub fn categoryVisible(cat: ?i64, class: []const u8, symbol_name: ?[]const u8, m: *const Settings) bool {
+    if (mariner.isDataQuality(class)) return m.data_quality;
+    // Meta-object boundaries (mirrors mariner.commonChartFilters): hidden unless
+    // the meta-bounds inspection view is on; when on, category still applies.
+    if (!m.show_meta_bounds) {
+        for ([_][]const u8{ "M_NPUB", "M_NSYS", "M_COVR", "M_CSCL" }) |mc| {
+            if (std.mem.eql(u8, class, mc)) return false;
+        }
+    }
+    // Spot soundings ride their own switch when the host set one: S-52 files SOUNDG under the
+    // OTHER category, but a mariner asking for soundings is not asking for the seabed and the
+    // cables too. `show_soundings == null` keeps the old behaviour (follow the category).
+    if (std.mem.eql(u8, class, "SOUNDG")) {
+        if (m.show_soundings) |on| return on;
+    }
+    var c = cat orelse 1;
+    if (symbol_name) |sn| {
+        if (std.mem.eql(u8, sn, "ISODGR01")) c = if (m.show_isolated_dangers_shallow) 1 else 0;
+    }
+    return switch (c) {
+        0 => m.display_base,
+        1 => m.display_standard,
+        2 => m.display_other,
+        else => false,
+    };
+}
+
+/// 1:N scale denominator of the whole world in one 256px tile at z0 — the
+/// constant the style's SCAMIN gate divides by (style/maplibre.zig SCAMIN_GATE).
+pub const DENOM_Z0 = 279541132.0;
+
+/// SCAMIN gate at a (fractional) display zoom — mirrors the style expression
+/// `zoom >= log2(DENOM_Z0 / scamin)` (style/maplibre.zig SCAMIN_GATE). A feature
+/// without SCAMIN (null) always shows.
+pub fn scaminVisible(scamin: ?i64, zoom: f64) bool {
+    const s = scamin orelse return true;
+    if (s <= 0) return true;
+    return zoom >= std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(s)));
+}
+
+/// Overscale gate (S-52 §10.1.10.2) — the AP(OVERSC01) hatch over a cell's M_COVR
+/// coverage shows only while the display is grossly overscale: denom(zoom) < oscl,
+/// i.e. zoom > log2(DENOM_Z0 / oscl). `oscl` is the baked X2 gate denominator
+/// (bake_enc.overscaleGateDenom = cscl/OVERSCALE_FACTOR), so this fires from X2 and
+/// NEVER before 1x compilation scale. The style clause is a strict `>` (oscl >
+/// DENOM); oscl 0 (unknown) never shows. Mirrors style/maplibre.zig writeOsclClause.
+pub fn osclVisible(oscl: i64, zoom: f64) bool {
+    if (oscl <= 0) return false;
+    return zoom > std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(oscl)));
+}
+
+/// Viewing-group gate (S-52 §14.5) — the deny-list model of
+/// mariner.Settings.viewing_groups_off (the host's viewingGroupsOff model):
+/// a feature with no viewing group (vg 0) always shows; otherwise it hides iff
+/// its group is in the mariner's off-list. Any group not listed defaults ON.
+pub fn viewingGroupVisible(vg: i64, off: ?[]const i32) bool {
+    if (vg == 0) return true;
+    const list = off orelse return true;
+    for (list) |g| {
+        if (g == vg) return false;
+    }
+    return true;
+}
+
+/// S-52 §14.5 text-group gate — mirrors mariner.textGroupFilter: important
+/// text (group 11) is always on; 21/26/29 ride text_names; 23 rides
+/// show_light_descriptions; everything else rides text_other.
+pub fn textGroupVisible(group: i64, m: *const Settings) bool {
+    if (group == 11) return true;
+    if (group == 21 or group == 26 or group == 29) return m.text_names;
+    if (group == 23) return m.show_light_descriptions;
+    return m.text_other;
+}
+
+/// Combined per-feature gate for pixel surfaces: display category + viewing
+/// group + SCAMIN at the scene zoom. `symbol_name` is the symbol about to be
+/// drawn (null for fills/lines/text) — only consulted for the ISODGR01 case.
+pub fn visible(meta: *const rs.FeatureMeta, symbol_name: ?[]const u8, zoom: f64, m: *const Settings) bool {
+    if (!categoryVisible(meta.display_category, meta.class, symbol_name, m)) return false;
+    if (!viewingGroupVisible(meta.vg, m.viewing_groups_off)) return false;
+    if (!m.ignore_scamin and !scaminVisible(meta.scamin, zoom)) return false;
+    // The AP(OVERSC01) overscale hatch (S-52 §10.1.10): the mariner toggle, plus
+    // the oscl scale gate. Hidden under ignore_scamin (the debug toggle drops all
+    // scale gating — an always-on hatch would bury the debug view), mirroring the
+    // style builder, which omits the overscale layer entirely there.
+    if (meta.overscale) {
+        if (!m.show_overscale or m.ignore_scamin) return false;
+        if (!osclVisible(meta.oscl, zoom)) return false;
+    }
+    // S-52 display-variant passes (mirrors mariner.boundaryFilter /
+    // pointStyleFilter): a feature portrayed twice carries bnd 1/0 (symbolized/
+    // plain boundary) or pts 0/1 (paper/simplified points); show the common
+    // pass (2) + the mariner's active style — otherwise both passes double-draw.
+    const bnd_rank: i64 = if (m.boundary_style == .plain) 0 else 1;
+    if (meta.bnd != 2 and meta.bnd != bnd_rank) return false;
+    const pts_rank: i64 = if (m.simplified_points) 1 else 0;
+    if (meta.pts != 2 and meta.pts != pts_rank) return false;
+    // Sector-leg length (S-52 §12.2.4, mirrors mariner.sectorFilter): a
+    // sectored light portrays its legs twice — sect 0 (the 25 mm stubs) and
+    // sect 1 (the full-length pass) — and without this gate both drew, so
+    // full sector lines showed whichever way the switch stood.
+    const sect_rank: i64 = if (m.show_full_sector_lines) 1 else 0;
+    if (meta.sect != 2 and meta.sect != sect_rank) return false;
+    return true;
+}
+
+// ---- tests ------------------------------------------------------------------
+
+const fixture_xml =
+    \\<cp:colorProfile>
+    \\ <palette name="Day">
+    \\  <item token="DEPMS"><srgb><red>197</red><green>225</green><blue>225</blue></srgb></item>
+    \\  <item token="CHBLK"><srgb><red>0</red><green>0</green><blue>0</blue></srgb></item>
+    \\ </palette>
+    \\ <palette name="Dusk">
+    \\  <item token="DEPMS"><srgb><red>65</red><green>85</green><blue>90</blue></srgb></item>
+    \\ </palette>
+    \\ <palette name="Night">
+    \\  <item token="DEPMS"><srgb><red>25</red><green>35</green><blue>40</blue></srgb></item>
+    \\ </palette>
+    \\</cp:colorProfile>
+;
+
+test "Colors: token -> RGB per palette, unknown -> null" {
+    const a = std.testing.allocator;
+    var c = try Colors.init(a, fixture_xml);
+    defer c.deinit(a);
+    try std.testing.expectEqual(Rgb{ .r = 197, .g = 225, .b = 225 }, c.get(.day, "DEPMS").?);
+    try std.testing.expectEqual(Rgb{ .r = 0, .g = 0, .b = 0 }, c.get(.day, "CHBLK").?);
+    try std.testing.expectEqual(Rgb{ .r = 65, .g = 85, .b = 90 }, c.get(.dusk, "DEPMS").?);
+    try std.testing.expectEqual(Rgb{ .r = 25, .g = 35, .b = 40 }, c.get(.night, "DEPMS").?);
+    try std.testing.expectEqual(@as(?Rgb, null), c.get(.dusk, "CHBLK")); // dusk fixture lacks it
+    try std.testing.expectEqual(@as(?Rgb, null), c.get(.day, "NOSUCH"));
+}
+
+test "soundings ride their own switch, not the OTHER category" {
+    // The everyday ECDIS setting: STANDARD category, soundings ON. Before the switch existed a
+    // host had to turn OTHER on for this, and got the seabed/cables/clutter with it.
+    const std_plus_soundings = Settings{ .display_other = false, .show_soundings = true };
+    try std.testing.expect(categoryVisible(2, "SOUNDG", null, &std_plus_soundings));
+    try std.testing.expect(!categoryVisible(2, "OBSTRN", null, &std_plus_soundings)); // rest of OTHER stays off
+    try std.testing.expect(categoryVisible(1, "DEPCNT", null, &std_plus_soundings)); // standard unaffected
+
+    // ...and the reverse: the whole OTHER category on, but soundings explicitly off.
+    const other_no_soundings = Settings{ .display_other = true, .show_soundings = false };
+    try std.testing.expect(!categoryVisible(2, "SOUNDG", null, &other_no_soundings));
+    try std.testing.expect(categoryVisible(2, "OBSTRN", null, &other_no_soundings));
+
+    // null (a host that never set it) = the old behaviour: soundings follow the category.
+    const legacy_std = Settings{ .display_other = false };
+    const legacy_other = Settings{ .display_other = true };
+    try std.testing.expect(!categoryVisible(2, "SOUNDG", null, &legacy_std));
+    try std.testing.expect(categoryVisible(2, "SOUNDG", null, &legacy_other));
+}
+
+test "seabedToken mirrors mariner.seabedTokenExpr" {
+    const four = Settings{ .shallow_contour = 2, .safety_contour = 10, .deep_contour = 30 };
+    const dr = struct {
+        fn r(d1: f32, d2: f32) rs.DepthRange {
+            return .{ .d1 = d1, .d2 = d2 };
+        }
+    }.r;
+    // The four bands + the drying/intertidal fallthrough.
+    try std.testing.expectEqualStrings("DEPDW", seabedToken(dr(30, 100), &four));
+    try std.testing.expectEqualStrings("DEPMD", seabedToken(dr(10, 30), &four));
+    try std.testing.expectEqualStrings("DEPMS", seabedToken(dr(2, 10), &four));
+    try std.testing.expectEqualStrings("DEPVS", seabedToken(dr(0, 2), &four));
+    try std.testing.expectEqualStrings("DEPIT", seabedToken(dr(-5, 0), &four));
+    // An area straddling a contour takes the SHALLOWER shade (DRVAL2 > x fails at
+    // the bound): 20..40 spans the 30 m deep contour, so DEPMD, not DEPDW.
+    try std.testing.expectEqualStrings("DEPMD", seabedToken(dr(20, 40), &four));
+    // Two-shade water: safety contour is the only split, and deep_contour is ignored.
+    const two = Settings{ .safety_contour = 10, .deep_contour = 30, .four_shade_water = false };
+    try std.testing.expectEqualStrings("DEPDW", seabedToken(dr(10, 30), &two));
+    try std.testing.expectEqualStrings("DEPVS", seabedToken(dr(0, 10), &two));
+    try std.testing.expectEqualStrings("DEPIT", seabedToken(dr(-2, 0), &two));
+    // The mariner's contours actually move the bands: a 12 m area is medium-deep at a
+    // 10 m safety contour, but DEEP once the mariner pulls the deep contour in to 10.
+    const shoal = Settings{ .shallow_contour = 2, .safety_contour = 5, .deep_contour = 10 };
+    try std.testing.expectEqualStrings("DEPDW", seabedToken(dr(12, 20), &shoal));
+    try std.testing.expectEqualStrings("DEPMD", seabedToken(dr(12, 20), &four));
+}
+
+test "categoryVisible mirrors mariner.categoryFilter" {
+    const def = Settings{}; // base+standard on, other off, no overlays
+    try std.testing.expect(categoryVisible(0, "DEPARE", null, &def));
+    try std.testing.expect(categoryVisible(1, "DEPARE", null, &def));
+    try std.testing.expect(!categoryVisible(2, "DEPARE", null, &def));
+    try std.testing.expect(categoryVisible(null, "DEPARE", null, &def)); // null -> standard
+    // M_QUAL: data-quality overlay only.
+    try std.testing.expect(!categoryVisible(0, "M_QUAL", null, &def));
+    const dq = Settings{ .data_quality = true };
+    try std.testing.expect(categoryVisible(2, "M_QUAL", null, &dq)); // shown regardless of cat
+    // The same feature under S-101, which names it QualityOfBathymetricData.
+    try std.testing.expect(!categoryVisible(0, "QualityOfBathymetricData", null, &def));
+    try std.testing.expect(!categoryVisible(2, "QualityOfBathymetricData", null, &def));
+    try std.testing.expect(categoryVisible(2, "QualityOfBathymetricData", null, &dq));
+    // ISODGR01 rides its own toggle: off -> cat 0 (base on -> visible);
+    // base ALSO off -> hidden; toggle on -> cat 1 (standard).
+    try std.testing.expect(categoryVisible(2, "UWTROC", "ISODGR01", &def));
+    const no_base = Settings{ .display_base = false };
+    try std.testing.expect(!categoryVisible(2, "UWTROC", "ISODGR01", &no_base));
+    const iso = Settings{ .display_base = false, .show_isolated_dangers_shallow = true };
+    try std.testing.expect(categoryVisible(2, "UWTROC", "ISODGR01", &iso));
+}
+
+test "scaminVisible mirrors the style SCAMIN_GATE" {
+    // 1:30000 gates at log2(279541132/30000) ~= 13.186.
+    try std.testing.expect(!scaminVisible(30000, 13.0));
+    try std.testing.expect(scaminVisible(30000, 13.2));
+    try std.testing.expect(scaminVisible(null, 0)); // no SCAMIN -> always
+    try std.testing.expect(scaminVisible(0, 0)); // degenerate 0 -> always
+}
+
+test "osclVisible: the X2 hatch never fires at/below 1x, fires past 2x" {
+    // A 1:260000 cell bakes oscl = cscl / OVERSCALE_FACTOR (X2) = 130000 (see
+    // bake_enc.overscaleGateDenom). The hatch (denom < oscl) must:
+    //   - stay OFF at & below 1x compilation scale (denom >= 260000), and
+    //   - turn ON only once grossly overscale (denom < 130000, i.e. X2+).
+    const cscl: i64 = 260000;
+    const oscl: i64 = @divTrunc(cscl, 2); // 130000
+    const z_1x = std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(cscl))); // denom == cscl
+    const z_2x = std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(oscl))); // denom == cscl/2
+    // At and below 1x: no hatch (the "no hatch at/below 1x cscl" pin).
+    try std.testing.expect(!osclVisible(oscl, z_1x - 0.5));
+    try std.testing.expect(!osclVisible(oscl, z_1x));
+    // Between 1x and 2x: still no hatch (not yet grossly overscale, §10.1.10.2).
+    try std.testing.expect(!osclVisible(oscl, (z_1x + z_2x) / 2.0));
+    // Exactly at 2x: strict `>` -> off; just past 2x: on.
+    try std.testing.expect(!osclVisible(oscl, z_2x));
+    try std.testing.expect(osclVisible(oscl, z_2x + 0.5));
+    // Unknown scale never hatches.
+    try std.testing.expect(!osclVisible(0, 16.0));
+}
+
+test "visible: the overscale hatch honours show_overscale + the oscl gate" {
+    const m = Settings{};
+    // Baked X2 gate denom for a 1:260000 cell (cscl/OVERSCALE_FACTOR = 130000).
+    // z_2x ~= log2(279541132/130000) ~= 11.07 — grossly overscale past there.
+    const hatch = rs.FeatureMeta{ .display_category = 0, .oscl = 130000, .overscale = true };
+    try std.testing.expect(!visible(&hatch, null, 10.5, &m)); // < 2x: no hatch
+    try std.testing.expect(visible(&hatch, null, 12.0, &m)); // grossly overscale: hatch shows
+    const off = Settings{ .show_overscale = false };
+    try std.testing.expect(!visible(&hatch, null, 12.0, &off));
+    const ign = Settings{ .ignore_scamin = true };
+    try std.testing.expect(!visible(&hatch, null, 12.0, &ign)); // debug view: no hatch
+    // An ordinary fill carrying the oscl TAG (not the hatch) is never oscl-gated.
+    const fill = rs.FeatureMeta{ .display_category = 0, .oscl = 130000 };
+    try std.testing.expect(visible(&fill, null, 10.5, &m));
+    try std.testing.expect(visible(&fill, null, 12.0, &m));
+}
+
+test "viewingGroupVisible: deny-list, vg 0 always shows" {
+    const off = [_]i32{ 21030, 26050 };
+    try std.testing.expect(viewingGroupVisible(0, &off));
+    try std.testing.expect(!viewingGroupVisible(21030, &off));
+    try std.testing.expect(viewingGroupVisible(27010, &off));
+    try std.testing.expect(viewingGroupVisible(21030, null)); // no list -> all on
+}
+
+test "visible combines gates + honours ignore_scamin" {
+    const m = Settings{};
+    const meta = rs.FeatureMeta{ .display_category = 1, .vg = 0, .scamin = 30000, .class = "BOYLAT" };
+    try std.testing.expect(!visible(&meta, "BOYLAT01", 12.0, &m)); // SCAMIN gates it
+    try std.testing.expect(visible(&meta, "BOYLAT01", 14.0, &m));
+    const ig = Settings{ .ignore_scamin = true };
+    try std.testing.expect(visible(&meta, "BOYLAT01", 12.0, &ig));
+}

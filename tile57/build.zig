@@ -1,0 +1,1193 @@
+const std = @import("std");
+/// Read for `.version`, the dev sentinel a source build reports. A release
+/// passes the tag as `-Dversion`.
+const zon = @import("build.zig.zon");
+
+// The vendored S-101 PortrayalCatalog, relative to the engine/ build root. Its
+// Rules (Lua) + Symbols/LineStyles/AreaFills/ColorProfiles (assets) are embedded
+// into the binary so tile57 portrays + styles charts with no on-disk catalogue.
+//
+// Two sources, same upstream commit: a dev checkout has it as the git submodule
+// below; a *fetched* tile57 package does not (zig's fetcher skips git
+// submodules, and the package excludes it from `paths`), so build() falls back
+// to the `s101_portrayal` lazy dependency in build.zig.zon. See resolveCatalog.
+const PORTRAYAL_CATALOG = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog";
+
+// Where the PortrayalCatalog actually is for THIS build: `.b` is the builder
+// whose root the relative `.root` resolves under (the tile57 build itself for
+// the submodule, the s101_portrayal dependency's builder for the fetched
+// fallback) — embedDir walks and @embedFile's through it. Null means the lazy
+// dependency fetch was just scheduled and build() must return so zig can re-run
+// it with the package on disk.
+const Catalog = struct { b: *std.Build, root: []const u8 };
+fn resolveCatalog(b: *std.Build) ?Catalog {
+    // Probe a directory only an *initialized* submodule has (a plain clone
+    // leaves vendor/S-101_Portrayal-Catalogue as an empty directory).
+    const probe = b.pathFromRoot(PORTRAYAL_CATALOG ++ "/Rules");
+    if (std.Io.Dir.openDirAbsolute(b.graph.io, probe, .{})) |dir| {
+        var d = dir;
+        d.close(b.graph.io);
+        return .{ .b = b, .root = PORTRAYAL_CATALOG };
+    } else |_| {}
+    const dep = b.lazyDependency("s101_portrayal", .{}) orelse return null;
+    return .{ .b = dep.builder, .root = "PortrayalCatalog" };
+}
+
+// libtess2 (vendored, SGI Free Software License B — vendor/libtess2/LICENSE.txt).
+// The polygon tessellator behind the GPU surface: contours in, triangles out,
+// with the winding rules S-52 needs (even-odd for glyph/symbol outlines with
+// counters, nonzero for area fills). Vendored as C for now; a Zig port is its
+// own change, and once it lands it is also a candidate to replace the
+// hand-rolled sweep in src/geometry.
+const tess_sources = [_][]const u8{
+    "bucketalloc.c", "dict.c", "geom.c", "mesh.c", "priorityq.c", "sweep.c", "tess.c",
+};
+
+// Cross-compiling to a non-macOS Apple target (`-Dtarget=aarch64-ios[-simulator]`)
+// needs that SDK's libc headers — Zig only bundles Apple headers for macOS. Pass
+// `--sysroot "$(xcrun --sdk iphoneos --show-sdk-path)"` and every C-compiling
+// module picks the headers up here (a no-op when no sysroot is given).
+fn addSysrootIncludes(b: *std.Build, mod: *std.Build.Module) void {
+    const sysroot = b.sysroot orelse return;
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
+}
+
+// setjmp/longjmp on wasm: the exception-handling feature + clang's sjlj
+// lowering pass, PER FILE. wasm-use-legacy-eh=false emits the STANDARDIZED
+// instructions (try_table over exnref — browsers deprecate the legacy `try`),
+// which also need the reference-types feature. The raw -Xclang pairs
+// re-enable both features at the cc1 level — zig appends its own disabling
+// `-target-feature` flags (derived from the module target, which keeps
+// default features so Zig's wasi-libc build never sees them and never
+// compiles its broken sjlj runtime) after the driver-level -m flags, and the
+// LAST cc1 flag wins; raw -Xclang pairs in the file flags land after zig's
+// and win the features back. The driver-level -m flags still matter: they
+// define __wasm_exception_handling__, which wasi's setjmp.h gates on.
+const wasm_sjlj_flags = [_][]const u8{
+    "-mexception-handling", "-mreference-types",
+    "-mllvm",               "-wasm-enable-sjlj",
+    "-mllvm",               "-wasm-use-legacy-eh=false",
+    "-Xclang",              "-target-feature",
+    "-Xclang",              "+exception-handling",
+    "-Xclang",              "-target-feature",
+    "-Xclang",              "+reference-types",
+};
+
+// `wasm`: sweep.c/tess.c bail out of the tessellation on OOM via
+// setjmp/longjmp, which wasm only has through the sjlj lowering above.
+fn addTess(b: *std.Build, mod: *std.Build.Module, wasm: bool) void {
+    mod.link_libc = true; // libtess2 uses assert.h/stdio.h/stdlib.h
+    addSysrootIncludes(b, mod);
+    mod.addIncludePath(b.path("vendor/libtess2/Include"));
+    mod.addIncludePath(b.path("vendor/libtess2/Source"));
+    var flags = std.ArrayList([]const u8).empty;
+    flags.appendSlice(b.allocator, &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" }) catch @panic("OOM");
+    if (wasm) flags.appendSlice(b.allocator, &wasm_sjlj_flags) catch @panic("OOM");
+    mod.addCSourceFiles(.{
+        .root = b.path("vendor/libtess2/Source"),
+        .files = &tess_sources,
+        .flags = flags.items,
+    });
+}
+
+// Lua 5.4 core sources (vendored from lua.org), minus the standalone mains.
+const lua_sources = [_][]const u8{
+    "lapi.c",    "lauxlib.c",  "lbaselib.c", "lcode.c",    "lcorolib.c", "lctype.c",
+    "ldblib.c",  "ldebug.c",   "ldo.c",      "ldump.c",    "lfunc.c",    "lgc.c",
+    "linit.c",   "liolib.c",   "llex.c",     "lmathlib.c", "lmem.c",     "loadlib.c",
+    "lobject.c", "lopcodes.c", "loslib.c",   "lparser.c",  "lstate.c",   "lstring.c",
+    "lstrlib.c", "ltable.c",   "ltablib.c",  "ltm.c",      "lundump.c",  "lutf8lib.c",
+    "lvm.c",     "lzio.c",
+};
+
+// The distilled S-101 catalogue + S-57 numeric code tables, embedded. They live
+// under vendor/, outside any module's src/ root, so they're added as named
+// imports (catalogue.zig @embedFile's them) rather than relative @embedFile.
+fn addCatalogueJson(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addAnonymousImport("catalogue_json", .{ .root_source_file = b.path("vendor/s101/catalogue.json") });
+    mod.addAnonymousImport("s57codes_json", .{ .root_source_file = b.path("vendor/s101/s57codes.json") });
+    mod.addAnonymousImport("permitted_json", .{ .root_source_file = b.path("vendor/s101/permitted.json") });
+}
+
+// Attach the embedded Lua 5.4 interpreter + the portrayal C shim to a module.
+// Attached to the `portray` module — which both libtile57.a and the baker import
+// — so the Lua runtime is defined once and can't drift between them.
+//
+// `posix`: define LUA_USE_POSIX (Unix). On Windows it must stay OFF — forcing it
+// pulls in <unistd.h>/dlopen; without it luaconf.h auto-selects LUA_USE_WINDOWS
+// from _WIN32. lua_shim.c is already portable (only getenv + ANSI stdio).
+//
+// `wasm`: Lua's error path is setjmp/longjmp, and wasm has that only through
+// the exception-handling proposal. Compile every Lua object (and the vendored
+// sjlj runtime, src/portray/wasm_sjlj_rt.c) with the EH feature + clang's sjlj
+// lowering pass, PER FILE — the target's own feature set stays default, so
+// Zig's wasi-libc build never sees the feature (enabling it target-wide makes
+// zig 0.16 add wasi-libc's sjlj runtime to libc.a and crash compiling it).
+// wasi has no process spawn, so l_system is stubbed exactly as on iOS.
+const LuaTarget = struct { posix: bool = false, ios: bool = false, wasm: bool = false };
+fn addLua(b: *std.Build, mod: *std.Build.Module, lt: LuaTarget) void {
+    addSysrootIncludes(b, mod);
+    mod.addIncludePath(b.path("vendor/lua/src"));
+    var shim_flags = std.ArrayList([]const u8).empty;
+    shim_flags.append(b.allocator, "-fno-sanitize=undefined") catch @panic("OOM");
+    if (lt.posix) shim_flags.append(b.allocator, "-DLUA_USE_POSIX") catch @panic("OOM");
+    mod.addCSourceFile(.{ .file = b.path("src/portray/lua_shim.c"), .flags = shim_flags.items });
+    var lua_flags = std.ArrayList([]const u8).empty;
+    lua_flags.appendSlice(b.allocator, &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" }) catch @panic("OOM");
+    if (lt.posix) lua_flags.append(b.allocator, "-DLUA_USE_POSIX") catch @panic("OOM");
+    // iOS forbids system(3) (marked unavailable in the SDK); wasi has no
+    // process spawn at all. Stub loslib's l_system hook to "no shell":
+    // os.execute() reports no shell available, os.execute(cmd) fails —
+    // nothing in the portrayal path shells out anyway.
+    if (lt.ios or lt.wasm) lua_flags.append(b.allocator, "-Dl_system(cmd)=((cmd)==0?0:-1)") catch @panic("OOM");
+    if (lt.wasm) {
+        lua_flags.appendSlice(b.allocator, &wasm_sjlj_flags) catch @panic("OOM");
+        // lstate.h includes <signal.h> for sig_atomic_t (the debug-hook trap
+        // flags). wasi's signal.h is gated; the emulation define provides the
+        // types, and nothing in the embedded Lua raises a signal.
+        lua_flags.append(b.allocator, "-D_WASI_EMULATED_SIGNAL") catch @panic("OOM");
+        // wasi has no tmpnam: stub loslib's hook so os.tmpname raises a clean
+        // Lua error. Nothing in the portrayal path names temp files.
+        lua_flags.append(b.allocator, "-DLUA_TMPNAMBUFSIZE=32") catch @panic("OOM");
+        lua_flags.append(b.allocator, "-Dlua_tmpnam(b,e)={(void)(b);(e)=1;}") catch @panic("OOM");
+        // os.clock uses clock(3); wasi emulates it over the wall clock. The
+        // ROOT wasm module links the emulated lib (linkSystemLibrary needs a
+        // module with a known target; this one is target-agnostic).
+        lua_flags.append(b.allocator, "-D_WASI_EMULATED_PROCESS_CLOCKS") catch @panic("OOM");
+        mod.addCSourceFile(.{ .file = b.path("src/portray/wasm_sjlj_rt.c"), .flags = &wasm_sjlj_flags });
+        // Libc definitions wasi-libc declares but does not ship (tmpfile).
+        mod.addCSourceFile(.{ .file = b.path("src/portray/wasi_stubs.c"), .flags = &.{"-fno-sanitize=undefined"} });
+    }
+    mod.addCSourceFiles(.{
+        .root = b.path("vendor/lua/src"),
+        .files = &lua_sources,
+        .flags = lua_flags.items,
+    });
+}
+
+// Attach the vendored SVG rasterizer (nanosvg) + PNG encoder (stb_image_write)
+// behind svgraster.c to a module. Used by the `sprite` module (sprite/pattern
+// atlas generation in the bake tool). Single-header C libs; need libc.
+fn addSvgRaster(b: *std.Build, mod: *std.Build.Module) void {
+    addSysrootIncludes(b, mod);
+    mod.addIncludePath(b.path("vendor/nanosvg"));
+    mod.addIncludePath(b.path("vendor/stb"));
+    mod.addCSourceFile(.{ .file = b.path("src/sprite/svgraster.c"), .flags = &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" } });
+}
+
+// Attach the vendored SQLite amalgamation to a module. Used by the `raster`
+// module, which reads a community raster chart where it sits — MBTiles is a
+// SQLite database, and the library that reads every SQLite database reads every
+// MBTiles. Read-only and trimmed: no extension loading, no shared cache, no
+// deprecated surface. THREADSAFE=1 (serialized) because a host streams tiles
+// from a worker while its UI thread reads metadata, and a per-call mutex is
+// nothing beside a JPEG decode.
+// `wasm`: SQLite carries native wasi support (SQLITE_WASI, set from __wasi__),
+// but our explicit THREADSAFE=1 would override its single-thread default and
+// pull in pthread symbols wasi-libc does not have — so it drops to 0 there
+// (the wasm engine is single-threaded end to end).
+fn addSqlite(b: *std.Build, mod: *std.Build.Module, wasm: bool) void {
+    addSysrootIncludes(b, mod);
+    mod.addIncludePath(b.path("vendor/sqlite"));
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/sqlite/sqlite3.c"),
+        .flags = &.{
+            "-std=gnu99",
+            "-O2",
+            "-fno-sanitize=undefined",
+            if (wasm) "-DSQLITE_THREADSAFE=0" else "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_DQS=0",
+            "-DSQLITE_DEFAULT_MEMSTATUS=0",
+            "-DSQLITE_OMIT_LOAD_EXTENSION",
+            "-DSQLITE_OMIT_DEPRECATED",
+            "-DSQLITE_OMIT_SHARED_CACHE",
+            "-DSQLITE_OMIT_PROGRESS_CALLBACK",
+            "-DSQLITE_OMIT_AUTHORIZATION",
+            "-DSQLITE_OMIT_UTF16",
+        },
+    });
+}
+
+// Re-import the pure packages into a consumer module (engine, libtile57.a, the
+// baker). One list keeps the edge set in sync across all three.
+fn addPkgs(mod: *std.Build.Module, pkgs: []const std.Build.Module.Import) void {
+    for (pkgs) |p| mod.addImport(p.name, p.module);
+}
+
+// The shared MVT round-trip fixture (used by pmtiles + the mvt parity test). It
+// lives under src/testdata/, outside any single module root, so it rides as an
+// anonymous import rather than a relative @embedFile.
+fn addMvtFixture(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addAnonymousImport("mvt_fixture", .{ .root_source_file = b.path("src/testdata/annapolis_z14.mvt") });
+}
+
+// Embed every `ext` file under the build-root-relative `dir_rel` into a generated
+// Zig module that exposes:
+//     pub const Entry = struct { name: []const u8, bytes: []const u8 };
+//     pub const entries = [_]Entry{ ... };
+// where `name` is the file stem (the Lua `require` name / asset id) and `bytes`
+// is the file content, @embedFile'd. Each file rides as a tracked anonymous
+// import, so editing or adding a resource re-triggers the build. The directory is
+// walked at configure time (host fs) and the entries are sorted for a
+// reproducible build. Used to bake the S-101 portrayal catalogue (Rules, Symbols,
+// LineStyles, …) into the binary so tile57 needs no on-disk catalogue at runtime.
+fn embedDir(b: *std.Build, registry_name: []const u8, dir_rel: []const u8, ext: []const u8) *std.Build.Module {
+    const io = b.graph.io;
+    const abs = b.pathFromRoot(dir_rel);
+    var dir = std.Io.Dir.openDirAbsolute(io, abs, .{ .iterate = true }) catch |e|
+        std.debug.panic("embedDir: cannot open '{s}': {s} (run `git submodule update --init --recursive`?)", .{ abs, @errorName(e) });
+    defer dir.close(io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch |e| std.debug.panic("embedDir: iterate '{s}': {s}", .{ abs, @errorName(e) })) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ext)) continue;
+        names.append(b.allocator, b.dupe(entry.name)) catch @panic("OOM");
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lt);
+
+    var src: std.ArrayList(u8) = .empty;
+    src.appendSlice(b.allocator, "pub const Entry = struct { name: []const u8, bytes: []const u8 };\n") catch @panic("OOM");
+    src.appendSlice(b.allocator, "pub const entries = [_]Entry{\n") catch @panic("OOM");
+    for (names.items) |fname| {
+        const stem = fname[0 .. fname.len - ext.len];
+        const line = b.fmt("    .{{ .name = \"{s}\", .bytes = @embedFile(\"{s}\") }},\n", .{ stem, fname });
+        src.appendSlice(b.allocator, line) catch @panic("OOM");
+    }
+    src.appendSlice(b.allocator, "};\n") catch @panic("OOM");
+
+    const wf = b.addWriteFiles();
+    const reg_mod = b.createModule(.{ .root_source_file = wf.add(b.fmt("{s}.zig", .{registry_name}), src.items) });
+    for (names.items) |fname| {
+        reg_mod.addAnonymousImport(fname, .{ .root_source_file = b.path(b.pathJoin(&.{ dir_rel, fname })) });
+    }
+    return reg_mod;
+}
+
+// Add a `zig build test` artifact for a standalone package module. A split
+// module's `test {}` blocks do NOT run via the engine test binary (importing a
+// module doesn't pull its tests in), so each package is tested through its own
+// root with a concrete target. `imports` wire its dependency modules (the
+// target-agnostic package objects, which inherit this target). Returns the test
+// module so the caller can attach extra inputs (e.g. addCatalogueJson).
+fn addPkgTest(
+    b: *std.Build,
+    step: *std.Build.Step,
+    src: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    imports: []const std.Build.Module.Import,
+) *std.Build.Module {
+    const tm = b.createModule(.{
+        .root_source_file = b.path(src),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    });
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = tm })).step);
+    return tm;
+}
+
+// The NDK triple for an *-linux-android target, or null when the target isn't
+// android. Drives the sysroot's arch-specific include + crt subdirs.
+fn androidTriple(target: std.Build.ResolvedTarget) ?[]const u8 {
+    const t = target.result;
+    if (t.abi != .android and t.abi != .androideabi) return null;
+    return switch (t.cpu.arch) {
+        .aarch64 => "aarch64-linux-android",
+        .x86_64 => "x86_64-linux-android",
+        .x86 => "i686-linux-android",
+        .arm, .thumb => "arm-linux-androideabi",
+        else => null,
+    };
+}
+
+// Generate a Zig `--libc` config for the NDK sysroot and return it as a file the
+// caller pins to the android artifact via `setLibCFile`. The `asm/` arch headers
+// live in the triple subdir (sys_include_dir), which a plain `--sysroot` misses.
+fn ndkSysroot(b: *std.Build, ndk: []const u8) []const u8 {
+    const base = b.fmt("{s}/toolchains/llvm/prebuilt", .{ndk});
+    // The NDK ships one host toolchain dir. Probe the host-OS default FIRST (what
+    // the NDK actually ships — e.g. darwin-x86_64 even on Apple silicon) so the
+    // result is correct regardless of how accessAbsolute behaves; only fall
+    // through to alternates (a future darwin-arm64 toolchain) if it's absent.
+    const candidates: []const []const u8 = switch (@import("builtin").os.tag) {
+        .macos => &.{ "darwin-x86_64", "darwin-arm64" },
+        .windows => &.{"windows-x86_64"},
+        else => &.{ "linux-x86_64", "linux-aarch64" },
+    };
+    for (candidates) |host| {
+        const sysroot = b.fmt("{s}/{s}/sysroot", .{ base, host });
+        std.Io.Dir.accessAbsolute(b.graph.io, b.fmt("{s}/usr/include", .{sysroot}), .{}) catch continue;
+        return sysroot;
+    }
+    return b.fmt("{s}/{s}/sysroot", .{ base, candidates[0] }); // default; clear path in errors
+}
+
+fn androidLibcFile(b: *std.Build, ndk: []const u8, triple: []const u8, api: u32) std.Build.LazyPath {
+    const sysroot = ndkSysroot(b, ndk);
+    const content = b.fmt(
+        \\include_dir={s}/usr/include
+        \\sys_include_dir={s}/usr/include/{s}
+        \\crt_dir={s}/usr/lib/{s}/{d}
+        \\msvc_lib_dir=
+        \\kernel32_lib_dir=
+        \\gcc_dir=
+        \\
+    , .{ sysroot, sysroot, triple, sysroot, triple, api });
+    return b.addWriteFiles().add(b.fmt("android-libc-{s}.txt", .{triple}), content);
+}
+
+pub fn build(b: *std.Build) void {
+    // The S-101 PortrayalCatalog source (submodule, or the lazy dependency for
+    // a fetched package). On the first pass of a fetch this is null — return so
+    // zig downloads the package and re-runs build().
+    const catalog = resolveCatalog(b) orelse return;
+
+    const target = b.standardTargetOptions(.{});
+    // Default to ReleaseFast: the tile57 CLI is a compute-heavy baking tool, and a
+    // Debug build bakes ~2.6x slower (no inlining/hoisting/vectorisation). A plain
+    // `zig build` (gen-style.sh, ad-hoc bakes) should produce a fast binary; pass
+    // `-Doptimize=Debug` (or ReleaseSafe) for development. (The C++ host's
+    // libtile57.a already builds ReleaseFast explicitly via CMake / zig-build-lib.sh,
+    // which pass -Doptimize and so still work.) NB: not standardOptimizeOption's
+    // preferred_optimize_mode — that keeps the no-flag default at Debug and drops
+    // the -Doptimize option entirely.
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
+
+    // Cross-compiling to *-linux-android: Zig ships no bionic headers, so the C
+    // deps (Lua, libtess2, nanosvg, stb) need the NDK sysroot. Pass the NDK root
+    // with `-Dandroid-ndk=<path>` and this generates the Zig libc config (include
+    // + arch `asm/` include + per-API crt dir) and pins it to the lib artifact
+    // ONLY — a global `--libc` would break the host tools pinned to linux-musl.
+    // `zig build lib -Dtarget=aarch64-linux-android -Dandroid-ndk=$ANDROID_NDK`.
+    const android_ndk = b.option([]const u8, "android-ndk", "Android NDK root (enables the *-linux-android libc for the lib)");
+    const android_api = b.option(u32, "android-api", "Android API level for the NDK sysroot (default 24)") orelse 24;
+    const android_libc: ?std.Build.LazyPath = if (androidTriple(target)) |triple|
+        (if (android_ndk) |ndk| androidLibcFile(b, ndk, triple, android_api) else null)
+    else
+        null;
+
+    // Lua: POSIX feature flags on Unix; Windows lets luaconf.h auto-pick
+    // LUA_USE_WINDOWS. The portray module is target-agnostic (it inherits each
+    // consumer's target), but on a given host the lib + baker share this OS, so
+    // gate the flag on the top-level target.
+    const lua_posix = target.result.os.tag != .windows;
+
+    // Foundational packages, mirroring the Go oracle's pkg layout. Pure Zig (no
+    // libc/Lua) and target-agnostic: they omit target/optimize so the same module
+    // objects compile under both the glibc test/lib build and the static-musl
+    // baker build, inheriting each consumer's target.
+    // DAG: iso8211 <- s57 <- s101; tiles (leaf) <- render <- scene.
+    // The embedded catalogue JSON rides on s101 (catalogue.zig @embedFile's it).
+    //
+    // ISO/IEC 8211 container reader (src/iso8211/): the bottom layer, a pure
+    // std-only leaf. Its own module so a consumer can decode 8211 records
+    // without depending on any S-57 semantics.
+    const iso8211_mod = b.addModule("iso8211", .{
+        .root_source_file = b.path("src/iso8211/iso8211.zig"),
+    });
+    const s57_mod = b.addModule("s57", .{
+        .root_source_file = b.path("src/s57/s57.zig"),
+        .imports = &.{.{ .name = "iso8211", .module = iso8211_mod }},
+    });
+    const s101_mod = b.addModule("s101", .{
+        .root_source_file = b.path("src/s101/s101.zig"),
+        .imports = &.{.{ .name = "s57", .module = s57_mod }},
+    });
+    addCatalogueJson(b, s101_mod);
+
+    // Tile encoding + addressing (src/tiles/): MVT + MLT encoders, gzip, the
+    // PMTiles container, and web-mercator tile math. One pure leaf module
+    // (mirrors the Go oracle's internal/engine/{mvt,tile,pmtiles}).
+    const tiles_mod = b.addModule("tiles", .{
+        .root_source_file = b.path("src/tiles/tiles.zig"),
+    });
+
+    // Render engine (src/render/): the semantic Surface contract + noop
+    // surface, the resolver (colors at palette, display gates), and the pixel
+    // machinery (Canvas primitive seam, RasterCanvas, PNG encoder, PixelSurface).
+    // One pure module; imports tiles (TilePoint alias) + style (settings model)
+    // only — never s57/s101/portray. NOTE: declared before style_mod exists,
+    // so that edge is attached right after style_mod below.
+    const render_mod = b.addModule("render", .{
+        .root_source_file = b.path("src/render/render.zig"),
+        .imports = &.{.{ .name = "tiles", .module = tiles_mod }},
+    });
+    // The embedded label face (render/font.zig @embedFile's it; OFL 1.1 —
+    // see THIRD_PARTY_LICENSES.md).
+    const addFont = struct {
+        fn f(bb: *std.Build, m: *std.Build.Module) void {
+            m.addAnonymousImport("font_ttf", .{ .root_source_file = bb.path("vendor/fonts/NotoSans-Regular.ttf") });
+            m.addAnonymousImport("font_ttf_bold", .{ .root_source_file = bb.path("vendor/fonts/NotoSans-Bold.ttf") });
+            m.addAnonymousImport("font_ttf_italic", .{ .root_source_file = bb.path("vendor/fonts/NotoSans-Italic.ttf") });
+        }
+    }.f;
+    addFont(b, render_mod);
+    addTess(b, render_mod, false);
+
+    // Integer computational geometry (src/geometry/): the Martinez polygon boolean +
+    // the coverage-clipped best-available partition. Pure (std-only); the scene
+    // engine + baker use it for the cross-band composite.
+    const geometry_mod = b.addModule("geometry", .{ .root_source_file = b.path("src/geometry/geometry.zig") });
+
+    // Per-cell M_COVR coverage sidecar (src/coverage/): CellCoverage plus the
+    // fromCell / encodeJson / decodeFromMetadata round-trip carried in PMTiles
+    // metadata. Pure over s57 (the LonLat point type) + std.json; the baker writes
+    // it and the compositor reads it.
+    const coverage_mod = b.addModule("coverage", .{
+        .root_source_file = b.path("src/coverage/coverage.zig"),
+        .imports = &.{.{ .name = "s57", .module = s57_mod }},
+    });
+
+    // The engine error taxonomy (src/errors.zig): the error set the C ABI maps to
+    // tile57_status, plus describe() for the per-call message. Pure std-only leaf.
+    const errors_mod = b.addModule("errors", .{ .root_source_file = b.path("src/errors.zig") });
+
+    // The runtime tile compositor (src/compose/): serve any (z,x,y) on demand from
+    // N per-cell PMTiles archives + an ownership partition. Reads baked archives
+    // only — never parses S-57 or runs portrayal — so it depends solely on the
+    // tile / geometry / coverage leaves (s57 rides in for the LonLat point type).
+    const compose_mod = b.addModule("compose", .{
+        .root_source_file = b.path("src/compose/compose.zig"),
+        .imports = &.{
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "geometry", .module = geometry_mod },
+            .{ .name = "coverage", .module = coverage_mod },
+            .{ .name = "s57", .module = s57_mod },
+        },
+    });
+
+    // The tile engine (src/scene/): S-57 -> tile-surface generation plus the
+    // banded ENC_ROOT baker (bake_enc.zig, mirrors the Go oracle's
+    // internal/engine/baker — folded in as the engine's batch driver).
+    const scene_mod = b.addModule("scene", .{
+        .root_source_file = b.path("src/scene/scene.zig"),
+        .imports = &.{
+            .{ .name = "s57", .module = s57_mod },
+            .{ .name = "s101", .module = s101_mod },
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "render", .module = render_mod },
+            .{ .name = "geometry", .module = geometry_mod },
+            .{ .name = "coverage", .module = coverage_mod },
+        },
+    });
+
+    // S-101 portrayal runner: drives the embedded Lua rule engine over a cell's
+    // adapted features (mirrors Go's internal/engine/portrayal). Owns the Lua
+    // attachment (the C shim + vendored Lua) so libc/Lua is encapsulated here,
+    // not spread across the lib + baker modules. pic so the same code links into
+    // both the PIE C++ host (libtile57.a) and the static baker. The pure engine
+    // module does NOT import it, so `zig build test` stays libc-free.
+    const portray_mod = b.addModule("portray", .{
+        .root_source_file = b.path("src/portray/portray.zig"),
+        .link_libc = true,
+        .pic = true,
+        .imports = &.{
+            .{ .name = "s57", .module = s57_mod },
+            .{ .name = "s101", .module = s101_mod },
+        },
+    });
+    addLua(b, portray_mod, .{ .posix = lua_posix, .ios = target.result.os.tag == .ios });
+    // Embed the S-101 Lua rules (216 framework + feature-class files) so the Lua
+    // `require` searcher in lua_shim.c can load them from memory — tile57 portrays
+    // S-57 cells with no on-disk catalogue. An explicit rules dir still overrides.
+    // ONE registry module, shared with the wasm portray variant below (a second
+    // embedDir for the same dir would make a second same-named module).
+    const rules_registry = embedDir(catalog.b, "rules_registry", catalog.b.pathJoin(&.{ catalog.root, "Rules" }), ".lua");
+    portray_mod.addImport("rules_registry", rules_registry);
+
+    // MapLibre style generation (src/style/): color tables, line styles, the
+    // style.json layer set (maplibre.zig), and the S-52 mariner settings model +
+    // expression builders (chartstyle.zig, a Zig port of the web client's
+    // s52-style.mjs builders). Consumed by the C ABI, the CLI, and the render
+    // resolver's settings model. Pure + target-agnostic.
+    const style_mod = b.addModule("style", .{
+        .root_source_file = b.path("src/style/style.zig"),
+    });
+    // The render module's settings-model edge (declared above style_mod).
+    render_mod.addImport("style", style_mod);
+    // The scene module's complex-linestyle XML analysis (also declared above).
+    scene_mod.addImport("style", style_mod);
+
+    // S-101 sprite/pattern atlas builder (nanosvg + stb PNG). libc (the C libs),
+    // target-less so it inherits the consumer's target (only the bake tool, which
+    // already links libc for Lua). Not in pure_pkgs — the tests stay libc-free.
+    const sprite_mod = b.addModule("sprite", .{
+        .root_source_file = b.path("src/sprite/sprite.zig"),
+        .link_libc = true,
+        // render: the vector-symbol types (symbols.Symbol/SymbolStore) the
+        // CatalogStore produces for the pixel path.
+        .imports = &.{.{ .name = "render", .module = render_mod }},
+    });
+    addSvgRaster(b, sprite_mod);
+
+    // Raster charts (vendored SQLite): a chart made of pictures, read in place.
+    // libc + pic like `portray`, so SQLite is encapsulated here rather than
+    // spread across the lib and the baker, and the same objects link into both
+    // the PIE C++ host (libtile57.a) and the static baker. Target-less so it
+    // inherits the consumer's. NOT in pure_pkgs — `zig build test` stays
+    // libc-free, and the `tiles` module stays pure std.
+    const raster_mod = b.addModule("raster", .{
+        .root_source_file = b.path("src/raster/raster.zig"),
+        .link_libc = true,
+        .pic = true,
+        // The RNC bake writes the same per-chart archive the ENC bake does:
+        // PMTiles + PNG tiles (tiles) carrying the chart's own coverage
+        // (coverage, over s57's integer lon/lat point).
+        .imports = &.{
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "coverage", .module = coverage_mod },
+            .{ .name = "s57", .module = s57_mod },
+        },
+    });
+    addSqlite(b, raster_mod, false);
+
+    // All pure packages, imported by name into engine / libtile57.a / the baker.
+    // (portray is libc, wired separately into the lib + baker only.)
+    // Charts read straight out of a .zip, and the text/pictures a cell points
+    // at. Both are pure std and both are needed by the engine root AND by the
+    // separately-compiled chart module, so they must be modules: a relative
+    // import from each would put one file in two modules.
+    const zipsrc_mod = b.addModule("zipsrc", .{ .root_source_file = b.path("src/zipsrc.zig") });
+    const auxfiles_mod = b.addModule("auxfiles", .{ .root_source_file = b.path("src/auxfiles.zig") });
+
+    const pure_pkgs = [_]std.Build.Module.Import{
+        .{ .name = "zipsrc", .module = zipsrc_mod },
+        .{ .name = "auxfiles", .module = auxfiles_mod },
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "s101", .module = s101_mod },
+        .{ .name = "tiles", .module = tiles_mod },
+        .{ .name = "scene", .module = scene_mod },
+        .{ .name = "render", .module = render_mod },
+        .{ .name = "style", .module = style_mod },
+        .{ .name = "geometry", .module = geometry_mod },
+    };
+
+    // Full engine surface (the pure root.zig packages + the embedded-Lua `portray`
+    // module) as ONE import named "engine", via bake_root.zig. Target-agnostic: it
+    // inherits each consumer's target, so the static-musl baker, libtile57.a (host
+    // target), and the shared bundle module below all compile it against their own
+    // target over the same singleton leaf packages.
+    const engine_full = b.createModule(.{
+        .root_source_file = b.path("src/bake_root.zig"),
+        .link_libc = true, // portray (embedded Lua) needs the C runtime
+    });
+    addPkgs(engine_full, &pure_pkgs);
+    engine_full.addImport("portray", portray_mod);
+
+    // The embedded S-52 colour profile. Built ONCE and shared: the C ABI imports it
+    // directly (tile57_colortables_default / tile57_style_template) AND it rides on
+    // catalog_embed below. A second embedDir for the same dir would create a second
+    // same-named module and collide in the libtile57.a build (where both are present).
+    const colorprofile_registry = embedDir(catalog.b, "colorprofile_registry", catalog.b.pathJoin(&.{ catalog.root, "ColorProfiles" }), ".xml");
+
+    // The S-101 portrayal *assets* embedded into the binary: symbol SVGs, the palette
+    // CSS, line-style + area-fill XML, and the colour profile. The bundle pipeline
+    // emits colortables / sprites / patterns / style.json from these with no on-disk
+    // catalogue; a --catalog / positional dir still overrides (read from disk). Shared
+    // by the CLI baker AND libtile57.a (so the C ABI bake_bundle needs no catalogue).
+    const catalog_embed = b.createModule(.{ .root_source_file = b.path("tools/catalog_embed.zig") });
+    catalog_embed.addImport("symbols_registry", embedDir(catalog.b, "symbols_registry", catalog.b.pathJoin(&.{ catalog.root, "Symbols" }), ".svg"));
+    catalog_embed.addImport("css_registry", embedDir(catalog.b, "css_registry", catalog.b.pathJoin(&.{ catalog.root, "Symbols" }), ".css"));
+    catalog_embed.addImport("linestyles_registry", embedDir(catalog.b, "linestyles_registry", catalog.b.pathJoin(&.{ catalog.root, "LineStyles" }), ".xml"));
+    catalog_embed.addImport("areafills_registry", embedDir(catalog.b, "areafills_registry", catalog.b.pathJoin(&.{ catalog.root, "AreaFills" }), ".xml"));
+    catalog_embed.addImport("colorprofile_registry", colorprofile_registry);
+
+    // The chart-bundle module: S-101 portrayal asset emission + the per-cell composite
+    // (ownership partition + on-demand compositor). Target-agnostic + libc (the sprite
+    // atlas builder), so the CLI baker AND libtile57.a share the SAME emitters over the
+    // shared singleton packages. See src/bundle.zig.
+    const bundle_mod = b.createModule(.{
+        .root_source_file = b.path("src/bundle.zig"),
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_full },
+            .{ .name = "style", .module = style_mod },
+            .{ .name = "sprite", .module = sprite_mod },
+            .{ .name = "catalog", .module = catalog_embed },
+            .{ .name = "compose", .module = compose_mod }, // debug bake reuses LoadedCov/toPlaneCells
+        },
+    });
+
+    // Pure-Zig public module (no libc). Used by the unit tests so that
+    // Zig-linked test binary doesn't pull in the system crt.
+    const mod = b.addModule("engine", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addPkgs(mod, &pure_pkgs);
+    addMvtFixture(b, mod); // mvt_parity_test (in the engine module) embeds it
+
+    // Public, consumable Zig library module: `@import("tile57")` after adding this
+    // package as a dependency. The curated public surface (src/tile57.zig) — the
+    // full engine API (Source/bake/style), so it links libc + the Lua portrayal
+    // engine like libtile57.a. (Consumers wanting only the libc-free format/encode
+    // packages can import those directly.)
+    const tile57_mod = b.addModule("tile57", .{
+        .root_source_file = b.path("src/tile57.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPkgs(tile57_mod, &pure_pkgs);
+    tile57_mod.addImport("portray", portray_mod);
+    tile57_mod.addImport("sprite", sprite_mod); // sprite/pattern atlas generation
+    tile57_mod.addImport("coverage", coverage_mod); // per-cell coverage sidecar
+    tile57_mod.addImport("compose", compose_mod); // the runtime compositor
+    tile57_mod.addImport("errors", errors_mod); // the error taxonomy
+    tile57_mod.addImport("raster", raster_mod); // raster charts (MBTiles today)
+
+    // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
+    // the C sources / libc only land in the archive (linked by the C++ host),
+    // never in a Zig-linked exe.
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        // iOS and visionOS: std.debug's stack-trace machinery references
+        // _dyld_get_image_header_containing_address, which those libdylds do
+        // not export. Strip so the panic path never pulls it in.
+        .strip = target.result.os.tag == .ios or target.result.os.tag == .visionos,
+        .pic = true, // links into a PIE C++ host
+        .link_libc = true, // Lua needs the C runtime
+    });
+    addPkgs(lib_mod, &pure_pkgs);
+    lib_mod.addImport("portray", portray_mod);
+    lib_mod.addImport("sprite", sprite_mod); // C ABI: sprite/pattern atlas generation
+    lib_mod.addImport("bundle", bundle_mod); // C ABI: portrayal-asset emitters + debug bake
+    lib_mod.addImport("compose", compose_mod); // C ABI: tile57_compose_* (the runtime compositor)
+    lib_mod.addImport("coverage", coverage_mod); // the tile57 public root re-exports it
+    lib_mod.addImport("errors", errors_mod); // C ABI: error taxonomy -> tile57_status
+    lib_mod.addImport("raster", raster_mod); // C ABI: tile57_raster_chart_* (MBTiles)
+    // The full engine surface as a NAMED import (not a root.zig file-import), so the
+    // single root.zig file isn't claimed by both lib_mod and engine_full (which bundle
+    // pulls in) — Zig requires each file to belong to exactly one module per artifact.
+    lib_mod.addImport("engine", engine_full);
+    // The S-52 colour profile (shared module, built once above) so the C ABI can
+    // generate the colortables + base style template with no on-disk catalogue
+    // (tile57_colortables_default / tile57_style_template).
+    lib_mod.addImport("colorprofile_registry", colorprofile_registry);
+    lib_mod.addImport("catalog", catalog_embed); // chart.renderView symbol/pattern store
+    // The engine's own git commit, embedded so the RUNTIME can state which
+    // engine a process actually linked (tile57_warmup logs it once): build
+    // provenance that survives any amount of checkout / link confusion.
+    // One options module, shared with the wasm engine build below.
+    // The version the library reports. A release passes the tag, so no file
+    // needs an edit to cut one. build.zig.zon holds the default for every
+    // other build.
+    const version = b.option([]const u8, "version", "Version the library reports (default: build.zig.zon)") orelse zon.version;
+    _ = std.SemanticVersion.parse(version) catch @panic("-Dversion is not a semantic version");
+    const buildinfo_mod = blk: {
+        const buildinfo = b.addOptions();
+        var code: u8 = 0;
+        const raw = b.runAllowFail(&.{ "git", "describe", "--always", "--dirty" }, &code, .ignore) catch "unknown";
+        buildinfo.addOption([]const u8, "commit", std.mem.trim(u8, raw, " \n\r\t"));
+        // NUL-terminated, so tile57_version() returns the pointer straight to C.
+        buildinfo.addOption([:0]const u8, "version", b.allocator.dupeZ(u8, version) catch @panic("OOM"));
+        break :blk buildinfo.createModule();
+    };
+    lib_mod.addImport("buildinfo", buildinfo_mod);
+    tile57_mod.addImport("buildinfo", buildinfo_mod); // tile57.version
+    const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
+    // Android cross-compile: point the C deps at the NDK sysroot (see -Dandroid-ndk).
+    if (android_libc) |libc| lib.setLibCFile(libc);
+    // The archive for zig-package consumers (lookout-core links it into its own
+    // build): a named lazy path, NOT dep.artifact() — the default install step
+    // installs the `tile57` CLI under the same name, and on macOS the lib
+    // reaches the install step only as the repacked file below. The raw archive
+    // is fine for a zig consumer; ld64/libtool consumers must still repack
+    // (loose-object extract) exactly like scripts/macho-align.sh does.
+    b.addNamedLazyPath("libtile57_a", lib.getEmittedBin());
+    // Bundle compiler-rt INTO the static archive. A non-Zig linker (the CGO host's gcc/clang,
+    // `go test`) has no access to Zig's compiler-rt, so builtins the code references — e.g.
+    // `roundq` (f128 @round, pulled in by std.json's number→int coercion in coverage decode) —
+    // would be undefined at link time. Static libs default to NOT bundling it; force it on so
+    // libtile57.a is self-contained for C consumers.
+    lib.bundle_compiler_rt = true;
+    // `zig build lib` installs only libtile57.a for the resolved target. The
+    // default install also builds the host-only bake CLI (which force-links
+    // static musl and so can't cross-compile); an embedder cross-building the
+    // library for another platform — e.g. a Qt6 viewer for the reMarkable
+    // tablet (arm-linux-gnueabihf / aarch64-linux-gnu) — uses this step to get
+    // just the archive without the CLI.
+    const lib_only_step = b.step("lib", "Build only libtile57.a for the target");
+    if (target.result.os.tag == .macos) {
+        // Apple's ld64 rejects 64-bit mach-o archive members whose offsets aren't
+        // 8-byte aligned, and Zig's archiver doesn't align them — so the raw
+        // `zig build` archive fails to link into the CGO host ("... not 8-byte
+        // aligned"). Re-pack it here, as part of the build, so a plain `zig build`
+        // or `zig build lib` alone emits an ld64-compatible libtile57.a (no
+        // wrapper needed): scripts/macho-align.sh partial-links every member into
+        // one relocatable object and re-wraps it with Apple's libtool. See the
+        // script for why.
+        const repack = b.addSystemCommand(&.{b.pathFromRoot("scripts/macho-align.sh")});
+        repack.setEnvironmentVariable("ZIG", b.graph.zig_exe); // `zig ar` need not be on PATH
+        repack.addFileArg(lib.getEmittedBin());
+        const aligned = repack.addOutputFileArg("libtile57.a");
+        const install_aligned = b.addInstallLibFile(aligned, "libtile57.a");
+        b.getInstallStep().dependOn(&install_aligned.step);
+        lib_only_step.dependOn(&install_aligned.step);
+    } else {
+        b.installArtifact(lib);
+        lib_only_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
+    }
+
+    // The offline baker / inspector CLI. It runs the embedded-Lua S-101 portrayal
+    // so baked tiles get full S-101 styling (not the classify() fallback), so —
+    // unlike the unit tests — its engine module is bake_root.zig (root.zig +
+    // portray.zig) and it links libc + the vendored Lua / shim C sources, exactly
+    // like libtile57.a. root.zig stays pure for the test build.
+    // On a glibc Linux host, link the baker against Zig's own static musl rather
+    // than the system libc. Zig's self-hosted ELF linker can't link a modern
+    // glibc's crt1.o (it carries an .sframe section with R_X86_64_PC64
+    // relocations the linker rejects), and forcing LLD segfaults the compiler.
+    // musl ships with Zig and links cleanly into a self-contained static binary.
+    // Other hosts (e.g. macOS Mach-O) keep the requested target; the library and
+    // unit tests are unaffected (libtile57.a is linked by clang++ in the C++
+    // host, and the tests are pure Zig with no libc).
+    // The chart layer (src/chart.zig) as a module for the CLI: streaming
+    // ENC_ROOT open + band-quilted view rendering (`tile57 png|pdf <ENC_ROOT>`).
+    // The lib compiles the same file relatively (capi/tile57 roots); this is a
+    // separate compilation for the separate binary.
+    const chart_mod = b.createModule(.{
+        .root_source_file = b.path("src/chart.zig"),
+        .link_libc = true, // portray (embedded Lua)
+        .imports = &.{
+            .{ .name = "s57", .module = s57_mod },
+            .{ .name = "s101", .module = s101_mod },
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "scene", .module = scene_mod },
+            .{ .name = "render", .module = render_mod },
+            .{ .name = "portray", .module = portray_mod },
+            .{ .name = "sprite", .module = sprite_mod },
+            .{ .name = "catalog", .module = catalog_embed },
+            .{ .name = "zipsrc", .module = zipsrc_mod },
+            .{ .name = "auxfiles", .module = auxfiles_mod },
+        },
+    });
+    chart_mod.addImport("style", style_mod); // linestyle XML analysis
+    chart_mod.addImport("coverage", coverage_mod); // embedded-coverage attach on PMTiles opens
+    chart_mod.addImport("compose", compose_mod); // compose-backed view renders
+    chart_mod.addImport("raster", raster_mod); // the inventory reads picture charts
+
+    const bake_target = if (target.result.os.tag == .linux and target.result.abi != .musl)
+        b.resolveTargetQuery(.{ .cpu_arch = target.result.cpu.arch, .os_tag = .linux, .abi = .musl })
+    else
+        target;
+
+    const bake_mod = b.createModule(.{
+        .root_source_file = b.path("tools/main.zig"),
+        .target = bake_target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_full },
+            .{ .name = "style", .module = style_mod },
+            .{ .name = "sprite", .module = sprite_mod },
+            .{ .name = "catalog", .module = catalog_embed },
+            .{ .name = "bundle", .module = bundle_mod },
+            .{ .name = "compose", .module = compose_mod }, // compose-tile CLI
+            .{ .name = "geometry", .module = geometry_mod }, // compose-tile --scan reads the boolean diagnostics
+            .{ .name = "render", .module = render_mod }, // renderpng pixel path
+            .{ .name = "chart", .module = chart_mod }, // ENC_ROOT view renders
+            .{ .name = "raster", .module = raster_mod }, // `raster info`
+            .{ .name = "buildinfo", .module = buildinfo_mod }, // the VERSION banner
+        },
+    });
+    const bake = b.addExecutable(.{ .name = "tile57", .root_module = bake_mod });
+    b.installArtifact(bake);
+
+    const run_bake = b.addRunArtifact(bake);
+    if (b.args) |args| run_bake.addArgs(args);
+    b.step("run", "Run the bake CLI").dependOn(&run_bake.step);
+
+    // S-57 -> S-101 portrayal attribute-coverage check (conformance recon; see
+    // conformance-testability plan). Pure std, no engine imports — it just
+    // reads vendor/s101/*.json + the vendored Lua rules from disk at run time.
+    // Runs from the repo root (build cwd), so its default relative paths resolve.
+    const cov = b.addExecutable(.{
+        .name = "s101-coverage",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/s101_coverage.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_cov = b.addRunArtifact(cov);
+    if (b.args) |args| run_cov.addArgs(args);
+    b.step("s101-coverage", "Scan S-101 portrayal rules and check adapter attribute coverage").dependOn(&run_cov.step);
+
+    // ---- JS/wasm style engine (bindings/) -----------------------------------
+    //
+    // A tiny entry point that compiles `chartstyle.buildStyle` to wasm so a
+    // front-end can turn S-52 mariner settings into a MapLibre style.json fully
+    // client-side. The MapLibre template + S-52 colortables are @embedFile'd (as
+    // anonymous imports, mirroring addCatalogueJson) so the wasm needs no file
+    // inputs. The shared settings parser is reused by the native parity oracle so
+    // the two backends can't drift. All additive — a plain `zig build` / `zig
+    // build test` is unaffected; `zig build wasm` builds the wasm.
+    const style_settings_mod = b.addModule("style_settings", .{
+        .root_source_file = b.path("bindings/shared/settings.zig"),
+        .imports = &.{.{ .name = "style", .module = style_mod }},
+    });
+
+    // Attach the embedded template + colortables to a bindings consumer module.
+    const addStyleAssets = struct {
+        fn f(bb: *std.Build, m: *std.Build.Module) void {
+            m.addAnonymousImport("template_json", .{ .root_source_file = bb.path("bindings/js/assets/template.json") });
+            m.addAnonymousImport("colortables_json", .{ .root_source_file = bb.path("bindings/js/assets/colortables.json") });
+        }
+    }.f;
+
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm_mod = b.createModule(.{
+        .root_source_file = b.path("bindings/js/style_wasm.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall, // smallest wasm; this isn't a hot path
+        .imports = &.{
+            .{ .name = "style", .module = style_mod },
+            .{ .name = "settings", .module = style_settings_mod },
+        },
+    });
+    addStyleAssets(b, wasm_mod);
+    const wasm = b.addExecutable(.{ .name = "style-engine", .root_module = wasm_mod });
+    wasm.entry = .disabled; // reactor-style: no _start, just the exported fns
+    wasm.rdynamic = true; // export the `export fn`s into the wasm export table
+    const wasm_step = b.step("wasm", "Build the wasm style engine (bindings/)");
+    wasm_step.dependOn(&b.addInstallArtifact(wasm, .{}).step);
+
+    // ---- Full-engine wasm (wasm32-wasi reactor) -----------------------------
+    //
+    // The complete C ABI — bake, chart, compose, style, raster — as ONE wasm
+    // module (`zig build wasm-engine`), so a browser chartplotter can bake
+    // charts and serve tiles with no server. wasm32-wasi-musl: the C deps
+    // (Lua, SQLite, libtess2, nanosvg/stb) need a libc, and Zig bundles
+    // wasi-libc for this target; the JS host supplies the small WASI import
+    // set. Reactor model: no _start — the host calls _initialize once, then
+    // the tile57_* exports (rdynamic puts every `export fn` in the export
+    // table). Single-threaded end to end: the thread users (bake_enc
+    // parallelFor, the capi raster workers, the pmtiles reader lock) all gate
+    // on builtin.single_threaded and run serial here.
+    //
+    // portray, raster, and render get their own module instances: their C
+    // flags differ on wasm (Lua and libtess2 need the sjlj lowering, SQLite
+    // drops to THREADSAFE=0), and the native portray/raster carry pic=true,
+    // which wasm must not. scene + sprite fork only to point at the wasm
+    // render. The pure packages and the embedded registries are the SAME
+    // singletons the native artifacts use.
+    const wasi_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi, .abi = .musl });
+    const portray_wasm = b.createModule(.{
+        .root_source_file = b.path("src/portray/portray.zig"),
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "s57", .module = s57_mod },
+            .{ .name = "s101", .module = s101_mod },
+        },
+    });
+    addLua(b, portray_wasm, .{ .wasm = true });
+    portray_wasm.addImport("rules_registry", rules_registry);
+
+    const raster_wasm = b.createModule(.{
+        .root_source_file = b.path("src/raster/raster.zig"),
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "coverage", .module = coverage_mod },
+            .{ .name = "s57", .module = s57_mod },
+        },
+    });
+    addSqlite(b, raster_wasm, true);
+
+    const render_wasm = b.createModule(.{
+        .root_source_file = b.path("src/render/render.zig"),
+        .imports = &.{
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "style", .module = style_mod },
+        },
+    });
+    addFont(b, render_wasm);
+    addTess(b, render_wasm, true);
+
+    const scene_wasm = b.createModule(.{
+        .root_source_file = b.path("src/scene/scene.zig"),
+        .imports = &.{
+            .{ .name = "s57", .module = s57_mod },
+            .{ .name = "s101", .module = s101_mod },
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "render", .module = render_wasm },
+            .{ .name = "geometry", .module = geometry_mod },
+            .{ .name = "coverage", .module = coverage_mod },
+            .{ .name = "style", .module = style_mod },
+        },
+    });
+
+    const sprite_wasm = b.createModule(.{
+        .root_source_file = b.path("src/sprite/sprite.zig"),
+        .link_libc = true,
+        .imports = &.{.{ .name = "render", .module = render_wasm }},
+    });
+    addSvgRaster(b, sprite_wasm);
+
+    // pure_pkgs with the render/scene edges swapped to the wasm instances.
+    const pure_pkgs_wasm = [_]std.Build.Module.Import{
+        .{ .name = "zipsrc", .module = zipsrc_mod },
+        .{ .name = "auxfiles", .module = auxfiles_mod },
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "s101", .module = s101_mod },
+        .{ .name = "tiles", .module = tiles_mod },
+        .{ .name = "scene", .module = scene_wasm },
+        .{ .name = "render", .module = render_wasm },
+        .{ .name = "style", .module = style_mod },
+        .{ .name = "geometry", .module = geometry_mod },
+    };
+
+    const engine_full_wasm = b.createModule(.{
+        .root_source_file = b.path("src/bake_root.zig"),
+        .link_libc = true,
+    });
+    addPkgs(engine_full_wasm, &pure_pkgs_wasm);
+    engine_full_wasm.addImport("portray", portray_wasm);
+
+    const bundle_wasm = b.createModule(.{
+        .root_source_file = b.path("src/bundle.zig"),
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_full_wasm },
+            .{ .name = "style", .module = style_mod },
+            .{ .name = "sprite", .module = sprite_wasm },
+            .{ .name = "catalog", .module = catalog_embed },
+            .{ .name = "compose", .module = compose_mod },
+        },
+    });
+
+    const engine_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/wasm_root.zig"),
+        .target = wasi_target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .link_libc = true,
+    });
+    addPkgs(engine_wasm_mod, &pure_pkgs_wasm);
+    engine_wasm_mod.addImport("portray", portray_wasm);
+    engine_wasm_mod.addImport("sprite", sprite_wasm);
+    engine_wasm_mod.addImport("bundle", bundle_wasm);
+    engine_wasm_mod.addImport("compose", compose_mod);
+    engine_wasm_mod.addImport("coverage", coverage_mod);
+    engine_wasm_mod.addImport("errors", errors_mod);
+    engine_wasm_mod.addImport("raster", raster_wasm);
+    engine_wasm_mod.addImport("engine", engine_full_wasm);
+    engine_wasm_mod.addImport("colorprofile_registry", colorprofile_registry);
+    engine_wasm_mod.addImport("catalog", catalog_embed);
+    engine_wasm_mod.addImport("buildinfo", buildinfo_mod);
+    // Lua's os.clock: clock(3) lives in wasi-libc's emulated process-clocks
+    // lib (addLua defines _WASI_EMULATED_PROCESS_CLOCKS on the Lua objects).
+    engine_wasm_mod.linkSystemLibrary("wasi-emulated-process-clocks", .{});
+
+    const engine_wasm = b.addExecutable(.{ .name = "tile57-engine", .root_module = engine_wasm_mod });
+    engine_wasm.wasi_exec_model = .reactor;
+    engine_wasm.rdynamic = true; // export the `export fn`s into the wasm export table
+    // A chart render works down a deep call stack (portrayal -> scene ->
+    // tessellation); the wasm default (1 MB) is not enough headroom.
+    engine_wasm.stack_size = 32 * 1024 * 1024;
+    const engine_wasm_step = b.step("wasm-engine", "Build the full-engine wasm reactor (bindings/)");
+    engine_wasm_step.dependOn(&b.addInstallArtifact(engine_wasm, .{}).step);
+
+    // Native parity oracle: same engine + same template/colortables/settings,
+    // native target. `zig build style-parity` builds it; the parity script diffs
+    // its output against the wasm/JS output.
+    const parity_mod = b.createModule(.{
+        .root_source_file = b.path("bindings/parity/parity.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "style", .module = style_mod },
+            .{ .name = "settings", .module = style_settings_mod },
+        },
+    });
+    addStyleAssets(b, parity_mod);
+    const parity = b.addExecutable(.{ .name = "style-parity", .root_module = parity_mod });
+    b.step("style-parity", "Build the native style-parity oracle (bindings/)")
+        .dependOn(&b.addInstallArtifact(parity, .{}).step);
+
+    // Tests. The engine module (root.zig) covers its own files — the relative-
+    // imported gzip/pmtiles/tile/scene/bake_enc + the MVT parity test. Each
+    // standalone package is tested through its own root (addPkgTest), since a
+    // module import does NOT pull another module's `test {}` blocks in.
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
+    // The CLI's own tests. They had never run: nothing but the executable
+    // referenced tools/*.zig, and an executable does not collect tests — so a
+    // test written beside the code it checks was silently dead.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = bake_mod })).step);
+    // The sprite module (SDF glyph atlas lives here): needs the C glue
+    // (stb_truetype/nanosvg) + libc + render.
+    const sprite_test = addPkgTest(b, test_step, "src/sprite/sprite.zig", target, optimize, &.{
+        .{ .name = "render", .module = render_mod },
+    });
+    sprite_test.link_libc = true;
+    addSvgRaster(b, sprite_test);
+
+    _ = addPkgTest(b, test_step, "src/iso8211/iso8211.zig", target, optimize, &.{});
+    // catalog.zig's cross-check against the spec's attribute list reads the
+    // path from the environment through libc's getenv, as every other
+    // real-file test here does. Without this the module compiles for a target
+    // that links libc implicitly and fails to compile for one that does not.
+    const s57_test = addPkgTest(b, test_step, "src/s57/s57.zig", target, optimize, &.{
+        .{ .name = "iso8211", .module = iso8211_mod },
+    });
+    s57_test.link_libc = true;
+    const s101_test = addPkgTest(b, test_step, "src/s101/s101.zig", target, optimize, &.{
+        .{ .name = "s57", .module = s57_mod },
+    });
+    addCatalogueJson(b, s101_test); // catalogue.zig @embedFile's the JSON
+    // pmtiles.zig's reader lock drops to raw pthread on POSIX, so this needs libc too.
+    const tiles_test = addPkgTest(b, test_step, "src/tiles/tiles.zig", target, optimize, &.{});
+    tiles_test.link_libc = true;
+    addMvtFixture(b, tiles_test); // pmtiles.zig's round-trip test embeds it
+    // The raster charts link the vendored SQLite. Their real-file tests skip
+    // unless TILE57_MBTILES points at a chart — community files are hundreds of
+    // megabytes and cannot live in the repo.
+    const raster_test = addPkgTest(b, test_step, "src/raster/raster.zig", target, optimize, &.{
+        .{ .name = "tiles", .module = tiles_mod },
+        .{ .name = "coverage", .module = coverage_mod },
+        .{ .name = "s57", .module = s57_mod },
+    });
+    raster_test.link_libc = true;
+    addSqlite(b, raster_test, false);
+    _ = addPkgTest(b, test_step, "src/scene/scene.zig", target, optimize, &.{
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "s101", .module = s101_mod },
+        .{ .name = "tiles", .module = tiles_mod },
+        .{ .name = "render", .module = render_mod },
+        .{ .name = "style", .module = style_mod },
+        .{ .name = "geometry", .module = geometry_mod },
+    });
+    _ = addPkgTest(b, test_step, "src/style/style.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/errors.zig", target, optimize, &.{});
+    // Charts read straight out of a .zip, and the aux files that travel with
+    // them: pure over std, so each tests alone.
+    _ = addPkgTest(b, test_step, "src/zipsrc.zig", target, optimize, &.{});
+    // src/chart.zig holds tests no other step collects: the engine imports it
+    // as a module, and a module import leaves another module's test blocks out.
+    // It needs libc for portray's embedded Lua.
+    addPkgTest(b, test_step, "src/chart.zig", target, optimize, &.{
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "s101", .module = s101_mod },
+        .{ .name = "tiles", .module = tiles_mod },
+        .{ .name = "scene", .module = scene_mod },
+        .{ .name = "render", .module = render_mod },
+        .{ .name = "portray", .module = portray_mod },
+        .{ .name = "sprite", .module = sprite_mod },
+        .{ .name = "catalog", .module = catalog_embed },
+        .{ .name = "zipsrc", .module = zipsrc_mod },
+        .{ .name = "auxfiles", .module = auxfiles_mod },
+        .{ .name = "style", .module = style_mod },
+        .{ .name = "coverage", .module = coverage_mod },
+        .{ .name = "compose", .module = compose_mod },
+        .{ .name = "raster", .module = raster_mod },
+    }).link_libc = true;
+    _ = addPkgTest(b, test_step, "src/auxfiles.zig", target, optimize, &.{});
+    // Geometry core for the cross-band composition. No longer std-only: plane.zig
+    // reads its partition tuning/stats valves via std.c.getenv, so the test binary
+    // needs libc for the same reason compose's does, below.
+    addPkgTest(b, test_step, "src/geometry/geometry.zig", target, optimize, &.{}).link_libc = true;
+    // The runtime compositor + its clip core: pure over tiles + geometry + coverage.
+    // Its own step for fast iteration, and part of the main suite.
+    const compose_deps = [_]std.Build.Module.Import{
+        .{ .name = "tiles", .module = tiles_mod },
+        .{ .name = "geometry", .module = geometry_mod },
+        .{ .name = "coverage", .module = coverage_mod },
+        .{ .name = "s57", .module = s57_mod },
+    };
+    const compose_step = b.step("compose-test", "Run the runtime compositor + clip-core tests");
+    // compose.zig reads two debug-valve env vars via std.c.getenv, so the test
+    // binaries need libc (the shipped lib already links it; addPkgTest omits it).
+    addPkgTest(b, compose_step, "src/compose/compose.zig", target, optimize, &compose_deps).link_libc = true;
+    addPkgTest(b, test_step, "src/compose/compose.zig", target, optimize, &compose_deps).link_libc = true;
+
+    // The chart-bundle module hosts the per-cell composite (composeTile / ComposeSource). Its full
+    // dep set (engine + assets/sprite/catalog) needs libc, so create the test module directly
+    // rather than via addPkgTest (which omits link_libc).
+    const bundle_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/bundle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_full },
+            .{ .name = "style", .module = style_mod },
+            .{ .name = "sprite", .module = sprite_mod },
+            .{ .name = "catalog", .module = catalog_embed },
+        },
+    });
+    const bundle_test_step = b.step("bundle-test", "Run the bundle / per-cell composite tests");
+    bundle_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = bundle_test_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = bundle_test_mod })).step);
+    // Per-cell coverage sidecar (JSON round-trip carried in PMTiles metadata): pure
+    // over s57 + std.json. Part of the main suite.
+    _ = addPkgTest(b, test_step, "src/coverage/coverage.zig", target, optimize, &.{
+        .{ .name = "s57", .module = s57_mod },
+    });
+    // The render module: Surface contract + noop lifecycle smoke test (pins
+    // the contract), resolver gates/colors, Canvas + RasterCanvas + PNG +
+    // PixelSurface.
+    const render_test = addPkgTest(b, test_step, "src/render/render.zig", target, optimize, &.{
+        .{ .name = "tiles", .module = tiles_mod },
+        .{ .name = "style", .module = style_mod },
+    });
+    addFont(b, render_test);
+    addTess(b, render_test, false);
+    // Golden portrayal-instruction test (assertion #5): drives the real embedded Lua
+    // rules end-to-end. It rides its own artifact because `portray` links libc + Lua +
+    // the rule registry (those settings + C sources propagate from portray_mod), unlike
+    // the libc-free pure-package tests above.
+    _ = addPkgTest(b, test_step, "src/portray/portray_golden_test.zig", target, optimize, &.{
+        .{ .name = "portray", .module = portray_mod },
+        .{ .name = "s57", .module = s57_mod },
+    });
+    // Golden-image test for the pixel path (Gate 2): real Lua rules -> engine ->
+    // PixelSurface -> PNG, sha-asserted. libc for the same reason as above.
+    const pixel_golden = addPkgTest(b, test_step, "src/render/pixel_golden_test.zig", target, optimize, &.{
+        .{ .name = "portray", .module = portray_mod },
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "scene", .module = scene_mod },
+        .{ .name = "render", .module = render_mod },
+        .{ .name = "tiles", .module = tiles_mod },
+    });
+    pixel_golden.addImport("colorprofile_registry", colorprofile_registry);
+    // The ASCII backend's engine test: same fixture-cell pattern as the pixel
+    // golden, but asserting structural grid properties, never golden bytes.
+    const ascii_view = addPkgTest(b, test_step, "src/render/ascii_view_test.zig", target, optimize, &.{
+        .{ .name = "portray", .module = portray_mod },
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "scene", .module = scene_mod },
+        .{ .name = "render", .module = render_mod },
+        .{ .name = "tiles", .module = tiles_mod },
+    });
+    ascii_view.addImport("colorprofile_registry", colorprofile_registry);
+    // The recording backend's engine test (render/inspect.zig, the `tile57 explore`
+    // tool): real rules -> scene.appendTile -> InspectSurface, asserting the 3-level
+    // record. libc for the same reason as the pixel/ascii golden tests (portray).
+    _ = addPkgTest(b, test_step, "src/render/inspect_view_test.zig", target, optimize, &.{
+        .{ .name = "portray", .module = portray_mod },
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "s101", .module = s101_mod },
+        .{ .name = "scene", .module = scene_mod },
+        .{ .name = "render", .module = render_mod },
+        .{ .name = "tiles", .module = tiles_mod },
+    });
+    // bindings/ shared settings parser (used by the wasm engine + parity oracle).
+    _ = addPkgTest(b, test_step, "bindings/shared/settings.zig", target, optimize, &.{
+        .{ .name = "style", .module = style_mod },
+    });
+    // The public root (src/tile57.zig) is compile-checked via lib_root.zig in the
+    // libtile57.a build — it imports source.zig (Lua/libc), so it can't be a pure
+    // pkg test here.
+}

@@ -1,0 +1,316 @@
+//! Golden portrayal-instruction test — conformance-testability assertion #5
+//! Drive the REAL embedded S-101 Lua
+//! rules over a tiny in-memory fixture cell and assert the pre-raster S-100 Part-9
+//! instruction stream that `portrayCell` returns, BEFORE any MVT/raster mapping.
+//!
+//! This is the end-to-end seam: it validates that the adapter's attribute synthesis
+//! (openingBridge from CATBRG, the BRIDGE->Bridge routing) and value handling reach
+//! the rules and produce the right drawing instructions — something the adapter-level
+//! unit tests (which stop at the CNode tree) cannot see. Lives in its own file because
+//! `portray` links libc + the vendored Lua + the embedded rule registry, so it rides a
+//! dedicated test artifact rather than the libc-free pure-package tests.
+//!
+//! No geometry is built: the instruction stream is emitted from a feature's attributes
+//! and primitive type; geometry is attached later (scene), downstream of this seam.
+
+const std = @import("std");
+const s57 = @import("s57");
+const portray = @import("portray");
+
+fn has(stream: ?[]const u8, needle: []const u8) bool {
+    const s = stream orelse return false;
+    return std.mem.indexOf(u8, s, needle) != null;
+}
+
+test "golden Part-9 stream: opening vs fixed Bridge, DepthArea (BRIDGE->Bridge + openingBridge)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const depare_attrs = [_]s57.Attr{
+        .{ .code = s57.ATTR_DRVAL1, .value = "5" },
+        .{ .code = s57.ATTR_DRVAL2, .value = "10" },
+    };
+    const opening = [_]s57.Attr{.{ .code = s57.ATTR_CATBRG, .value = "2" }}; // opening span
+    const fixed = [_]s57.Attr{.{ .code = s57.ATTR_CATBRG, .value = "1" }}; // fixed span
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 42, .attrs = &depare_attrs }, // DEPARE -> DepthArea
+        .{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = s57.OBJL_BRIDGE, .attrs = &opening }, // opening bridge
+        .{ .rcnm = 100, .rcid = 3, .prim = 2, .objl = s57.OBJL_BRIDGE, .attrs = &fixed }, // fixed bridge
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    // "" rules_dir -> the embedded Lua rule registry (no on-disk catalogue).
+    portray.setQuiet(true); // silence the per-cell "[s101] portrayed …" stderr summary
+    const streams = try portray.portrayCell(a, &cell, "");
+    try std.testing.expectEqual(@as(usize, 3), streams.len);
+
+    // [0] DepthArea: a depth ColorFill at a real drawing priority (rule fired).
+    try std.testing.expect(has(streams[0], "ColorFill:"));
+    try std.testing.expect(has(streams[0], "DrawingPriority:"));
+
+    // [1] opening bridge: the CHGRD structure line AND the BRIDGE01 opening symbol —
+    // proves BRIDGE routed to Bridge and openingBridge=true (synthesized from CATBRG=2)
+    // coerced to a real boolean and fired Bridge.lua's `== true` branch.
+    try std.testing.expect(has(streams[1], "CHGRD"));
+    try std.testing.expect(has(streams[1], "PointInstruction:BRIDGE01"));
+
+    // [2] fixed bridge (CATBRG=1): the CHGRD line, but NO opening symbol.
+    try std.testing.expect(has(streams[2], "CHGRD"));
+    try std.testing.expect(!has(streams[2], "BRIDGE01"));
+}
+
+test "golden Part-9 stream: FFPT StructureEquipment suppresses DistanceMark's standalone symbol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Three point features: a free-standing DISMAR (no association), a DISMAR bound
+    // via FFPT to a LNDMRK "structure", and the LNDMRK itself. DistanceMark.lua calls
+    // GetFeatureAssociations('StructureEquipment'): when it returns nothing the rule
+    // draws a standalone DISMAR06/07 symbol; when the association resolves it suppresses
+    // the symbol (the structure already carries one). This exercises the full path:
+    // FFPT parse -> Cell.foid_index -> HostFeatureGetAssociatedFeatureIDs -> the rule.
+    const struct_foid: u64 = 0xABCDEF;
+    const eq_ref = [_]s57.FeatureRef{.{ .lnam = struct_foid, .rind = 2 }}; // slave -> the structure
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 44 }, // DISMAR, free-standing
+        .{ .rcnm = 100, .rcid = 2, .prim = 1, .objl = 44, .frefs = &eq_ref }, // DISMAR bound to a structure
+        .{ .rcnm = 100, .rcid = 3, .prim = 1, .objl = 74, .foid = struct_foid }, // LNDMRK -> Landmark
+    };
+    var foid_index: std.AutoHashMapUnmanaged(u64, usize) = .{};
+    try foid_index.put(a, struct_foid, 2);
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .foid_index = foid_index,
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    portray.setQuiet(true);
+    const streams = try portray.portrayCell(a, &cell, "");
+    try std.testing.expectEqual(@as(usize, 3), streams.len);
+
+    // [0] no association -> DistanceMark draws its standalone symbol.
+    try std.testing.expect(has(streams[0], "PointInstruction:DISMAR"));
+    // [1] StructureEquipment association resolved -> symbol suppressed.
+    try std.testing.expect(!has(streams[1], "PointInstruction:DISMAR"));
+}
+
+test "golden Part-9 stream: FFPT-bearing named structure does not fall to QUESMRK1 (associationCode honored)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Regression for the A4 QUESMRK1 crash. HostFeatureGetAssociatedFeatureIDs MUST
+    // honor the S-101 associationCode. A named aid-to-navigation (beacon/buoy/landmark)
+    // carries an FFPT SLAVE pointer to its equipment and places its name via
+    // PortrayFeatureName -> AddTextInstruction, which first asks the feature for
+    // GetFeatureAssociations('TextAssociation'). If the shim ignores the code and answers
+    // that from FFPT, the framework then reads the TextPlacement-only attribute `.textType`
+    // on the equipment ("Invalid attribute code textType"), the rule errors, and Default()
+    // paints QUESMRK1 — the exact failure seen baking real NOAA cells (LateralBeacon,
+    // Landmark, LateralBuoy, ...). Since S-57 FFPT only models structure<->equipment, the
+    // shim answers StructureEquipment only; 'TextAssociation' stays empty and the name
+    // path is clean.
+    const light_foid: u64 = 0x1234AB;
+    const eq_ref = [_]s57.FeatureRef{.{ .lnam = light_foid, .rind = 2 }}; // slave -> equipment
+    const named = [_]s57.Attr{.{ .code = s57.ATTR_OBJNAM, .value = "Test Tower" }}; // -> featureName
+    const feats = [_]s57.Feature{
+        // LNDMRK -> Landmark: named, carries the FFPT slave pointer to its light.
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 74, .attrs = &named, .frefs = &eq_ref },
+        .{ .rcnm = 100, .rcid = 2, .prim = 1, .objl = 75, .foid = light_foid }, // LIGHTS equipment
+    };
+    var foid_index: std.AutoHashMapUnmanaged(u64, usize) = .{};
+    try foid_index.put(a, light_foid, 1);
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .foid_index = foid_index,
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    portray.setQuiet(true);
+    const streams = try portray.portrayCell(a, &cell, "");
+    try std.testing.expectEqual(@as(usize, 2), streams.len);
+
+    // [0] the named landmark: its name IS placed (proves the AddTextInstruction path that
+    // triggered the crash actually ran — not a vacuous pass) and it did NOT fall to the
+    // "?" QUESMRK1 default.
+    try std.testing.expect(has(streams[0], "TextInstruction"));
+    try std.testing.expect(!has(streams[0], "QUESMRK1"));
+}
+
+test "golden Part-9 stream: TidalStreamFloodEbb ebb (CAT_TS=2) renders via the rule override, not QUESMRK1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // TS_FEB (objl 160) point, ebb category (CAT_TS=2). The vendored TidalStreamFloodEbb rule's
+    // ebb branch has an upstream typo (`feature..orientationValue`, a stray `..`) that concatenates
+    // the feature table -> crash -> QUESMRK1. rules_embed ships a comptime-corrected copy that
+    // shadows the vendored source by name (the submodule stays pristine). The tidal-stream arrows
+    // only draw in the SimplifiedSymbols pass, so portray with that context on.
+    const attrs = [_]s57.Attr{
+        .{ .code = 188, .value = "2" }, // CAT_TS -> categoryOfTidalStream = 2 (ebb)
+        .{ .code = s57.ATTR_ORIENT, .value = "195" }, // ORIENT -> orientationValue
+        .{ .code = s57.ATTR_CURVEL, .value = "1.5" }, // CURVEL -> speed.speedMaximum
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 160, .attrs = &attrs }, // TS_FEB -> TidalStreamFloodEbb
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    portray.setQuiet(true);
+    const streams = try portray.portrayCellWith(a, &cell, "", .{ .simplified_symbols = true });
+    try std.testing.expectEqual(@as(usize, 1), streams.len);
+    // The ebb branch drew its arrow and did NOT fall to the "?" default (pre-override: QUESMRK1).
+    try std.testing.expect(has(streams[0], "PointInstruction:EBBSTR01"));
+    try std.testing.expect(!has(streams[0], "QUESMRK1"));
+}
+
+test "golden Part-9 stream: SWPARE routes to HighConfidenceDepthArea (renamed from SweptArea), renders SWPARE51 not QUESMRK1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // IHO renamed the S-101 feature Swept Area -> High Confidence Depth Area and removed
+    // SweptArea.lua; our older Feature Catalogue still names it "SweptArea" (a class with no
+    // rule), so SWPARE used to require() a missing module -> QUESMRK1. resolveClass now routes
+    // SWPARE (objl 134) to HighConfidenceDepthArea, whose Surface branch draws SWPARE51 plus the
+    // swept depth ("swept to N") from DRVAL1 -> depthRangeMinimumValue.
+    const attrs = [_]s57.Attr{.{ .code = s57.ATTR_DRVAL1, .value = "12.3" }};
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 134, .attrs = &attrs }, // SWPARE (area)
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    portray.setQuiet(true);
+    const streams = try portray.portrayCell(a, &cell, "");
+    try std.testing.expectEqual(@as(usize, 1), streams.len);
+    try std.testing.expect(has(streams[0], "PointInstruction:SWPARE51"));
+    try std.testing.expect(!has(streams[0], "QUESMRK1"));
+}
+
+test "golden Part-9 stream: M_QUAL quality fills (DQUAL from CATZOC, NODATA03 when absent)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const zoc_b = [_]s57.Attr{.{ .code = s57.ATTR_CATZOC, .value = "3" }}; // ZOC B
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 308, .attrs = &zoc_b }, // M_QUAL, assessed
+        .{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 308 }, // M_QUAL, bare (no CATZOC)
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    portray.setQuiet(true);
+    const streams = try portray.portrayCell(a, &cell, "");
+    try std.testing.expectEqual(@as(usize, 2), streams.len);
+
+    // [0] CATZOC=3 -> the DQUALB01 fill (unchanged by the Gap D deconstruction).
+    try std.testing.expect(has(streams[0], "AreaFillReference:DQUALB01"));
+
+    // [1] no CATZOC -> the NODATA03 "quality unknown" fill (S-52's bare-M_QUAL lookup
+    // line): the always-emitted zoneOfConfidence entry takes the rule's else branch.
+    // Before the deconstruction this feature emitted no fill at all (a silent miss).
+    try std.testing.expect(has(streams[1], "AreaFillReference:NODATA03"));
+}
+
+test "golden Part-9 stream: low-accuracy QUAPOS lights the SpatialQuality rule branches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two coastlines drawn over VE edges: one carrying QUAPOS=3 (inadequately
+    // surveyed -> remapped qualityOfHorizontalMeasurement=4), one surveyed (QUAPOS=1
+    // -> no spatial quality). QUALIN02 must draw LOWACC21 for the first and the
+    // solid CSTLN line for the second. A low-accuracy wreck point must gain
+    // QUAPNT02's LOWACC01 quality mark next to its danger symbol.
+    var vectors = try a.alloc(s57.VectorRecord, 2);
+    vectors[0] = .{ .rcnm = s57.RCNM_VE, .rcid = 10, .points = &.{}, .soundings = &.{}, .quapos = 3 };
+    vectors[1] = .{ .rcnm = s57.RCNM_VE, .rcid = 20, .points = &.{}, .soundings = &.{}, .quapos = 1 };
+    var edges = std.AutoHashMap(u32, usize).init(a);
+    try edges.put(10, 0);
+    try edges.put(20, 1);
+
+    const refs_low = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 10 }, .ornt = 1 }};
+    const refs_ok = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 20 }, .ornt = 1 }};
+    const wreck_attrs = [_]s57.Attr{.{ .code = 71, .value = "2" }}; // CATWRK=2 dangerous wreck
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 2, .objl = 30, .refs = &refs_low }, // COALNE, low accuracy
+        .{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = 30, .refs = &refs_ok }, // COALNE, surveyed
+        .{ .rcnm = 100, .rcid = 3, .prim = 1, .objl = 159, .refs = &refs_low, .attrs = &wreck_attrs }, // WRECKS, low accuracy
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = vectors,
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = edges,
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    portray.setQuiet(true);
+    const streams = try portray.portrayCell(a, &cell, "");
+    try std.testing.expectEqual(@as(usize, 3), streams.len);
+
+    // [0] low-accuracy coastline: QUALIN02's LOWACC21 linestyle, no solid CSTLN.
+    try std.testing.expect(has(streams[0], "LineInstruction:LOWACC21"));
+    try std.testing.expect(!has(streams[0], "CSTLN"));
+
+    // [1] surveyed coastline: the normal solid CSTLN simple line, no LOWACC21.
+    try std.testing.expect(has(streams[1], "CSTLN"));
+    try std.testing.expect(!has(streams[1], "LOWACC21"));
+
+    // [2] low-accuracy wreck: QUAPNT02 adds the LOWACC01 accuracy mark (90011).
+    try std.testing.expect(has(streams[2], "PointInstruction:LOWACC01"));
+}

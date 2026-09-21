@@ -1,0 +1,2815 @@
+//! C ABI for libtile57.a — a thin shim over the Zig engine API (chart.zig).
+//!
+//! Contract: POD across the seam. Every export that can fail returns a tile57_status
+//! (0 = OK), takes an optional caller-owned tile57_error* it fills on failure,
+//! and defines its out-parameters on every return (result on OK, NULL/0
+//! otherwise). Zig errors, slices and optionals stay inside chart.zig. Public
+//! header: ../../include/tile57.h. The opaque `tile57` is a `*chart.Chart`;
+//! the opaque `tile57_compose` is a `*compose.ComposeSource`.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const chart = @import("chart.zig");
+const auxfiles = @import("engine").auxfiles; // via the named module: engine owns the file
+const scene = @import("engine").scene; // tile surface + the complex-linestyle walk
+const mlt_dec = @import("tiles").mlt; // decoding a verbatim composed tile
+const s57 = @import("s57");
+const bundle = @import("bundle"); // portrayal-asset emitters + the partition debug bake
+const compose = @import("compose"); // the runtime tile compositor (tile57_compose_*)
+const mariner = @import("style").mariner;
+const style = @import("style");
+const errors = @import("errors"); // the engine error taxonomy + describe()
+const raster = @import("raster"); // raster charts (tile57_raster_chart_*)
+const zipsrc = @import("zipsrc"); // charts read straight out of a .zip
+// The S-52 ColorProfiles/colorProfile.xml baked into the library (build.zig), so
+// the style C ABI generates colortables + a base style template with no on-disk
+// catalogue. The full catalogue (symbols, linestyles, css) is embedded too, via
+// the `catalog` module bundle.zig imports — tile57_style_template reads the
+// analysed linestyles from it and tile57_bake_sprite_mln the symbol SVGs.
+const colorprofile_registry = @import("colorprofile_registry");
+
+// c_allocator, not smp_allocator: smp never returns freed slabs to the OS, so
+// the host app's footprint sticks at the worst transient peak forever. libc
+// malloc unmaps large blocks on free and Instruments can see it. Hot paths
+// allocate through arenas, so per-alloc speed is not the bottleneck.
+const gpa = std.heap.c_allocator;
+const Chart = chart.Chart;
+
+// One std.Io for the whole C ABI, stood up on first use and kept for the life
+// of the library.
+//
+// std.Io.Threaded.init installs PROCESS-GLOBAL SIGIO/SIGPIPE handlers and
+// deinit restores them. One per call therefore costs two sigaction round-trips
+// and a getCpuCount on EVERY entry — tile57_chart_open runs once per cell, so
+// thousands of times to open a library — and, worse, two threads opening at
+// once interleave those save/restores: a thread can capture the other's
+// temporary handler as "old" and reinstall it permanently. Sharing one instance
+// removes both. Threaded carries its own mutex for concurrent use.
+var io_inst: std.Io.Threaded = undefined;
+/// 0 = untouched, 1 = a thread is standing it up, 2 = ready.
+var io_state = std.atomic.Value(u8).init(0);
+
+fn sharedIo() std.Io {
+    if (io_state.load(.acquire) != 2) {
+        if (io_state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
+            io_inst = .init(gpa, .{});
+            io_state.store(2, .release);
+        } else {
+            while (io_state.load(.acquire) != 2) {} // the winner is microseconds away
+        }
+    }
+    return io_inst.io();
+}
+
+// Wall-clock time for "today" date resolution in tile57_style_build. Zig 0.16
+// keeps the clock behind Io; the lib links libc, so call time(3) directly.
+// std.c.time_t where the target defines it — wasi's is 64-bit while wasm32's
+// c_long is 32-bit, and wasm-ld rejects the signature mismatch against libc.
+// Windows leaves std.c.time_t void, so the binding keeps the c_long it always
+// used there (mingw maps time() onto its 64-bit variant itself).
+const CTimeT = if (std.c.time_t == void) c_long else std.c.time_t;
+extern fn time(tloc: ?*CTimeT) callconv(.c) CTimeT;
+
+// A release build reports the tag (see -Dversion in build.zig).
+const version_string = @import("buildinfo").version;
+
+fn spanOpt(s: ?[*:0]const u8) ?[]const u8 {
+    return if (s) |p| std.mem.span(p) else null;
+}
+
+// ---- error model (mirrors tile57_status / tile57_error in tile57.h) ---------
+
+// Keep in sync with the tile57_status enum in tile57.h.
+const Status = enum(c_int) { ok = 0, badarg, io, parse, nomem, unsupported, render, internal };
+
+// Mirrors tile57_error in tile57.h: a caller-owned status + fixed message buffer.
+const ERROR_MSG_MAX = 256;
+const CError = extern struct { status: c_int, message: [ERROR_MSG_MAX]u8 };
+
+const OK: c_int = @intFromEnum(Status.ok);
+
+// Map an engine error (errors.Error) to a tile57_status. std IO errors that can
+// surface directly from file ops map to .io; anything unrecognised is .internal.
+fn statusOf(e: anyerror) Status {
+    return switch (e) {
+        error.OutOfMemory => .nomem,
+        error.Unsupported => .unsupported,
+        error.RenderFailed, error.TileGen => .render,
+        error.InvalidCell, error.InvalidArchive, error.InvalidPartition => .parse,
+        // Specific S-57 / ISO 8211 parse failures, propagated so the message
+        // carries the exact reason (e.g. "BadLeader", "UnknownRUIN").
+        error.ShortLeader,
+        error.BadLeader,
+        error.BadAsciiInt,
+        error.BadAsciiDigit,
+        error.MissingFieldTerminator,
+        error.FieldOutOfBounds,
+        error.ModifyMissingSpatial,
+        error.ModifyMissingFeature,
+        error.UnknownRUIN,
+        error.BadFeatureRecord,
+        => .parse,
+        error.NotFound, error.IoFailed => .io,
+        error.FileNotFound, error.AccessDenied, error.NotDir, error.IsDir, error.OpenFailed => .io,
+        else => .internal,
+    };
+}
+
+// Fill an optional caller-provided tile57_error (NULL to ignore) with a status +
+// message; the message is copied, truncated to fit, and NUL-terminated.
+fn setError(err: ?*CError, status: Status, msg: []const u8) void {
+    const dst = err orelse return;
+    dst.status = @intFromEnum(status);
+    const n = @min(msg.len, ERROR_MSG_MAX - 1);
+    @memcpy(dst.message[0..n], msg[0..n]);
+    dst.message[n] = 0;
+}
+
+// Report a Zig error: set `err` (if any) with the mapped status + describe()
+// message, and return the status code.
+fn fail(err: ?*CError, e: anyerror) c_int {
+    const s = statusOf(e);
+    setError(err, s, errors.describe(e));
+    return @intFromEnum(s);
+}
+
+// Like fail, but prefix the message with a context string (e.g. the file path):
+// "US5MD1MC.000: malformed ISO 8211 leader". Truncated to fit.
+fn failCtx(err: ?*CError, e: anyerror, context: []const u8) c_int {
+    const s = statusOf(e);
+    if (err) |dst| {
+        dst.status = @intFromEnum(s);
+        const msg = std.fmt.bufPrint(dst.message[0 .. ERROR_MSG_MAX - 1], "{s}: {s}", .{ context, errors.describe(e) }) catch blk: {
+            // Context + reason overflowed the buffer; keep the reason alone.
+            const r = errors.describe(e);
+            const n = @min(r.len, ERROR_MSG_MAX - 1);
+            @memcpy(dst.message[0..n], r[0..n]);
+            break :blk dst.message[0..n];
+        };
+        dst.message[msg.len] = 0;
+    }
+    return @intFromEnum(s);
+}
+
+// Report a specific status with a literal message.
+fn failWith(err: ?*CError, status: Status, msg: []const u8) c_int {
+    setError(err, status, msg);
+    return @intFromEnum(status);
+}
+
+// Validate + zero a (bytes, len) out-parameter pair. Every buffer-returning
+// export runs this first, so outs are defined (NULL/0) on every return path.
+fn bytesOut(out: ?*?[*]u8, out_len: ?*usize) error{BadArg}!struct { *?[*]u8, *usize } {
+    const o = out orelse return error.BadArg;
+    const n = out_len orelse return error.BadArg;
+    o.* = null;
+    n.* = 0;
+    return .{ o, n };
+}
+
+// ---- export allocations ------------------------------------------------------
+// Every buffer handed across the ABI is length-prefixed: a 16-byte header (the
+// total allocation size in its first usize) sits before the returned pointer, so
+// tile57_free needs only the pointer — the classic malloc shape — and the payload
+// stays 16-aligned.
+const EXPORT_HDR: usize = 16;
+
+fn exportAlloc(len: usize) ?[*]u8 {
+    const total = EXPORT_HDR + len;
+    const raw = gpa.alignedAlloc(u8, .@"16", total) catch return null;
+    std.mem.writeInt(usize, raw[0..@sizeOf(usize)], total, .little);
+    return raw.ptr + EXPORT_HDR;
+}
+
+// Hand an engine-owned buffer across the ABI through (out, out_len): copy it into
+// an export allocation and free the engine buffer. Returns OK, or NOMEM with the
+// outs left NULL/0.
+fn exportOut(err: ?*CError, o: *?[*]u8, n: *usize, bytes: []u8) c_int {
+    defer chart.freeBytes(bytes);
+    const p = exportAlloc(bytes.len) orelse return failWith(err, .nomem, "out of memory");
+    @memcpy(p[0..bytes.len], bytes);
+    o.* = p;
+    n.* = bytes.len;
+    return OK;
+}
+
+const bad_out = "out/out_len must not be null";
+
+/// Return a static, human-readable string for a tile57_status.
+export fn tile57_status_str(status: c_int) callconv(.c) [*:0]const u8 {
+    return switch (status) {
+        @intFromEnum(Status.ok) => "ok",
+        @intFromEnum(Status.badarg) => "invalid argument",
+        @intFromEnum(Status.io) => "I/O error",
+        @intFromEnum(Status.parse) => "malformed input",
+        @intFromEnum(Status.nomem) => "out of memory",
+        @intFromEnum(Status.unsupported) => "unsupported input",
+        @intFromEnum(Status.render) => "render failed",
+        @intFromEnum(Status.internal) => "internal error",
+        else => "unknown error",
+    };
+}
+
+/// Return the library version string ("0.3.1"). A release build reports the
+/// tag. The string is static, so it needs no free.
+export fn tile57_version() callconv(.c) [*:0]const u8 {
+    return version_string;
+}
+
+// ===========================================================================
+// 3. Bake — ENC source data in, per-cell PMTiles out (see tile57.h)
+// ===========================================================================
+
+/// The per-cell metadata of the S-57 data at `path` (one .000 or a whole ENC_ROOT)
+/// as a JSON array — name/scale/edition/update/issueDate/agency/bbox per cell,
+/// DSID fields reflecting the applied update chain. See tile57.h.
+export fn tile57_enc_charts(path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
+    const c = Chart.openPath(p, null, false) catch |e| return failCtx(err, e, p);
+    defer c.deinit();
+    const bytes = (c.chartsJson() catch |e| return fail(err, e)) orelse return OK;
+    return exportOut(err, o, n, bytes);
+}
+
+/// The features of the S-57 data at `path` (one cell or a whole ENC_ROOT) for the
+/// comma-separated object-class acronyms `classes`, as a GeoJSON FeatureCollection
+/// (lon/lat geometry; properties = {"class", ...full S-57 attribute map}). Parsed
+/// without portrayal. NULL/0 out when nothing matched. See tile57.h.
+export fn tile57_enc_features(path: ?[*:0]const u8, classes: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
+    const cls = spanOpt(classes) orelse return failWith(err, .badarg, "classes must not be null");
+    const c = Chart.openPath(p, null, false) catch |e| return failCtx(err, e, p);
+    defer c.deinit();
+    const bytes = (c.featuresJson(cls) catch |e| return fail(err, e)) orelse return OK;
+    return exportOut(err, o, n, bytes);
+}
+
+/// tile57_enc_features over in-memory base-cell bytes (no update chain). See tile57.h.
+export fn tile57_enc_features_bytes(base: ?[*]const u8, len: usize, classes: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const b = base orelse return failWith(err, .badarg, "base must not be null");
+    if (len == 0) return failWith(err, .badarg, "len must not be zero");
+    const cls = spanOpt(classes) orelse return failWith(err, .badarg, "classes must not be null");
+    const charts_in = [_]chart.ChartInput{.{ .base = b[0..len] }};
+    const c = Chart.openCharts(&charts_in, null, false) catch |e| return fail(err, e);
+    defer c.deinit();
+    const bytes = (c.featuresJson(cls) catch |e| return fail(err, e)) orelse return OK;
+    return exportOut(err, o, n, bytes);
+}
+
+/// Decode a CATALOG.031 exchange-set catalogue into a JSON array of its CATD
+/// entries: [{"file","longName","impl","bbox"?}, ...]. NULL/0 out when the file
+/// holds no CATD records. See tile57.h.
+export fn tile57_enc_catalog(catalog_031: ?[*]const u8, len: usize, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const cat = catalog_031 orelse return failWith(err, .badarg, "catalog_031 must not be null");
+    if (len == 0) return failWith(err, .badarg, "len must not be zero");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = s57.parseCatalog(a, cat[0..len]) orelse return failWith(err, .parse, "malformed CATALOG.031");
+    if (entries.len == 0) return OK;
+    var buf = std.ArrayList(u8).empty;
+    catalogJson(a, &buf, entries) catch |e| return fail(err, e);
+    const bytes = gpa.dupe(u8, buf.items) catch |e| return fail(err, e);
+    return exportOut(err, o, n, bytes);
+}
+
+fn catalogJson(a: std.mem.Allocator, buf: *std.ArrayList(u8), entries: []const s57.CatalogEntry) !void {
+    try buf.append(a, '[');
+    for (entries, 0..) |e, i| {
+        if (i > 0) try buf.append(a, ',');
+        try buf.appendSlice(a, "{\"file\":");
+        try jsonStr(a, buf, e.path);
+        try buf.appendSlice(a, ",\"longName\":");
+        try jsonStr(a, buf, e.long_name);
+        try buf.appendSlice(a, ",\"impl\":");
+        try jsonStr(a, buf, e.impl);
+        if (e.bbox) |b| try buf.print(a, ",\"bbox\":[{d},{d},{d},{d}]", .{ b[0], b[1], b[2], b[3] });
+        try buf.append(a, '}');
+    }
+    try buf.append(a, ']');
+}
+
+fn jsonStr(a: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    try buf.append(a, '"');
+    for (s) |ch| switch (ch) {
+        '"' => try buf.appendSlice(a, "\\\""),
+        '\\' => try buf.appendSlice(a, "\\\\"),
+        else => if (ch < 0x20) {
+            try buf.print(a, "\\u{x:0>4}", .{ch});
+        } else try buf.append(a, ch),
+    };
+    try buf.append(a, '"');
+}
+
+/// Bake ONE cell (+ its updates, read from disk) to PMTiles bytes over its NATIVE
+/// band zoom range, into *out / *out_len (free with tile57_free); NULL/0 when the
+/// cell produced no tiles. See tile57.h.
+export fn tile57_bake_chart_bytes(path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
+    const archive = chart.bakeChartBytes(p, null) catch |e| return failCtx(err, e, p);
+    if (archive) |a| return exportOut(err, o, n, a);
+    return OK;
+}
+
+/// Bake `n` charts to per-chart PMTiles bytes IN PARALLEL across up to `workers`
+/// threads; out_bytes[i]/out_lens[i] get cell i's archive (free each with
+/// tile57_free) or NULL/0 when it produced nothing. *out_baked (NULL to ignore) =
+/// the count that produced bytes. `workers` is a MEMORY bound. See tile57.h.
+export fn tile57_bake_charts(
+    paths: ?[*]const ?[*:0]const u8,
+    n: usize,
+    workers: u32,
+    out_bytes: ?[*]?[*]u8,
+    out_lens: ?[*]usize,
+    out_baked: ?*usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    const ps = paths orelse return failWith(err, .badarg, "paths must not be null");
+    const ob = out_bytes orelse return failWith(err, .badarg, "out_bytes must not be null");
+    const ol = out_lens orelse return failWith(err, .badarg, "out_lens must not be null");
+    if (n == 0) return OK;
+    for (0..n) |i| {
+        ob[i] = null;
+        ol[i] = 0;
+    }
+    const list = gpa.alloc([]const u8, n) catch |e| return fail(err, e);
+    defer gpa.free(list);
+    for (0..n) |i| list[i] = spanOpt(ps[i]) orelse return failWith(err, .badarg, "a path in paths is null");
+    const results = gpa.alloc(?[]u8, n) catch |e| return fail(err, e);
+    defer gpa.free(results);
+    chart.bakeChartsParallel(list, null, workers, results);
+    var baked: usize = 0;
+    var oom = false;
+    for (0..n) |i| {
+        const b = results[i] orelse continue;
+        defer chart.freeBytes(b);
+        if (oom) continue;
+        const p = exportAlloc(b.len) orelse {
+            oom = true;
+            continue;
+        };
+        @memcpy(p[0..b.len], b);
+        ob[i] = p;
+        ol[i] = b.len;
+        baked += 1;
+    }
+    if (oom) {
+        for (0..n) |i| {
+            if (ob[i]) |p| tile57_free(p);
+            ob[i] = null;
+            ol[i] = 0;
+        }
+        return failWith(err, .nomem, "out of memory");
+    }
+    if (out_baked) |p| p.* = baked;
+    return OK;
+}
+
+/// Walk `in_dir` for S-57 base charts (*.000) and bake each IN PARALLEL to the SAME
+/// relative path under `out_dir` with a .pmtiles extension (+ an <out>.sha sidecar),
+/// creating subdirs as needed. INCREMENTAL: an archive already at least as new as
+/// its whole input is skipped, so *out_baked (NULL to ignore) counts THIS run only.
+/// `progress` returning false CANCELS (OK, with out_baked = what finished — see
+/// tile57.h). An unreadable `in_dir` errors. See tile57.h.
+export fn tile57_bake_tree(
+    in_dir: ?[*:0]const u8,
+    out_dir: ?[*:0]const u8,
+    workers: u32,
+    progress: chart.BakeProgress,
+    progress_ctx: ?*anyopaque,
+    out_baked: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    const in_d = spanOpt(in_dir) orelse return failWith(err, .badarg, "in_dir must not be null");
+    const out_d = spanOpt(out_dir) orelse return failWith(err, .badarg, "out_dir must not be null");
+    // Stand up a threaded std.Io for the tree walk + the workers' file writes.
+    // No label callback: this ABI reports progress as a count, and a chart name would have to cross
+    // the seam as a string. A Zig caller that owns the input list names the charts itself.
+    const baked = chart.bakeTree(sharedIo(), in_d, out_d, null, workers, progress, progress_ctx, null) catch |e| return failCtx(err, e, in_d);
+    if (out_baked) |p| p.* = @intCast(baked);
+    return OK;
+}
+
+/// Bake a whole exchange set out of its .zip in one call — the archive twin of
+/// tile57_bake_tree, naming every output itself. See tile57.h.
+export fn tile57_bake_zip(
+    zip_path: ?[*:0]const u8,
+    out_dir: ?[*:0]const u8,
+    workers: u32,
+    progress: chart.BakeProgress,
+    progress_ctx: ?*anyopaque,
+    out_baked: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    const zp = spanOpt(zip_path) orelse return failWith(err, .badarg, "zip_path must not be null");
+    const out_d = spanOpt(out_dir) orelse return failWith(err, .badarg, "out_dir must not be null");
+    // No label callback, for the same reason tile57_bake_tree has none: this
+    // ABI reports progress as a count, and naming a chart would put a string
+    // across the seam. A caller that wants names owns the list and calls
+    // tile57_bake_zip_charts instead.
+    const baked = chart.bakeZip(sharedIo(), zp, out_d, null, workers, progress, progress_ctx, null) catch |e| return failCtx(err, e, zp);
+    if (out_baked) |p| p.* = @intCast(baked);
+    return OK;
+}
+
+/// Bake the cells at `in_paths` to the archives at `out_paths`, in parallel.
+/// The CALLER owns the list, so `label` names each finished chart by its index
+/// into it and no string crosses the ABI. See tile57.h.
+export fn tile57_bake_files(
+    in_paths: ?[*]const [*:0]const u8,
+    out_paths: ?[*]const [*:0]const u8,
+    n: usize,
+    workers: u32,
+    progress: chart.BakeProgress,
+    label: chart.BakeLabel,
+    progress_ctx: ?*anyopaque,
+    out_baked: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    if (n == 0) return OK;
+    const ins = in_paths orelse return failWith(err, .badarg, "in_paths must not be null");
+    const outs = out_paths orelse return failWith(err, .badarg, "out_paths must not be null");
+
+    const in_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(in_list);
+    const out_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(out_list);
+    for (0..n) |i| {
+        in_list[i] = std.mem.span(ins[i]);
+        out_list[i] = std.mem.span(outs[i]);
+    }
+    const baked = chart.bakeChartsToFiles(sharedIo(), in_list, out_list, null, workers, progress, progress_ctx, label, true);
+    if (out_baked) |p| p.* = @intCast(baked);
+    return OK;
+}
+
+/// One raster bake in flight, shared by its workers.
+const RasterJob = struct {
+    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Sheet paths, or — when `zip` is set — names of entries inside it.
+    in: []const []const u8,
+    out: []const []const u8,
+    ok: []bool,
+    /// The archive the sheets are read out of, or null to read from disk.
+    zip: ?*const zipsrc.Archive = null,
+    progress: chart.BakeProgress,
+    label: chart.BakeLabel,
+    ctx: ?*anyopaque,
+};
+
+/// One raster chart: read, warp, write. It decodes whole (an ocean sheet is
+/// about 180 Mpx) plus the pyramid it warps into, so this takes libc's
+/// allocator and frees everything before the next one starts.
+fn bakeOneRaster(io: std.Io, job: *RasterJob, i: usize) void {
+    const a = std.heap.c_allocator;
+    const stem = std.fs.path.stem(std.fs.path.basename(job.in[i]));
+    // From the archive or from disk — the warp below cannot tell which.
+    const kap = blk: {
+        if (job.zip) |z| {
+            const idx = z.find(job.in[i]) orelse return;
+            break :blk z.readAlloc(a, io, idx, MAX_RASTER_BYTES) catch return;
+        }
+        break :blk std.Io.Dir.cwd().readFileAlloc(io, job.in[i], a, .unlimited) catch return;
+    };
+    defer a.free(kap);
+    const baked = raster.bakebsb.bakeBytes(a, kap, stem) catch return;
+    defer a.free(baked.bytes);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = job.out[i], .data = baked.bytes }) catch return;
+    job.ok[i] = true;
+}
+
+fn rasterWorker(job: *RasterJob) void {
+    const a = std.heap.c_allocator;
+    // Its own std.Io: a worker must not share the caller's.
+    const threaded = a.create(std.Io.Threaded) catch return;
+    threaded.* = .init(a, .{});
+    defer {
+        threaded.deinit();
+        a.destroy(threaded);
+    }
+    const io = threaded.io();
+    while (true) {
+        if (job.cancel.load(.monotonic)) return; // a peer's progress callback said stop
+        const i = job.next.fetchAdd(1, .monotonic);
+        if (i >= job.in.len) return;
+        bakeOneRaster(io, job, i);
+        if (job.label) |lb| lb(job.ctx, @intCast(i));
+        const d = job.done.fetchAdd(1, .monotonic) + 1;
+        if (job.progress) |cb| {
+            if (!cb(job.ctx, d, @intCast(job.in.len))) {
+                job.cancel.store(true, .monotonic);
+                return;
+            }
+        }
+    }
+}
+
+/// Bake the BSB/KAP charts at `in_paths` to the archives at `out_paths`. This
+/// is tile57_bake_files for raster charts. See tile57.h.
+export fn tile57_bake_rasters(
+    in_paths: ?[*]const [*:0]const u8,
+    out_paths: ?[*]const [*:0]const u8,
+    n: usize,
+    workers: u32,
+    progress: chart.BakeProgress,
+    label: chart.BakeLabel,
+    progress_ctx: ?*anyopaque,
+    out_baked: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    if (n == 0) return OK;
+    const ins = in_paths orelse return failWith(err, .badarg, "in_paths must not be null");
+    const outs = out_paths orelse return failWith(err, .badarg, "out_paths must not be null");
+
+    const in_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(in_list);
+    const out_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(out_list);
+    const ok = gpa.alloc(bool, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(ok);
+    @memset(ok, false);
+    for (0..n) |i| {
+        in_list[i] = std.mem.span(ins[i]);
+        out_list[i] = std.mem.span(outs[i]);
+    }
+
+    var job = RasterJob{
+        .in = in_list,
+        .out = out_list,
+        .ok = ok,
+        .progress = progress,
+        .label = label,
+        .ctx = progress_ctx,
+    };
+    // A worker holds one whole chart, so `workers` is a MEMORY bound here, as
+    // it is for cells.
+    //
+    // EVERY worker is a thread of ours, and the calling thread only waits.
+    // Warping a sheet needs a deep stack: an ocean sheet decodes to about 180
+    // megapixels. The cell bake can borrow the caller's thread safely, but a
+    // host that calls this from a pool thread with a small stack (libdispatch
+    // gives 512 KB) crashes inside the warp. Asking for the stack here is the
+    // only way to know it is there.
+    const stack = 16 * 1024 * 1024;
+    var threads: [8]std.Thread = undefined;
+    var spawned: usize = 0;
+    // Single-threaded build (wasm): spawn is a compile error, so the fan-out
+    // is comptime-gated and the caller's thread does all the work below.
+    if (!builtin.single_threaded) {
+        const want = @min(@max(workers, 1), @min(threads.len, n));
+        while (spawned < want) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{ .stack_size = stack }, rasterWorker, .{&job}) catch break;
+        }
+    }
+    if (spawned == 0) rasterWorker(&job); // nothing would run otherwise
+    for (threads[0..spawned]) |t| t.join();
+
+    var baked: u32 = 0;
+    for (ok) |o| {
+        if (o) baked += 1;
+    }
+    if (out_baked) |p| p.* = baked;
+
+    // The ownership partition, beside the archives, as the ENC bake writes one.
+    // Without it every open rebuilds the quilt in memory, and a host with a
+    // thousand sheets pays for that on the boat instead of here, once.
+    if (baked > 0) writeRasterPartition(out_list, ok);
+    return OK;
+}
+
+/// Build the quilt over the archives just written and leave it beside them.
+/// Best effort: a library with no partition still draws, only slower.
+fn writeRasterPartition(out_list: []const []const u8, ok: []const bool) void {
+    const io = sharedIo();
+    var charts = std.ArrayList(*raster.RasterChart).empty;
+    defer {
+        for (charts.items) |rc| {
+            rc.close();
+            gpa.destroy(rc);
+        }
+        charts.deinit(gpa);
+    }
+    var archives = std.ArrayList(compose.ChartArchive).empty;
+    defer archives.deinit(gpa);
+
+    var dir: []const u8 = "";
+    for (out_list, ok) |path, good| {
+        if (!good) continue;
+        const pz = gpa.dupeZ(u8, path) catch continue;
+        defer gpa.free(pz);
+        const opened = raster.RasterChart.open(io, gpa, pz, null) catch continue;
+        const rc = gpa.create(raster.RasterChart) catch continue;
+        rc.* = opened;
+        charts.append(gpa, rc) catch continue;
+        // One directory per chart, so the library is the directory above.
+        if (dir.len == 0) {
+            const own = std.fs.path.dirname(path) orelse continue;
+            dir = std.fs.path.dirname(own) orelse own;
+        }
+        const rd = rc.pmtilesReader() orelse continue;
+        const cov = rc.decodedCoverage() orelse continue;
+        archives.append(gpa, .{ .reader = rd, .cov = cov }) catch continue;
+    }
+    if (archives.items.len == 0 or dir.len == 0) return;
+
+    const src = (compose.ComposeSource.openRasters(gpa, archives.items, null) catch return) orelse return;
+    defer src.deinit();
+    const bytes = src.serializePartition(gpa) catch return;
+    defer gpa.free(bytes);
+    const path = std.fs.path.join(gpa, &.{ dir, "partition.tpart" }) catch return;
+    defer gpa.free(path);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes }) catch {};
+}
+
+// ---- charts inside a .zip ----------------------------------------------------
+// A chart archive is opened, read from, and closed within each call. Walking a
+// 27,680-entry central directory costs about 8 ms, so the alternative — an open
+// handle the host must hold, close, and keep off other threads — buys nothing
+// and can be got wrong.
+
+/// The largest a single raster sheet may claim to expand to. A KAP runs to tens
+/// of megabytes; the cap is here so a bad header fails instead of allocating.
+const MAX_RASTER_BYTES: u64 = 512 << 20;
+
+/// List what a .zip holds: [{"name":..,"size":..,"packed":..}, ..] into
+/// *out / *out_len (free with tile57_free). See tile57.h.
+export fn tile57_zip_list(zip_path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const zp = spanOpt(zip_path) orelse return failWith(err, .badarg, "zip_path must not be null");
+    const io = sharedIo();
+    var arc = zipsrc.Archive.open(gpa, io, zp) catch |e| return failCtx(err, e, zp);
+    defer arc.deinit();
+    const json = arc.toJson(gpa) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(json);
+    // Copied with its terminator: the payload is length-delimited by *out_len
+    // AND readable as a C string, so a host can take either.
+    const p = exportAlloc(json.len + 1) orelse return failWith(err, .nomem, "out of memory");
+    @memcpy(p[0 .. json.len + 1], json[0 .. json.len + 1]);
+    o.* = p;
+    n.* = json.len;
+    return OK;
+}
+
+/// Inflate entries out of a .zip to paths the CALLER names, streaming. See tile57.h.
+export fn tile57_zip_extract(
+    zip_path: ?[*:0]const u8,
+    names: ?[*]const [*:0]const u8,
+    out_paths: ?[*]const [*:0]const u8,
+    n: usize,
+    progress: chart.BakeProgress,
+    progress_ctx: ?*anyopaque,
+    out_done: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_done) |p| p.* = 0;
+    if (n == 0) return OK;
+    const zp = spanOpt(zip_path) orelse return failWith(err, .badarg, "zip_path must not be null");
+    const ns = names orelse return failWith(err, .badarg, "names must not be null");
+    const outs = out_paths orelse return failWith(err, .badarg, "out_paths must not be null");
+
+    const io = sharedIo();
+    var arc = zipsrc.Archive.open(gpa, io, zp) catch |e| return failCtx(err, e, zp);
+    defer arc.deinit();
+
+    // Serial on purpose: this is one file stream to disk per entry, and the
+    // entries that come this way are the big ones (a 4 GiB .mbtiles), where
+    // the disk is the limit and parallel writers only fight over it.
+    var done: u32 = 0;
+    for (0..n) |i| {
+        const name = std.mem.span(ns[i]);
+        const idx = arc.find(name) orelse continue;
+        arc.extractTo(io, idx, std.mem.span(outs[i])) catch continue;
+        done += 1;
+        if (progress) |cb| {
+            if (!cb(progress_ctx, @intCast(i + 1), @intCast(n))) break;
+        }
+    }
+    if (out_done) |p| p.* = done;
+    return OK;
+}
+
+/// tile57_bake_files reading the cells STRAIGHT OUT of a .zip. See tile57.h.
+export fn tile57_bake_zip_charts(
+    zip_path: ?[*:0]const u8,
+    names: ?[*]const [*:0]const u8,
+    out_paths: ?[*]const [*:0]const u8,
+    n: usize,
+    workers: u32,
+    progress: chart.BakeProgress,
+    label: chart.BakeLabel,
+    progress_ctx: ?*anyopaque,
+    out_baked: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    if (n == 0) return OK;
+    const zp = spanOpt(zip_path) orelse return failWith(err, .badarg, "zip_path must not be null");
+    const ns = names orelse return failWith(err, .badarg, "names must not be null");
+    const outs = out_paths orelse return failWith(err, .badarg, "out_paths must not be null");
+
+    const in_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(in_list);
+    const out_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(out_list);
+    for (0..n) |i| {
+        in_list[i] = std.mem.span(ns[i]);
+        out_list[i] = std.mem.span(outs[i]);
+    }
+
+    const io = sharedIo();
+    var arc = zipsrc.Archive.open(gpa, io, zp) catch |e| return failCtx(err, e, zp);
+    defer arc.deinit();
+    const baked = chart.bakeZipChartsToFiles(io, &arc, in_list, out_list, null, workers, progress, progress_ctx, label, true);
+    if (out_baked) |p| p.* = @intCast(baked);
+    return OK;
+}
+
+/// tile57_bake_rasters reading the sheets STRAIGHT OUT of a .zip. See tile57.h.
+export fn tile57_bake_zip_rasters(
+    zip_path: ?[*:0]const u8,
+    names: ?[*]const [*:0]const u8,
+    out_paths: ?[*]const [*:0]const u8,
+    n: usize,
+    workers: u32,
+    progress: chart.BakeProgress,
+    label: chart.BakeLabel,
+    progress_ctx: ?*anyopaque,
+    out_baked: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    if (n == 0) return OK;
+    const zp = spanOpt(zip_path) orelse return failWith(err, .badarg, "zip_path must not be null");
+    const ns = names orelse return failWith(err, .badarg, "names must not be null");
+    const outs = out_paths orelse return failWith(err, .badarg, "out_paths must not be null");
+
+    const in_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(in_list);
+    const out_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(out_list);
+    const ok = gpa.alloc(bool, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(ok);
+    @memset(ok, false);
+    for (0..n) |i| {
+        in_list[i] = std.mem.span(ns[i]);
+        out_list[i] = std.mem.span(outs[i]);
+    }
+
+    const io = sharedIo();
+    var arc = zipsrc.Archive.open(gpa, io, zp) catch |e| return failCtx(err, e, zp);
+    defer arc.deinit();
+
+    var job = RasterJob{
+        .in = in_list,
+        .out = out_list,
+        .ok = ok,
+        .zip = &arc,
+        .progress = progress,
+        .label = label,
+        .ctx = progress_ctx,
+    };
+    // Same deep stacks as tile57_bake_rasters: the warp is the same work,
+    // only the bytes arrive from the archive instead of a file.
+    const stack = 16 * 1024 * 1024;
+    var threads: [8]std.Thread = undefined;
+    var spawned: usize = 0;
+    // Same comptime gate as tile57_bake_rasters: serial on a single-threaded build.
+    if (!builtin.single_threaded) {
+        const want = @min(@max(workers, 1), @min(threads.len, n));
+        while (spawned < want) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{ .stack_size = stack }, rasterWorker, .{&job}) catch break;
+        }
+    }
+    if (spawned == 0) rasterWorker(&job);
+    for (threads[0..spawned]) |t| t.join();
+
+    var baked: u32 = 0;
+    for (ok) |o| {
+        if (o) baked += 1;
+    }
+    if (out_baked) |p| p.* = baked;
+    if (baked > 0) writeRasterPartition(out_list, ok);
+    return OK;
+}
+
+/// The metadata JSON blob of a PMTiles archive (decompressed) — e.g. the embedded
+/// per-cell "coverage" a single-cell bake carries — into *out / *out_len (free with
+/// tile57_free); NULL/0 when the archive carries none. See tile57.h.
+export fn tile57_pmtiles_metadata(pmtiles_ptr: ?[*]const u8, len: usize, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const p = pmtiles_ptr orelse return failWith(err, .badarg, "pmtiles must not be null");
+    if (len == 0) return failWith(err, .badarg, "len must not be zero");
+    const meta = chart.pmtilesMetadata(gpa, p[0..len]) catch |e| return fail(err, e);
+    if (meta) |m| return exportOut(err, o, n, m);
+    return OK;
+}
+
+/// Bake the ownership-partition DEBUG tiles from an ENC_ROOT into a single PMTiles
+/// at out_path (composited ownership faces, no portrayed content — for a
+/// partition-debug UI). OK with *out_cell_count = 0 and no file written when
+/// nothing is covered. See tile57.h.
+export fn tile57_bake_partition_debug(
+    enc_root: ?[*:0]const u8,
+    out_path: ?[*:0]const u8,
+    minzoom: u8,
+    maxzoom: u8,
+    band: i8,
+    out_cell_count: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_cell_count) |p| p.* = 0;
+    const root = spanOpt(enc_root) orelse return failWith(err, .badarg, "enc_root must not be null");
+    const outp = spanOpt(out_path) orelse return failWith(err, .badarg, "out_path must not be null");
+    // The debug bake does filesystem I/O (read ENC_ROOT, write the pmtiles); the lib
+    // has no std.process.Init, so stand up a threaded std.Io for the call. It streams
+    // internally (StreamWriter over gpa), so pass the real gpa, not a scratch arena.
+    const nc = bundle.bakePartitionDebug(sharedIo(), gpa, root, outp, minzoom, maxzoom, band) catch |e| {
+        if (e == error.NoGeometry) return OK; // nothing covered: count stays 0
+        return failCtx(err, e, root);
+    };
+    if (out_cell_count) |p| p.* = @intCast(nc);
+    return OK;
+}
+
+// ===========================================================================
+// 4. Render — the `tile57` chart handle (see tile57.h)
+// ===========================================================================
+
+/// Open a baked PMTiles archive from a file path, mmap'd (never fully resident;
+/// the file must stay in place while the chart is open). See tile57.h.
+export fn tile57_chart_open(path: ?[*:0]const u8, out: ?*?*Chart, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
+    o.* = chart.openPmtilesPath(sharedIo(), p) catch |e| return failCtx(err, e, p);
+    return OK;
+}
+
+/// Open a baked PMTiles archive from in-memory bytes (copied). See tile57.h.
+export fn tile57_chart_open_bytes(pmtiles_ptr: ?[*]const u8, len: usize, out: ?*?*Chart, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const b = pmtiles_ptr orelse return failWith(err, .badarg, "pmtiles must not be null");
+    if (len == 0) return failWith(err, .badarg, "len must not be zero");
+    o.* = Chart.openBytes(b[0..len], .pmtiles, null) catch |e| return fail(err, e);
+    return OK;
+}
+
+// Fixed-size chart metadata (mirrors tile57_info in tile57.h).
+const CInfo = extern struct {
+    min_zoom: u8,
+    max_zoom: u8,
+    bands: u32,
+    has_bounds: bool,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    has_anchor: bool,
+    anchor_lat: f64,
+    anchor_lon: f64,
+    anchor_zoom: f64,
+    tile_type: u8, // the archive's stored encoding (TILE57_TILE_TYPE_*)
+    native_scale: i32, // embedded compilation scale (1:N); 0 = derive from zoom band
+    is_raster: bool, // the archive stores pictures, not vector tiles
+    // Cells handed to the open that produced no chart. The open succeeds while
+    // one parses, so this is what tells a host the set has a gap. Appended for
+    // ABI-append-safety; a zeroed struct reads 0.
+    skipped_cells: u32,
+};
+
+// tile57_tile_type values (keep in sync with tile57.h).
+const TILE_TYPE_MVT: u8 = 1;
+const TILE_TYPE_MLT: u8 = 2;
+
+/// Fill *out with the chart's fixed metadata (zoom range, bands, bounds, anchor,
+/// tile encoding, embedded compilation scale). See tile57.h.
+export fn tile57_chart_get_info(src: ?*Chart, out: ?*CInfo) callconv(.c) void {
+    const o = out orelse return;
+    o.* = std.mem.zeroes(CInfo);
+    const s = src orelse return;
+    const zr = s.zoomRange();
+    o.min_zoom = zr.min;
+    o.max_zoom = zr.max;
+    o.native_scale = s.nativeScale();
+    o.bands = s.bands();
+    o.tile_type = switch (s.tileType()) {
+        .mlt => TILE_TYPE_MLT,
+        else => TILE_TYPE_MVT,
+    };
+    // A raster archive opens as a chart and carries coverage and a scale, so
+    // nothing above tells it apart from a vector chart. Its tiles are images.
+    // tile_type cannot carry this: TILE57_TILE_TYPE_MLT is 2, and 2 is PNG in
+    // the PMTiles header.
+    o.skipped_cells = s.skipped_cells;
+    o.is_raster = switch (s.tileType()) {
+        .png, .jpeg, .webp, .avif => true,
+        else => false,
+    };
+    if (s.bounds()) |b| {
+        o.has_bounds = true;
+        o.west = b[0];
+        o.south = b[1];
+        o.east = b[2];
+        o.north = b[3];
+    }
+    if (s.anchor()) |a| {
+        o.has_anchor = true;
+        o.anchor_lat = a.lat;
+        o.anchor_lon = a.lon;
+        o.anchor_zoom = a.zoom;
+    }
+}
+
+/// The distinct SCAMIN denominators present in the chart (ascending, from the
+/// archive metadata); NULL/0 out when there are none. Free *out with
+/// tile57_free. See tile57.h.
+export fn tile57_chart_scamin(handle: ?*Chart, out: ?*?[*]i32, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, bad_out);
+    const n = out_len orelse return failWith(err, .badarg, bad_out);
+    o.* = null;
+    n.* = 0;
+    const s = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const vals = s.scamin() catch |e| return fail(err, e);
+    defer chart.freeBytes(std.mem.sliceAsBytes(vals));
+    if (vals.len == 0) return OK;
+    // SCAMIN denominators fit in int32 (the engine caps them).
+    const p = exportAlloc(vals.len * @sizeOf(i32)) orelse return failWith(err, .nomem, "out of memory");
+    @memcpy(p[0 .. vals.len * @sizeOf(u32)], std.mem.sliceAsBytes(vals));
+    o.* = @ptrCast(@alignCast(p));
+    n.* = vals.len;
+    return OK;
+}
+
+/// The label languages the chart states besides English, as NUL-terminated
+/// ISO 639-2 codes. A host offers the mariner these, because a
+/// `preferred_language` outside the set draws the portrayed name. One
+/// allocation holds the pointer array and the codes, so `tile57_free` on
+/// `*out` releases all of it.
+export fn tile57_chart_languages(handle: ?*Chart, out: ?*?[*]const [*:0]const u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, bad_out);
+    const n = out_len orelse return failWith(err, .badarg, bad_out);
+    o.* = null;
+    n.* = 0;
+    const s = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const codes = s.languages() catch |e| return fail(err, e);
+    defer {
+        for (codes) |c| gpa.free(c);
+        gpa.free(codes);
+    }
+    if (codes.len == 0) return OK;
+
+    var bytes: usize = codes.len * @sizeOf([*:0]const u8);
+    for (codes) |c| bytes += c.len + 1;
+    const p = exportAlloc(bytes) orelse return failWith(err, .nomem, "out of memory");
+    const table: [*][*:0]const u8 = @ptrCast(@alignCast(p));
+    var at: usize = codes.len * @sizeOf([*:0]const u8);
+    for (codes, 0..) |c, i| {
+        @memcpy(p[at .. at + c.len], c);
+        p[at + c.len] = 0;
+        table[i] = @ptrCast(p + at);
+        at += c.len + 1;
+    }
+    o.* = table;
+    n.* = codes.len;
+    return OK;
+}
+
+const CCoverageCb = extern struct {
+    ctx: ?*anyopaque,
+    ring: *const fn (?*anyopaque, lonlat: [*]const f64, npts: usize) callconv(.c) void,
+};
+
+/// The chart's M_COVR data-coverage polygons, from the coverage the bake embedded
+/// in the archive metadata: cb->ring is called once per polygon with its exterior
+/// ring as interleaved lon,lat doubles. OK with no calls when the archive embeds
+/// none. See tile57.h.
+export fn tile57_chart_coverage(handle: ?*Chart, cb: ?*const CCoverageCb, err: ?*CError) callconv(.c) c_int {
+    const self = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const cbp = cb orelse return failWith(err, .badarg, "cb must not be null");
+    const polys = self.coverage() orelse return OK;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (polys) |poly| {
+        if (poly.len == 0) continue;
+        const ring = poly[0]; // exterior ring
+        if (ring.len < 3) continue;
+        const flat = a.alloc(f64, ring.len * 2) catch continue;
+        for (ring, 0..) |p, i| {
+            flat[2 * i] = @as(f64, @floatFromInt(p.lon_e7)) / 1e7;
+            flat[2 * i + 1] = @as(f64, @floatFromInt(p.lat_e7)) / 1e7;
+        }
+        cbp.ring(cbp.ctx, flat.ptr, ring.len);
+    }
+    return OK;
+}
+
+/// The chart's own stored tile at (z,x,y), decompressed (MLT or MVT per
+/// tile57_info.tile_type), with NO composition — the per-archive primitive an
+/// embedder's own compositor consumes. NULL/0 out when the archive has no tile
+/// there. See tile57.h.
+export fn tile57_chart_tile(handle: ?*Chart, z: u8, x: u32, y: u32, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const rd = c.pmtilesReader() orelse return failWith(err, .badarg, "chart is not archive-backed");
+    const bytes = (rd.getTile(gpa, z, x, y) catch |e| return fail(err, e)) orelse return OK;
+    return exportOut(err, o, n, bytes);
+}
+
+/// The decoded pick report for one queried feature, as JSON: title, rows,
+/// notes and provenance, composed from the class, the cell name and the
+/// attribute payload of a query callback. See tile57.h.
+export fn tile57_s57_report(cls: ?[*]const u8, cls_len: usize, cell: ?[*]const u8, cell_len: usize, attrs: ?[*]const u8, attrs_len: usize, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const c = cls orelse return failWith(err, .badarg, "cls must not be null");
+    const ch = cell orelse return failWith(err, .badarg, "cell must not be null");
+    const s = attrs orelse return failWith(err, .badarg, "attrs must not be null");
+    const bytes = s57.decode.report(gpa, c[0..cls_len], ch[0..cell_len], s[0..attrs_len]) catch |e| return fail(err, e);
+    return exportOut(err, o, n, bytes);
+}
+
+const CQueryCb = @import("render").query.QueryCb;
+
+/// Cursor object-query at (lon,lat) for the view `zoom` (web-mercator): invokes
+/// cb->feature once per displayed feature the point falls in, with its S-57 class,
+/// attribute JSON, and source cell. See tile57.h.
+export fn tile57_chart_query(handle: ?*Chart, lon: f64, lat: f64, zoom: f64, cb: ?*const CQueryCb, err: ?*CError) callconv(.c) c_int {
+    const self = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const cbp = cb orelse return failWith(err, .badarg, "cb must not be null");
+    self.queryPoint(lon, lat, zoom, cbp) catch |e| return fail(err, e);
+    return OK;
+}
+
+const RenderPalette = @import("render").resolve.PaletteId;
+
+fn paletteOf(settings: *const mariner.Settings) RenderPalette {
+    return switch (settings.scheme) {
+        .day => .day,
+        .dusk => .dusk,
+        .night => .night,
+    };
+}
+
+// Shared render prologue: width/height must be 1..MAX_RENDER_PX per side.
+const MAX_RENDER_PX = 16384;
+const bad_size = "width/height must be 1..16384";
+
+/// Render a VIEW of this ONE chart (centre + fractional zoom + pixel size) to
+/// PNG: the archive's baked tiles replayed through the native S-52 pixel path —
+/// one scene across every covering tile, labels decluttered over the whole
+/// canvas. No composition (see tile57_compose_png for the composed twin).
+/// `m` NULL = defaults. See tile57.h.
+export fn tile57_chart_png(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    out: ?*?[*]u8,
+    out_len: ?*usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const bytes = c.renderView(lon, lat, zoom, width, height, paletteOf(&settings), &settings, .png, null) catch |e| return fail(err, e);
+    return exportOut(err, o, n, bytes);
+}
+
+/// tile57_chart_png's vector twin: the SAME scene as a deterministic single-page PDF
+/// (1 px = 1 pt, 72 dpi; vector fills, native strokes, glyph-outline text).
+export fn tile57_chart_pdf(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    out: ?*?[*]u8,
+    out_len: ?*usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const bytes = c.renderView(lon, lat, zoom, width, height, paletteOf(&settings), &settings, .pdf, null) catch |e| return fail(err, e);
+    return exportOut(err, o, n, bytes);
+}
+
+const CbCanvas = @import("render").cb_canvas.CCanvas;
+
+/// tile57_chart_png's callback twin: the SAME view painted through the C callback
+/// table `canvas` (see tile57.h) instead of rasterising. Geometry in canvas
+/// PIXEL space (y down), paint order, palette-resolved colours.
+export fn tile57_chart_canvas(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    canvas: ?*const CbCanvas,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const cb = canvas orelse return failWith(err, .badarg, "canvas must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const bytes = c.renderView(lon, lat, zoom, width, height, paletteOf(&settings), &settings, .callback, cb) catch |e| return fail(err, e);
+    chart.freeBytes(bytes); // the callback path returns an empty buffer
+    return OK;
+}
+
+const CSurface = @import("render").vector.CSurface;
+
+// TILE57_LABEL_DEBUG -> render.vector.debug_labels. Read HERE rather than in the
+// render module: only libc-linked artifacts include this file, while the package
+// tests compile render/ without libc.
+var label_debug_synced = false;
+fn syncLabelDebug() void {
+    if (label_debug_synced) return;
+    label_debug_synced = true;
+    @import("render").vector.debug_labels = std.c.getenv("TILE57_LABEL_DEBUG") != null;
+}
+
+/// The GPU vector twin: the SAME view emitted as a WORLD-SPACE tagged stream
+/// (areas/lines in web-mercator [0,1]; symbols/text as a world anchor + local
+/// reference-px outline; per-feature class + SCAMIN) to the C surface callback
+/// `surface` (see tile57.h). Pan/zoom re-portray nothing on the host.
+export fn tile57_chart_surface(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    rotation_rad: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+    err: ?*CError,
+) callconv(.c) c_int {
+    syncLabelDebug();
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    c.renderSurfaceView(lon, lat, zoom, rotation_rad, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    return OK;
+}
+
+/// The VIEW-level, globally-decluttered TEXT pass — emits ONLY labels (through the
+/// surface's draw_text_str / draw_text), decluttered across the whole view, and no
+/// geometry. For a tile-renderer host that draws geometry + symbols from its own
+/// per-tile cache (tile57_chart_tile_surface) but needs labels resolved across tile
+/// seams. Same world anchors + coordinate space as tile57_chart_surface. See tile57.h.
+export fn tile57_chart_labels(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    rotation_rad: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+    err: ?*CError,
+) callconv(.c) c_int {
+    syncLabelDebug();
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    c.renderSurfaceLabels(lon, lat, zoom, rotation_rad, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    return OK;
+}
+
+// ---- draw-ready GPU scenes (mirrors tile57_gpu_* in tile57.h) --------------
+
+const gpu = @import("render").gpu;
+const batch_mod = @import("render").batch;
+
+/// The C-facing scene structs live in render/gpu.zig, beside the Vertex/Range
+/// they mirror, so the layout assertions guarding them against tile57.h run in
+/// the pure-Zig test build — capi.zig itself is excluded from it (lib_root.zig).
+const CGpuPattern = gpu.CPattern;
+const CGpuScene = gpu.CScene;
+
+/// Portray a view into DRAW-READY BUFFERS: triangles already in S-52 paint order,
+/// packed into ranges a host draws one pipeline at a time. The twin of
+/// tile57_chart_surface for a GPU host, which cannot use the callback stream
+/// without rebuilding paint order — and thus a whole second scene — for itself.
+/// The caller frees with tile57_gpu_scene_free. See tile57.h.
+export fn tile57_chart_gpu_scene(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    pixel_ratio: f64,
+    out: ?*CGpuScene,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = .{}; // defined on every return, per the POD contract
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const built = c.renderGpuScene(lon, lat, zoom, width, height, paletteOf(&settings), &settings, pixel_ratio) catch |e| return fail(err, e);
+    return fillGpuScene(o, built, err);
+}
+
+/// Flatten a built GpuScene into the C struct, transferring ownership to the
+/// caller (freed with tile57_gpu_scene_free). Shared by the single-chart and
+/// composed entry points.
+fn fillGpuScene(o: *CGpuScene, built: *chart.GpuScene, err: ?*CError) c_int {
+    // Pattern cells carry Zig slices; flatten them to ptr+len in the scene's own
+    // arena so they die with it.
+    const a = built.arena.allocator();
+    const cells = a.alloc(CGpuPattern, built.scene.patterns.len) catch |e| {
+        built.deinit();
+        return fail(err, e);
+    };
+    for (built.scene.patterns, cells) |src, *dst| {
+        dst.* = .{ .w = src.w, .h = src.h, .rgba = src.rgba.ptr, .rgba_len = src.rgba.len };
+    }
+    o.* = .{
+        .vertices = built.scene.vertices.ptr,
+        .vertex_count = built.scene.vertices.len,
+        .indices = built.scene.indices.ptr,
+        .index_count = built.scene.indices.len,
+        .quads = built.scene.quads.ptr,
+        .quad_count = built.scene.quads.len,
+        .ranges = built.scene.ranges.ptr,
+        .range_count = built.scene.ranges.len,
+        .patterns = cells.ptr,
+        .pattern_count = cells.len,
+        .owner = built,
+    };
+    return OK;
+}
+
+/// The composed twin of tile57_chart_gpu_scene: a whole chart LIBRARY portrayed
+/// into one draw-ready scene, seams stitched across cells. Same buffers, same
+/// tile57_gpu_scene_free. See tile57.h.
+export fn tile57_compose_gpu_scene(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    pixel_ratio: f64,
+    out: ?*CGpuScene,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = .{};
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const built = chart.renderComposeGpuScene(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, pixel_ratio) catch |e| return fail(err, e);
+    return fillGpuScene(o, built, err);
+}
+
+/// Release a scene from tile57_chart_gpu_scene and zero the struct. Every pointer
+/// it handed out dies here, so the host must have finished uploading. Null-safe,
+/// and safe to call twice. See tile57.h.
+export fn tile57_gpu_scene_free(out: ?*CGpuScene) callconv(.c) void {
+    const o = out orelse return;
+    if (o.owner) |p| @as(*chart.GpuScene, @ptrCast(@alignCast(p))).deinit();
+    o.* = .{};
+}
+
+/// Portray ONE tile (z, x, y) to a surface — the per-tile twin of
+/// tile57_chart_surface. Same WORLD-SPACE tagged draw calls, for a single tile, so
+/// a host can portray+tessellate each tile once, cache it, and compose the view
+/// from cached tiles (the MapLibre model). Decluttering is per-tile. See tile57.h.
+export fn tile57_chart_tile_surface(
+    handle: ?*Chart,
+    z: u8,
+    x: u32,
+    y: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    c.renderSurfaceTile(z, x, y, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    return OK;
+}
+
+/// Portray ONE MLT tile from CALLER-SUPPLIED bytes to a surface — the archive-less
+/// twin of tile57_chart_tile_surface. For a host that fetched a tile (e.g. over
+/// HTTP from a tile server) and wants it painted with no chart open: `mlt`/`mlt_len`
+/// are the raw (decompressed) MLT tile bytes, (z,x,y) place it, decluttering is
+/// per-tile. Same WORLD-SPACE tagged draw calls as tile57_chart_tile_surface. The
+/// colour profile + symbol catalogue are the ones baked into the library. See tile57.h.
+export fn tile57_render_mlt_tile(
+    mlt: ?[*]const u8,
+    mlt_len: usize,
+    z: u8,
+    x: u32,
+    y: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const b = mlt orelse return failWith(err, .badarg, "mlt bytes must not be null");
+    const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    chart.renderMltTileSurface(b[0..mlt_len], z, x, y, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    return OK;
+}
+
+/// Release a chart and all cached tiles. Must not be called while any borrower
+/// (a compositor, a renderer) may still read from it. See tile57.h.
+export fn tile57_chart_close(handle: ?*Chart) callconv(.c) void {
+    if (handle) |s| s.deinit();
+}
+
+// ---- raster charts (a chart made of pictures) ------------------------------
+
+const RasterChart = raster.RasterChart;
+
+// Fixed-size raster-chart metadata (mirrors tile57_raster_chart_info in tile57.h).
+const CRasterInfo = extern struct {
+    min_zoom: u8,
+    max_zoom: u8,
+    encoding: u8,
+    tile_size: u32,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    scale: u32,
+    zooms_declared: bool,
+    bounds_declared: bool,
+};
+
+/// Open a raster chart from a file path, read-only and never fully resident.
+/// See tile57.h.
+export fn tile57_raster_chart_open(path: ?[*:0]const u8, out: ?*?*RasterChart, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const p = path orelse return failWith(err, .badarg, "path must not be null");
+    // The reader's own text is the only thing that says WHY a file would not
+    // open — "file is encrypted", "database disk image is malformed" — so carry
+    // it rather than the taxonomy's generic reason.
+    var msg: raster.ErrMsg = .{};
+    const opened = RasterChart.open(sharedIo(), gpa, p, &msg) catch |e| {
+        if (msg.len > 0) return failWith(err, statusOfRaster(e), msg.slice());
+        return failWith(err, statusOfRaster(e), rasterReason(e));
+    };
+    const rc = gpa.create(RasterChart) catch |e| return fail(err, e);
+    rc.* = opened;
+    o.* = rc;
+    return OK;
+}
+
+/// Release a raster chart. See tile57.h.
+export fn tile57_raster_chart_close(handle: ?*RasterChart) callconv(.c) void {
+    const rc = handle orelse return;
+    rc.close();
+    gpa.destroy(rc);
+}
+
+/// Fill *out with what the chart declares. See tile57.h.
+export fn tile57_raster_chart_get_info(handle: ?*RasterChart, out: ?*CRasterInfo) callconv(.c) void {
+    const o = out orelse return;
+    o.* = std.mem.zeroes(CRasterInfo);
+    const rc = handle orelse return;
+    const i = rc.getInfo();
+    o.* = .{
+        .min_zoom = i.min_zoom,
+        .max_zoom = i.max_zoom,
+        .encoding = @intFromEnum(i.encoding),
+        .tile_size = i.tile_size,
+        .west = i.west,
+        .south = i.south,
+        .east = i.east,
+        .north = i.north,
+        .scale = i.scale,
+        .zooms_declared = i.zooms_declared,
+        .bounds_declared = i.bounds_declared,
+    };
+}
+
+/// The encoded picture at (z,x,y), XYZ addressing. NULL/0 with OK where the
+/// chart has no tile — the ordinary case, not a failure. See tile57.h.
+export fn tile57_raster_chart_tile(handle: ?*RasterChart, z: u8, x: u32, y: u32, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const rc = handle orelse return failWith(err, .badarg, "raster chart must not be null");
+    const bytes = (rc.tile(gpa, z, x, y) catch |e| return failWith(err, statusOfRaster(e), rasterReason(e))) orelse return OK;
+    return exportOut(err, o, n, bytes);
+}
+
+/// What the chart calls itself. Borrowed, static for the life of the handle.
+/// None of these is a capture date — no MBTiles carries one. See tile57.h.
+export fn tile57_raster_chart_name(handle: ?*RasterChart, out_len: ?*usize) callconv(.c) [*:0]const u8 {
+    return borrowedText(if (handle) |rc| rc.name() else "", out_len);
+}
+
+export fn tile57_raster_chart_description(handle: ?*RasterChart, out_len: ?*usize) callconv(.c) [*:0]const u8 {
+    return borrowedText(if (handle) |rc| rc.description() else "", out_len);
+}
+
+export fn tile57_raster_chart_attribution(handle: ?*RasterChart, out_len: ?*usize) callconv(.c) [*:0]const u8 {
+    return borrowedText(if (handle) |rc| rc.attribution() else "", out_len);
+}
+
+// The reader terminates its metadata strings when it dupes them, so the ABI
+// hands back a pointer into the handle's arena with no copy and no lifetime rule
+// beyond the handle's own. A null handle or an absent field is the static "".
+fn borrowedText(s: [:0]const u8, out_len: ?*usize) [*:0]const u8 {
+    if (out_len) |n| n.* = s.len;
+    return s.ptr;
+}
+
+// A raster-reader failure is not in the engine's taxonomy, so map it here rather
+// than widening errors.zig with SQLite's vocabulary.
+fn statusOfRaster(e: anyerror) Status {
+    return switch (e) {
+        error.OutOfMemory => .nomem,
+        error.UnknownFormat, error.VectorTileset => .unsupported,
+        error.OpenFailed => .io,
+        error.NotADatabase, error.NotMbtiles, error.NoTiles, error.QueryFailed => .parse,
+        else => statusOf(e),
+    };
+}
+
+fn rasterReason(e: anyerror) []const u8 {
+    return switch (e) {
+        error.OpenFailed => "raster chart could not be opened",
+        error.UnknownFormat => "not a raster chart in any format tile57 reads",
+        error.NotADatabase => "not an MBTiles database",
+        error.NotMbtiles => "a database, but not a tileset",
+        error.NoTiles => "the tileset holds no tiles",
+        error.VectorTileset => "a vector tileset, not a raster chart",
+        error.QueryFailed => "the tileset could not be read (truncated or corrupt?)",
+        else => errors.describe(e),
+    };
+}
+
+// ---- auxiliary files (the text and pictures a cell points at) --------------
+
+/// Open the auxiliary files of a chart directory. The handle owns the manifest
+/// and every file it has read. See tile57.h.
+export fn tile57_aux_open(dir: ?[*:0]const u8, out: ?*?*auxfiles.Reader, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const d = spanOpt(dir) orelse return failWith(err, .badarg, "dir must not be null");
+    const opened = auxfiles.Reader.open(sharedIo(), gpa, d) catch |e| return failCtx(err, e, d);
+    const r = opened orelse return OK; // no manifest: the chart references nothing
+    const handle = gpa.create(auxfiles.Reader) catch return failWith(err, .nomem, "out of memory");
+    handle.* = r;
+    o.* = handle;
+    return OK;
+}
+
+/// The bytes and the MIME type for a referenced file, by the name the feature
+/// carries (TXTDSC, PICREP, or an S-101 fileReference). The bytes stay valid
+/// until tile57_aux_close. NULL/0 when the chart has no such file. See tile57.h.
+export fn tile57_aux_get(handle: ?*auxfiles.Reader, name: ?[*:0]const u8, bytes: ?*?[*]const u8, len: ?*usize, mime: ?*?[*:0]const u8, err: ?*CError) callconv(.c) c_int {
+    const h = handle orelse return failWith(err, .badarg, "aux must not be null");
+    const b = bytes orelse return failWith(err, .badarg, "bytes must not be null");
+    const n = len orelse return failWith(err, .badarg, "len must not be null");
+    b.* = null;
+    n.* = 0;
+    if (mime) |m| m.* = null;
+    const nm = spanOpt(name) orelse return failWith(err, .badarg, "name must not be null");
+    const found = (h.get(sharedIo(), nm) catch |e| return fail(err, e)) orelse return OK;
+    b.* = found.bytes.ptr;
+    n.* = found.bytes.len;
+    if (mime) |m| m.* = mimeZ(found.mime);
+    return OK;
+}
+
+/// A static NUL-terminated string for a MIME type the manifest holds, so the
+/// caller gets a C string without owning it.
+fn mimeZ(m: []const u8) [*:0]const u8 {
+    if (std.mem.eql(u8, m, "text/plain")) return "text/plain";
+    if (std.mem.eql(u8, m, "image/png")) return "image/png";
+    if (std.mem.eql(u8, m, "image/jpeg")) return "image/jpeg";
+    if (std.mem.eql(u8, m, "image/tiff")) return "image/tiff";
+    return "application/octet-stream";
+}
+
+/// Release the auxiliary files of a chart, and every file read through it.
+export fn tile57_aux_close(handle: ?*auxfiles.Reader) callconv(.c) void {
+    if (handle) |h| {
+        h.deinit();
+        gpa.destroy(h);
+    }
+}
+
+// ===========================================================================
+// 5. Compose — the runtime compositor over open charts (see tile57.h)
+// ===========================================================================
+
+/// Coverage/zoom summary of a compositor, filled by tile57_compose_get_meta.
+const CComposeMeta = extern struct {
+    min_zoom: u8,
+    max_zoom: u8, // deepest zoom that can be served (native windows + one fill-up overscale zoom)
+    charts: u32, // coverage-carrying charts held
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+};
+
+/// Read a partition sidecar file into a fresh gpa-owned buffer (or error). Used only during open.
+fn readSidecar(io: std.Io, path: []const u8) ![]u8 {
+    var f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const st = try f.stat(io);
+    const n: usize = @intCast(st.size);
+    const buf = try gpa.alloc(u8, n);
+    errdefer gpa.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    return buf;
+}
+
+/// Open a compositor over `n` open charts, BORROWING their archives + embedded
+/// coverage (the charts must outlive it; close the compositor first). Charts whose
+/// archives embed no coverage are skipped; none at all is TILE57_ERR_UNSUPPORTED.
+/// The ownership partition is found automatically: a bake leaves partition.tpart
+/// beside the archives it wrote, and it is loaded if it matches this cell set.
+/// A missing or stale one just means the compositor builds it. See tile57.h.
+/// Find the ownership partition a bake left beside these archives. `chart_path` is
+/// any one chart's source path; a bake writes `<out>/partition.tpart` with the
+/// archives under `<out>/tiles/`, and a host that mirrors subdirectories nests them
+/// deeper still, so walk up a few levels rather than guessing one layout. Returns
+/// the bytes (caller frees) or null — a miss is not an error, it just means the
+/// compositor builds the partition itself.
+fn discoverSidecar(io: std.Io, chart_path: []const u8) Sidecar {
+    var dir: ?[]const u8 = std.fs.path.dirname(chart_path);
+    var up: usize = 0;
+    while (dir) |d| : (up += 1) {
+        if (up > 3) break; // <archive>/../../.. is as far as any sane layout nests
+        const p = std.fs.path.join(gpa, &.{ d, "partition.tpart" }) catch return .{};
+        if (readSidecar(io, p)) |b| {
+            std.debug.print("compose: sidecar {s} ({d} bytes)\n", .{ p, b.len });
+            return .{ .bytes = b, .path = p };
+        } else |e| if (e != error.FileNotFound) {
+            // A sidecar that EXISTS but cannot be read is a field fact worth a
+            // line — a silent miss here costs a full rebuild every open.
+            std.debug.print("compose: sidecar {s} unreadable ({s})\n", .{ p, @errorName(e) });
+        }
+        gpa.free(p);
+        dir = std.fs.path.dirname(d);
+    }
+    return .{};
+}
+
+/// A partition sidecar found on disk: its bytes, and where it lives so a stale one
+/// can be rewritten in place. Both owned by gpa.
+const Sidecar = struct {
+    bytes: ?[]u8 = null,
+    path: ?[]u8 = null,
+
+    fn deinit(self: Sidecar) void {
+        if (self.bytes) |b| gpa.free(b);
+        if (self.path) |p| gpa.free(p);
+    }
+
+    /// Rewrite the sidecar when the compositor had to build the partition itself.
+    /// Only refreshes a file that already existed — creating one is the bake's job,
+    /// and guessing a location for a library we merely read would be worse than
+    /// leaving it alone.
+    fn refresh(self: Sidecar, io: std.Io, src: *compose.ComposeSource) void {
+        if (src.part_loaded) return;
+        const p = self.path orelse return;
+        const bytes = src.serializePartition(gpa) catch return;
+        defer gpa.free(bytes);
+        if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = bytes })) |_| {
+            std.debug.print("compose: sidecar refreshed {s}\n", .{p});
+        } else |e| {
+            std.debug.print("compose: sidecar refresh failed {s} ({s})\n", .{ p, @errorName(e) });
+        }
+    }
+};
+
+// One compositor holds one kind. Composing raster charts stitches PICTURES
+// across a seam and vector charts clip GEOMETRY at one; the two paths share the
+// ownership partition and nothing above it. A host wanting both opens two
+// compositors — two layers, which is what the mariner wants anyway.
+const mixed_kinds = "a compositor holds one kind of chart: open the picture charts with tile57_compose_rasters";
+const raster_tiles_only = "a raster compositor serves tile57_compose_tile only: a chart made of pictures portrays nothing";
+
+export fn tile57_compose_open(
+    charts: ?[*]const ?*Chart,
+    n: usize,
+    out: ?*?*compose.ComposeSource,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const cs = charts orelse return failWith(err, .badarg, "charts must not be null");
+    if (n == 0) return failWith(err, .badarg, "n must not be zero");
+
+    const archives = gpa.alloc(compose.ChartArchive, n) catch |e| return fail(err, e);
+    defer gpa.free(archives);
+    var na: usize = 0;
+    for (0..n) |i| {
+        const c = cs[i] orelse return failWith(err, .badarg, "a chart in charts is null");
+        const rd = c.pmtilesReader() orelse return failWith(err, .badarg, "a chart in charts is not archive-backed");
+        const cov = c.decodedCoverage() orelse continue; // embeds no coverage: owns no ground
+        archives[na] = .{ .reader = rd, .cov = cov };
+        na += 1;
+    }
+
+    // Find the partition beside the archives. The lib has no std.process.Init, so
+    // stand up a threaded std.Io for the read (nothing else here does file I/O).
+    const io = sharedIo();
+    var sidecar: Sidecar = .{};
+    defer sidecar.deinit();
+    if (cs[0]) |c0| {
+        if (c0.source_path) |sp| sidecar = discoverSidecar(io, sp);
+    }
+
+    const src = (compose.ComposeSource.open(gpa, archives[0..na], sidecar.bytes) catch |e| return switch (e) {
+        // A picture archive (a baked RNC) opened as a vector chart would pass
+        // every check above — it carries coverage and a scale — and then compose
+        // as nonsense, because its tiles are PNGs and this path decodes MLT.
+        error.MixedChartKinds => failWith(err, .unsupported, mixed_kinds),
+        else => fail(err, e),
+    }) orelse return failWith(err, .unsupported, "no chart carries per-cell coverage");
+    // What the open kept, subtracted from what it was handed. Counting the
+    // charts with no decoded coverage missed the ones openBorrowed drops later
+    // for an empty coverage ring, so charts + skipped came to less than n.
+    src.skipped = @intCast(n - src.readers.len);
+    sidecar.refresh(io, src);
+    o.* = src;
+    return OK;
+}
+
+/// Walk `dir` recursively for baked *.pmtiles archives, open each (mmap'd, so the
+/// cell set is never fully resident) and compose them into one compositor that OWNS
+/// the archives it opened — the caller holds no chart handles and frees everything
+/// with tile57_compose_close. The ownership partition is found automatically, as in
+/// tile57_compose_open. *out_chart_count (NULL to ignore) = archives composed. No
+/// *.pmtiles under `dir` (or none carrying coverage) is TILE57_ERR_UNSUPPORTED, with
+/// *out = NULL. An unreadable `dir` errors. See tile57.h.
+export fn tile57_compose_tree(
+    dir: ?[*:0]const u8,
+    out: ?*?*compose.ComposeSource,
+    out_chart_count: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    if (out_chart_count) |p| p.* = 0;
+    const d = spanOpt(dir) orelse return failWith(err, .badarg, "dir must not be null");
+
+    // The lib has no std.process.Init; stand up a threaded std.Io for the tree walk,
+    // the per-archive mmaps and the partition-sidecar read.
+    const io = sharedIo();
+
+    // Collect every *.pmtiles path under `dir` — the SAME walk tile57_bake_tree uses,
+    // matching *.pmtiles instead of *.000. Arena-owned; only live for the open below.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var paths = std.ArrayList([]const u8).empty;
+
+    var wd = std.Io.Dir.cwd().openDir(io, d, .{ .iterate = true }) catch |e| return failCtx(err, e, d);
+    defer wd.close(io);
+    var walker = wd.walk(a) catch |e| return fail(err, e);
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".pmtiles")) continue;
+        const p = std.fs.path.join(a, &.{ d, entry.path }) catch continue;
+        paths.append(a, p) catch continue;
+    }
+    if (paths.items.len == 0) return failWith(err, .unsupported, "no .pmtiles archive under dir");
+
+    // The partition sits beside the archives — a bake writes <out>/partition.tpart
+    // with the tiles under <out>/tiles, so discover from one of the paths we found
+    // rather than from `dir`, which may be either level. Missing or stale just
+    // means the compositor builds it.
+    var sidecar = discoverSidecar(io, paths.items[0]);
+    defer sidecar.deinit();
+    const owned = sidecar.bytes;
+
+    // openFiles mmaps + opens each path and the compositor OWNS them (deinit closes
+    // them), so tile57_compose_close alone releases the whole set.
+    const src = (compose.ComposeSource.openFiles(io, gpa, paths.items, owned) catch |e| return failCtx(err, e, d)) orelse
+        return failWith(err, .unsupported, "no archive carries per-cell coverage");
+    sidecar.refresh(io, src);
+    o.* = src;
+    if (out_chart_count) |p| p.* = @intCast(src.readers.len);
+    return OK;
+}
+
+/// Open a compositor over `n` open RASTER charts, BORROWING their archives +
+/// embedded coverage (the charts must outlive it; close the compositor first).
+/// Charts declaring no compilation scale or embedding no coverage are skipped —
+/// they can own no ground, which is the rule tile57_compose_open already applies;
+/// none at all is TILE57_ERR_UNSUPPORTED. See tile57.h.
+export fn tile57_compose_rasters(
+    charts: ?[*]const ?*RasterChart,
+    n: usize,
+    out: ?*?*compose.ComposeSource,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const cs = charts orelse return failWith(err, .badarg, "charts must not be null");
+    if (n == 0) return failWith(err, .badarg, "n must not be zero");
+
+    const archives = gpa.alloc(compose.ChartArchive, n) catch |e| return fail(err, e);
+    defer gpa.free(archives);
+    var na: usize = 0;
+    for (0..n) |i| {
+        const rc = cs[i] orelse return failWith(err, .badarg, "a chart in charts is null");
+        // A community MBTiles has no archive and no coverage: it is a pyramid the
+        // mariner points at, not a chart that can own ground.
+        const rd = rc.pmtilesReader() orelse continue;
+        const cov = rc.decodedCoverage() orelse continue;
+        if (cov.cscl == 0 or cov.cov1.len == 0) continue;
+        archives[na] = .{ .reader = rd, .cov = cov };
+        na += 1;
+    }
+    if (na == 0) return failWith(err, .unsupported, "no raster chart carries a compilation scale and coverage");
+
+    const src = (compose.ComposeSource.openRasters(gpa, archives[0..na], null) catch |e| return switch (e) {
+        error.MixedChartKinds => failWith(err, .unsupported, mixed_kinds),
+        else => fail(err, e),
+    }) orelse return failWith(err, .unsupported, "no raster chart carries a compilation scale and coverage");
+    src.skipped = @intCast(n - src.readers.len);
+    o.* = src;
+    return OK;
+}
+
+/// Compose the tile (z,x,y) on demand into RAW (decompressed) MLT in *out / *out_len
+/// (free with tile57_free) — the HTTP layer gzips on the wire. NULL/0 out with OK =
+/// no bytes; *out_owned (NULL to ignore) then distinguishes true empty ocean (false,
+/// safe to cache) from owned-but-empty (true — transient during a bake, suspect
+/// after). Byte-faithful to the batch compositor. See tile57.h.
+export fn tile57_compose_tile(
+    handle: ?*compose.ComposeSource,
+    z: u8,
+    x: u32,
+    y: u32,
+    out: ?*?[*]u8,
+    out_len: ?*usize,
+    out_owned: ?*bool,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    if (out_owned) |p| p.* = false;
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    // Pictures carry no linestyles, so a raster compositor takes the plain path.
+    if (src.kind == .vector) return composeWalked(src, z, x, y, o, n, out_owned, err);
+    const res = src.tile(gpa, z, x, y) catch |e| return fail(err, e);
+    if (out_owned) |p| p.* = res.owned;
+    if (res.tile) |t| return exportOut(err, o, n, t);
+    return OK;
+}
+
+/// tile57_compose_tile's body for a vector compositor: compose to FEATURES,
+/// step every complex linestyle into plain geometry, re-encode.
+///
+/// Always, rather than on request. A composed tile is drawn from a STYLE, and a
+/// style cannot say where in a linestyle period a symbol sits — so the
+/// un-walked form draws every symbol of a style at one phase and loses the S-52
+/// rhythm. The only thing that can re-walk a stored run is the engine's own
+/// replay, which reads tileContent directly and never comes through here.
+///
+/// The compositor answers `.layers` where a tile seam-composes and `.bytes`
+/// where one cell owns the whole tile and its stored blob passes through
+/// verbatim. Both must be walked, or every tile away from a cell boundary
+/// silently goes missing.
+fn composeWalked(
+    src: *compose.ComposeSource,
+    z: u8,
+    x: u32,
+    y: u32,
+    o: *?[*]u8,
+    n: *usize,
+    out_owned: ?*bool,
+    err: ?*CError,
+) c_int {
+    // The decoded features live only long enough to be walked: an arena for
+    // the compose and the walk's scratch, the encoded tile alone in gpa.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ta = arena.allocator();
+    const px: f64 = @floatFromInt(src.draw_px_per_tile);
+
+    const res = src.tileContent(ta, z, x, y) catch |e| return fail(err, e);
+    const layers = switch (res.content) {
+        .layers => |l| l,
+        .bytes => |b| mlt_dec.decode(ta, b) catch |e| return fail(err, e),
+        .none => return OK,
+    };
+    const bytes = scene.walkTile(ta, gpa, layers, .mlt, z, px) catch |e| return fail(err, e);
+    if (out_owned) |p| p.* = true;
+    return exportOut(err, o, n, bytes);
+}
+
+/// How wide the caller draws a tile: 256 for the native convention, 512 for the
+/// MapLibre style spec's world tile. Sets what composed linestyle rhythms are
+/// restated in. See tile57.h.
+export fn tile57_compose_set_px_per_tile(handle: ?*compose.ComposeSource, px_per_tile: u32) void {
+    const src = handle orelse return;
+    if (px_per_tile != 0) src.draw_px_per_tile = px_per_tile;
+}
+
+export fn tile57_compose_png(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    out: ?*?[*]u8,
+    out_len: ?*usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const bytes = chart.renderComposeView(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, .png, null) catch |e| return fail(err, e);
+    return exportOut(err, o, n, bytes);
+}
+
+/// tile57_compose_png's vector twin: the SAME composed scene as a deterministic
+/// single-page PDF. See tile57.h.
+export fn tile57_compose_pdf(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    out: ?*?[*]u8,
+    out_len: ?*usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const bytes = chart.renderComposeView(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, .pdf, null) catch |e| return fail(err, e);
+    return exportOut(err, o, n, bytes);
+}
+
+/// tile57_compose_png's callback twin: the SAME composed view painted through the
+/// C callback table `canvas` (pixel space, paint order). See tile57.h.
+export fn tile57_compose_canvas(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    canvas: ?*const CbCanvas,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
+    const cb = canvas orelse return failWith(err, .badarg, "canvas must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const bytes = chart.renderComposeView(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, .callback, cb) catch |e| return fail(err, e);
+    chart.freeBytes(bytes); // the callback path returns an empty buffer
+    return OK;
+}
+
+/// The composed GPU vector twin: the SAME composed view emitted as a WORLD-SPACE
+/// tagged stream to the C surface callback (see tile57.h). See tile57_chart_surface for
+/// the single-chart form.
+export fn tile57_compose_surface(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    rotation_rad: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+    err: ?*CError,
+) callconv(.c) c_int {
+    syncLabelDebug();
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
+    const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    chart.renderComposeSurfaceView(src, lon, lat, zoom, rotation_rad, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    return OK;
+}
+
+/// The composed VIEW-level, globally-decluttered TEXT pass — emits ONLY labels
+/// (through the surface's draw_text_str / draw_text), decluttered across the whole
+/// composed view, and no geometry. For a tile-renderer host that draws geometry +
+/// symbols from its own per-tile cache (tile57_compose_tile / a per-tile surface)
+/// but needs labels resolved across tile seams. Same world anchors + coordinate
+/// space as tile57_compose_surface. See tile57_chart_labels for the single-chart form.
+export fn tile57_compose_labels(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    rotation_rad: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+    err: ?*CError,
+) callconv(.c) c_int {
+    syncLabelDebug();
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
+    const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    chart.renderComposeLabels(src, lon, lat, zoom, rotation_rad, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    return OK;
+}
+
+/// Cursor object-query over the composed set (the S-52 pick, seams included):
+/// invokes cb->feature once per displayed feature the point falls in. See
+/// tile57.h.
+export fn tile57_compose_query(handle: ?*compose.ComposeSource, lon: f64, lat: f64, zoom: f64, cb: ?*const CQueryCb, err: ?*CError) callconv(.c) c_int {
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
+    const cbp = cb orelse return failWith(err, .badarg, "cb must not be null");
+    src.explainPoint(gpa, lon, lat, zoom); // every tap logs the serving story of that spot
+    chart.composeQueryPoint(src, lon, lat, zoom, cbp) catch |e| return fail(err, e);
+    return OK;
+}
+
+/// Fill *out with the compositor's zoom range + union coverage bounds (zeroed when
+/// the handle is NULL). See tile57.h.
+export fn tile57_compose_get_meta(handle: ?*compose.ComposeSource, out: ?*CComposeMeta) callconv(.c) void {
+    const o = out orelse return;
+    o.* = std.mem.zeroes(CComposeMeta);
+    const src = handle orelse return;
+    o.* = .{
+        .min_zoom = src.minz,
+        .max_zoom = src.loop_max,
+        .charts = @intCast(src.readers.len),
+        .west = src.bounds[0],
+        .south = src.bounds[1],
+        .east = src.bounds[2],
+        .north = src.bounds[3],
+    };
+}
+
+/// Charts handed to the open that embed no usable coverage. See tile57.h.
+export fn tile57_compose_skipped(handle: ?*compose.ComposeSource) callconv(.c) u32 {
+    const src = handle orelse return 0;
+    return src.skipped;
+}
+
+/// The deepest zoom the chart covering (lon,lat) can serve — the host caps its
+/// per-view zoom-in here so it never magnifies past that chart into nodata. Falls
+/// back to the library max where the point covers no cell. See tile57.h.
+export fn tile57_compose_max_zoom_at(handle: ?*compose.ComposeSource, lon: f64, lat: f64) callconv(.c) u8 {
+    const src = handle orelse return 0;
+    return src.maxZoomAt(lon, lat);
+}
+
+/// Release a compositor. Its charts stay open (and stay the caller's to close).
+export fn tile57_compose_close(handle: ?*compose.ComposeSource) callconv(.c) void {
+    if (handle) |src| {
+        chart.geomDropHandle(@intFromPtr(src));
+        src.deinit();
+    }
+}
+
+// ===========================================================================
+// 6. Style + portrayal assets (see tile57.h)
+// ===========================================================================
+
+// The S-52 colour profile baked into the library, or null if (somehow) absent.
+fn embeddedColorProfileXml() ?[]const u8 {
+    for (colorprofile_registry.entries) |e| return e.bytes;
+    return null;
+}
+
+/// S-52 colortables.json from the colour profile baked into the library — no
+/// on-disk catalogue needed. Pair with tile57_style_template / tile57_style_build.
+export fn tile57_colortables_default(out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const xml = embeddedColorProfileXml() orelse return failWith(err, .internal, "embedded colour profile missing");
+    const json = style.colorTablesJson(gpa, xml) catch |e| return fail(err, e);
+    return exportOut(err, o, n, json);
+}
+
+// All portrayal assets in memory. Mirrors tile57_assets in tile57.h; each non-null
+// field is a gpa-owned buffer freed by tile57_assets_free (via chart.freeBytes).
+const CAssets = extern struct {
+    colortables: ?[*]u8 = null,
+    colortables_len: usize = 0,
+    linestyles: ?[*]u8 = null,
+    linestyles_len: usize = 0,
+    sprite_json: ?[*]u8 = null,
+    sprite_json_len: usize = 0,
+    sprite_png: ?[*]u8 = null,
+    sprite_png_len: usize = 0,
+    pattern_json: ?[*]u8 = null,
+    pattern_json_len: usize = 0,
+    pattern_png: ?[*]u8 = null,
+    pattern_png_len: usize = 0,
+};
+
+// Dupe each generated (arena-owned) buffer into `gpa` so the C owner can free them
+// via chart.freeBytes. Fills out.* in place; on OOM the caller frees via
+// tile57_assets_free (each field's len is set immediately after its ptr).
+fn fillAssets(out: *CAssets, ct: []const u8, ls: []const u8, spr_json: []const u8, spr_png: []const u8, pat_json: []const u8, pat_png: []const u8) !void {
+    out.colortables = (try gpa.dupe(u8, ct)).ptr;
+    out.colortables_len = ct.len;
+    out.linestyles = (try gpa.dupe(u8, ls)).ptr;
+    out.linestyles_len = ls.len;
+    out.sprite_json = (try gpa.dupe(u8, spr_json)).ptr;
+    out.sprite_json_len = spr_json.len;
+    out.sprite_png = (try gpa.dupe(u8, spr_png)).ptr;
+    out.sprite_png_len = spr_png.len;
+    out.pattern_json = (try gpa.dupe(u8, pat_json)).ptr;
+    out.pattern_json_len = pat_json.len;
+    out.pattern_png = (try gpa.dupe(u8, pat_png)).ptr;
+    out.pattern_png_len = pat_png.len;
+}
+
+/// All portrayal assets in memory (the same files the offline bake writes to disk),
+/// from the embedded catalogue (catalog_dir NULL/"") or an on-disk one. Free with
+/// tile57_assets_free. See tile57.h.
+export fn tile57_bake_assets(catalog_dir: ?[*:0]const u8, out: ?*CAssets, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = .{};
+    // The bundle emitters do filesystem I/O for an on-disk catalogue; the lib has no
+    // std.process.Init, so stand up a threaded std.Io for the call.
+    const io = sharedIo();
+    // Scratch arena for generation; the final buffers are duped into gpa (C-owned).
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cd = spanOpt(catalog_dir) orelse "";
+
+    const ct = bundle.colorTablesBytes(io, a, cd) catch |e| return fail(err, e);
+    const ls = bundle.linestylesBytes(io, a, cd) catch |e| return fail(err, e);
+    const spr = bundle.spriteAtlasBytes(io, a, cd, bundle.DEFAULT_CSS) catch |e| return fail(err, e);
+    const pat = bundle.patternAtlasBytes(io, a, cd, bundle.DEFAULT_CSS) catch |e| return fail(err, e);
+
+    fillAssets(o, ct, ls, spr.json, spr.png, pat.json, pat.png) catch |e| {
+        tile57_assets_free(o);
+        return fail(err, e);
+    };
+    return OK;
+}
+
+/// The palette stylesheet a tile57_scheme rasterizes its symbol artwork with.
+/// Symbol colours live in the artwork, not in the scene's range colours, so an
+/// atlas drawn under one palette keeps that palette's colours whatever the
+/// scene is built for.
+fn svgCssFor(scheme: c_int) []const u8 {
+    return switch (scheme) {
+        1 => bundle.DUSK_CSS,
+        2 => bundle.NIGHT_CSS,
+        else => bundle.DEFAULT_CSS,
+    };
+}
+
+/// Like tile57_bake_assets but the sprite_* fields carry the MapLibre sprite-mln
+/// atlas (pivot-centred cells + {name:{x,y,width,height,pixelRatio}} JSON). Only
+/// sprite_json/sprite_png are filled. Free with tile57_assets_free. See tile57.h.
+export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, pixel_ratio: f64, scheme: c_int, out: ?*CAssets, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = .{};
+    const io = sharedIo();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cd = spanOpt(catalog_dir) orelse "";
+    const ratio = if (pixel_ratio > 0) pixel_ratio else 1;
+    const spr = bundle.spriteMlnBytes(io, a, cd, svgCssFor(scheme), &[_][]const u8{}, ratio) catch |e| return fail(err, e);
+    fillAssets(o, "", "", spr.json, spr.png, "", "") catch |e| {
+        tile57_assets_free(o);
+        return fail(err, e);
+    };
+    return OK;
+}
+
+/// Render one comma-joined symbol run (a sounding digit stack like
+/// "SOUNDG11,SOUNDG53") to a pivot-centred RGBA image at `pixel_ratio`, in
+/// the palette of `scheme`. The runtime path behind MapLibre's missing-image
+/// event: a chart library carries more distinct runs than a prebaked sheet
+/// can enumerate, so the host renders exactly the ones the map asks for.
+/// TILE57_OK with *out_rgba NULL when the run names no known glyph (absent,
+/// not an error). Free *out_rgba with tile57_free.
+export fn tile57_render_symbol_run(
+    catalog_dir: ?[*:0]const u8,
+    run: ?[*:0]const u8,
+    pixel_ratio: f64,
+    scheme: c_int,
+    out_rgba: ?*?[*]u8,
+    out_w: ?*u32,
+    out_h: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out_rgba orelse return failWith(err, .badarg, "out_rgba must not be null");
+    const ow = out_w orelse return failWith(err, .badarg, "out_w must not be null");
+    const oh = out_h orelse return failWith(err, .badarg, "out_h must not be null");
+    o.* = null;
+    ow.* = 0;
+    oh.* = 0;
+    const r = run orelse return failWith(err, .badarg, "run must not be null");
+    const cd = spanOpt(catalog_dir) orelse "";
+    const ratio = if (pixel_ratio > 0) pixel_ratio else 1;
+    const img = bundle.symbolRunImage(sharedIo(), gpa, cd, svgCssFor(scheme), std.mem.span(r), ratio) catch |e| return fail(err, e);
+    if (img) |i| {
+        // Through the export-header convention (exportAlloc/tile57_free) like
+        // every other buffer this ABI hands out; the engine copy is freed here.
+        defer gpa.free(i.rgba);
+        const p = exportAlloc(i.rgba.len) orelse return failWith(err, .nomem, "out of memory");
+        @memcpy(p[0..i.rgba.len], i.rgba);
+        o.* = p;
+        ow.* = i.w;
+        oh.* = i.h;
+    }
+    return OK;
+}
+
+const glyph_sdf = @import("sprite").glyph;
+
+// Glyph metrics as compact JSON: {"em_px","pad","glyphs":{cp:[u0,v0,u1,v1,ox,oy,w,h,adv]}}.
+fn glyphMetricsJson(a: std.mem.Allocator, atlas: *const glyph_sdf.Atlas) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    try out.print(a, "{{\"em_px\":{d},\"pad\":{d},\"glyphs\":{{", .{ atlas.em_px, atlas.pad });
+    var it = atlas.glyphs.iterator();
+    var first = true;
+    while (it.next()) |e| {
+        const g = e.value_ptr.*;
+        if (!first) try out.append(a, ',');
+        first = false;
+        try out.print(a, "\"{d}\":[{d},{d},{d},{d},{d},{d},{d},{d},{d}]", .{ e.key_ptr.*, g.u0, g.v0, g.u1, g.v1, g.off_x, g.off_y, g.w, g.h, g.advance });
+    }
+    try out.appendSlice(a, "}}");
+    return out.toOwnedSlice(a);
+}
+
+/// SDF glyph atlas for GPU text: sprite_png = the RGBA SDF atlas, sprite_json =
+/// {"em_px","pad","glyphs":{codepoint:[u0,v0,u1,v1,ox,oy,w,h,adv]}} (EM units).
+/// Only sprite_* filled. Free with tile57_assets_free. See tile57.h.
+export fn tile57_bake_glyph_sdf(out: ?*CAssets, err: ?*CError) callconv(.c) c_int {
+    return bakeGlyphSdf(out, 0, err);
+}
+
+/// tile57_bake_glyph_sdf for a specific label-tier face: 0 regular, 1 bold, 2
+/// italic (render.labeltier / the draw_text_str `face` argument). A GPU host that
+/// wants bold place names and italic hydrography bakes one atlas per face.
+export fn tile57_bake_glyph_sdf_face(out: ?*CAssets, face: i32, err: ?*CError) callconv(.c) c_int {
+    return bakeGlyphSdf(out, face, err);
+}
+
+/// An SDF sheet for named codepoints, out of a font the HOST supplies. See
+/// tile57.h.
+export fn tile57_bake_glyph_sdf_codepoints(
+    out: ?*CAssets,
+    font_bytes: ?[*]const u8,
+    font_len: usize,
+    codepoints: ?[*]const u32,
+    count: usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = .{};
+    const fb = font_bytes orelse return failWith(err, .badarg, "font_bytes must not be null");
+    if (font_len == 0) return failWith(err, .badarg, "font_len must not be zero");
+    const cps_c = codepoints orelse return failWith(err, .badarg, "codepoints must not be null");
+    if (count == 0) return failWith(err, .badarg, "count must not be zero");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cps = a.alloc(u21, count) catch |e| return fail(err, e);
+    for (cps_c[0..count], cps) |src, *dst| {
+        if (src > 0x10FFFF) return failWith(err, .badarg, "codepoint above the Unicode range");
+        dst.* = @intCast(src);
+    }
+    var atlas = glyph_sdf.build(a, fb[0..font_len], cps, 32.0, 6) catch |e| return fail(err, e);
+    // Every codepoint came back with neither ink nor an advance. Either the
+    // face draws none of them, or its outlines are in a format the rasterizer
+    // cannot read. Say so: a host that took an empty sheet as success would
+    // record the characters as served and never ask for them again.
+    if (atlas.glyphs.count() == 0)
+        return failWith(err, .unsupported, "the face draws none of those codepoints");
+    return finishGlyphSdf(o, a, &atlas, err);
+}
+
+/// True when the BUNDLED label face can draw `codepoint`. See tile57.h.
+export fn tile57_label_font_covers(codepoint: u32, out: ?*bool, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = false;
+    if (codepoint > 0x10FFFF) return failWith(err, .badarg, "codepoint above the Unicode range");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const one = [_]u21{@intCast(codepoint)};
+    const ft = @import("render").font;
+    var atlas = glyph_sdf.build(arena.allocator(), ft.notosans, &one, 32.0, 6) catch |e| return fail(err, e);
+    o.* = atlas.glyphs.count() > 0;
+    return OK;
+}
+
+/// True when `font_bytes` can draw `codepoint`. See tile57.h.
+export fn tile57_font_covers(
+    font_bytes: ?[*]const u8,
+    font_len: usize,
+    codepoint: u32,
+    out: ?*bool,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = false;
+    const fb = font_bytes orelse return failWith(err, .badarg, "font_bytes must not be null");
+    if (font_len == 0) return failWith(err, .badarg, "font_len must not be zero");
+    if (codepoint > 0x10FFFF) return failWith(err, .badarg, "codepoint above the Unicode range");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const one = [_]u21{@intCast(codepoint)};
+    var atlas = glyph_sdf.build(arena.allocator(), fb[0..font_len], &one, 32.0, 6) catch |e| return fail(err, e);
+    o.* = atlas.glyphs.count() > 0;
+    return OK;
+}
+
+fn bakeGlyphSdf(out: ?*CAssets, face: i32, err: ?*CError) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = .{};
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ft = @import("render").font;
+    const font = switch (face) {
+        1 => ft.notosans_bold,
+        2 => ft.notosans_italic,
+        else => ft.notosans,
+    };
+    const cps = glyph_sdf.defaultCodepoints(a) catch |e| return fail(err, e);
+    var atlas = glyph_sdf.build(a, font, cps, 32.0, 6) catch |e| return fail(err, e);
+    return finishGlyphSdf(o, a, &atlas, err);
+}
+
+/// Encode a built atlas into *out. `a` is the arena the atlas lives in; the two
+/// buffers that leave are duped into gpa, which is what tile57_assets_free
+/// releases.
+fn finishGlyphSdf(o: *CAssets, a: std.mem.Allocator, atlas: *glyph_sdf.Atlas, err: ?*CError) c_int {
+    const png = (atlas.encodePng(a) catch |e| return fail(err, e)) orelse
+        return failWith(err, .internal, "glyph atlas PNG encode produced nothing");
+    const json = glyphMetricsJson(a, atlas) catch |e| return fail(err, e);
+    o.sprite_png = (gpa.dupe(u8, png) catch |e| {
+        tile57_assets_free(o);
+        return fail(err, e);
+    }).ptr;
+    o.sprite_png_len = png.len;
+    o.sprite_json = (gpa.dupe(u8, json) catch |e| {
+        tile57_assets_free(o);
+        return fail(err, e);
+    }).ptr;
+    o.sprite_json_len = json.len;
+    return OK;
+}
+
+/// Free every non-null buffer in *out and zero the struct. See tile57.h.
+export fn tile57_assets_free(out: ?*CAssets) callconv(.c) void {
+    const o = out orelse return;
+    if (o.colortables) |p| chart.freeBytes(p[0..o.colortables_len]);
+    if (o.linestyles) |p| chart.freeBytes(p[0..o.linestyles_len]);
+    if (o.sprite_json) |p| chart.freeBytes(p[0..o.sprite_json_len]);
+    if (o.sprite_png) |p| chart.freeBytes(p[0..o.sprite_png_len]);
+    if (o.pattern_json) |p| chart.freeBytes(p[0..o.pattern_json_len]);
+    if (o.pattern_png) |p| chart.freeBytes(p[0..o.pattern_png_len]);
+    o.* = .{};
+}
+
+// ---- chart-style generation (mirrors tile57_mariner in tile57.h) -----------
+
+/// The mariner language as the ABI's fixed field. A code longer than the field
+/// holds is dropped, which reads as the portrayed name.
+fn langCode(s: []const u8) [4]u8 {
+    var out = [_]u8{0} ** 4;
+    if (s.len < out.len) @memcpy(out[0..s.len], s);
+    return out;
+}
+
+const CMariner = extern struct {
+    scheme: c_int,
+    shallow_contour: f64,
+    safety_contour: f64,
+    deep_contour: f64,
+    safety_depth: f64,
+    four_shade_water: bool,
+    depth_unit: c_int,
+    display_base: bool,
+    display_standard: bool,
+    display_other: bool,
+    data_quality: bool,
+    show_inform_callouts: bool,
+    show_meta_bounds: bool,
+    show_isolated_dangers_shallow: bool,
+    boundary_style: c_int,
+    simplified_points: bool,
+    show_full_sector_lines: bool,
+    text_names: bool,
+    show_light_descriptions: bool,
+    text_other: bool,
+    date_dependent: bool,
+    highlight_date_dependent: bool,
+    date_view: [9]u8,
+    ignore_scamin: bool,
+    size_scale: f64,
+    // S-52 §14.5 fine-grained viewing-group control: a DENY-LIST of the raw `vg`
+    // ids the mariner turned OFF (NULL/len 0 -> every group shown). Appended at the
+    // end for ABI-append-safety. The pointee must outlive the tile57_style_build call.
+    viewing_groups_off: [*c]const i32,
+    viewing_groups_off_len: u32,
+    // Gate SCAMIN with a live client filter instead of per-value bucket layers
+    // (one *_scamin layer per render-type). Appended for ABI-append-safety.
+    scamin_filter_gate: bool,
+    // S-52 §10.1.10 overscale indication (AP(OVERSC01) over overscaled coverage):
+    // drives the `overscale` layer's visibility. Appended for ABI-append-safety;
+    // tile57_mariner_defaults sets true.
+    show_overscale: bool,
+    // Per-category size multipliers for text / soundings, on top of size_scale.
+    // Appended for ABI-append-safety; marinerFromC reads 0 (an un-set field) as 1.0.
+    text_size_scale: f64,
+    sounding_size_scale: f64,
+    // Spot soundings, independent of the display category. S-52 files SOUNDG under OTHER, but
+    // every ECDIS gives soundings their own switch and the everyday setting is STANDARD +
+    // soundings ON; without this a host must enable the whole OTHER category to get them, and
+    // takes the seabed, the cables and the rest of the low-priority clutter with it.
+    //
+    // TRI-STATE, so a zeroed struct keeps the old meaning (Appended for ABI-append-safety):
+    //   0 = follow the display category (what every existing host gets)
+    //   1 = show soundings, whatever the category says
+    //   2 = hide soundings, whatever the category says
+    soundings: u8,
+    // Device pixels per reference pixel — the HiDPI framebuffer density the SURFACE
+    // paths are drawn at. Describes the display, not the mariner; multiplies with
+    // size_scale. Appended for ABI-append-safety; marinerFromC reads 0 (an un-set
+    // field) as 1.0 = a 1x framebuffer.
+    device_scale: f64,
+    // Chart over picture: drop the opaque water/land fills and the no-data
+    // background so a raster chart beneath shows through, and engage the
+    // DisplayPlane precedence. See tile57.h. Appended for ABI-append-safety.
+    chart_over_image: bool,
+    // The mariner's label language, an ISO 639-2 code, or "" for the portrayed
+    // name. The bake stores each language the chart states beside that name, so
+    // this switches without a re-bake. Appended for ABI-append-safety; a zeroed
+    // struct keeps the portrayed name.
+    preferred_language: [4]u8,
+};
+
+/// The tri-state `soundings` field as the engine's optional bool.
+fn soundingsOf(v: u8) ?bool {
+    return switch (v) {
+        1 => true,
+        2 => false,
+        else => null, // 0 / unknown: follow the display category
+    };
+}
+
+// "YYYYMMDD" or "" from the fixed char[9] field.
+fn dateViewSlice(buf: *const [9]u8) []const u8 {
+    const n = std.mem.indexOfScalar(u8, buf, 0) orelse buf.len;
+    return buf[0..@min(n, 8)];
+}
+
+// Translate the extern CMariner into the internal mariner.Settings the
+// style builders take. The returned value borrows `cm`'s date_view and
+// viewing_groups_off storage, so `cm` (and its viewing_groups_off array) must
+// outlive every use of the result — true within a single ABI call.
+fn marinerFromC(cm: *const CMariner) mariner.Settings {
+    return .{
+        .scheme = switch (cm.scheme) {
+            1 => .dusk,
+            2 => .night,
+            else => .day,
+        },
+        .shallow_contour = cm.shallow_contour,
+        .safety_contour = cm.safety_contour,
+        .deep_contour = cm.deep_contour,
+        .safety_depth = cm.safety_depth,
+        .four_shade_water = cm.four_shade_water,
+        .depth_unit = if (cm.depth_unit == 1) .feet else .meters,
+        .display_base = cm.display_base,
+        .display_standard = cm.display_standard,
+        .display_other = cm.display_other,
+        .data_quality = cm.data_quality,
+        .show_inform_callouts = cm.show_inform_callouts,
+        .show_meta_bounds = cm.show_meta_bounds,
+        .show_isolated_dangers_shallow = cm.show_isolated_dangers_shallow,
+        .boundary_style = if (cm.boundary_style == 1) .plain else .symbolized,
+        .simplified_points = cm.simplified_points,
+        .show_full_sector_lines = cm.show_full_sector_lines,
+        .text_names = cm.text_names,
+        .show_light_descriptions = cm.show_light_descriptions,
+        .text_other = cm.text_other,
+        .date_dependent = cm.date_dependent,
+        .highlight_date_dependent = cm.highlight_date_dependent,
+        .date_view = dateViewSlice(&cm.date_view),
+        .ignore_scamin = cm.ignore_scamin,
+        .scamin_filter_gate = cm.scamin_filter_gate,
+        .show_soundings = soundingsOf(cm.soundings),
+        .show_overscale = cm.show_overscale,
+        .size_scale = cm.size_scale,
+        // Appended fields: an un-set (zero) multiplier means "no extra scale", so a
+        // host that zero-inits without tile57_mariner_defaults still gets 1.0 rather
+        // than invisible text/soundings.
+        .text_size_scale = if (cm.text_size_scale > 0) cm.text_size_scale else 1.0,
+        .sounding_size_scale = if (cm.sounding_size_scale > 0) cm.sounding_size_scale else 1.0,
+        .device_scale = if (cm.device_scale > 0) cm.device_scale else 1.0,
+        .chart_over_image = cm.chart_over_image,
+        .preferred_language = std.mem.sliceTo(&cm.preferred_language, 0),
+        .viewing_groups_off = if (cm.viewing_groups_off != null and cm.viewing_groups_off_len > 0)
+            cm.viewing_groups_off[0..cm.viewing_groups_off_len]
+        else
+            null,
+    };
+}
+
+// The distinct SCAMIN denominators the host passed (host i32 -> u32 styleJson
+// buckets on). Returns an empty slice for NULL/count 0. Caller frees a non-empty
+// result with gpa.free.
+fn scaminBuf(scamin: ?[*]const i32, scamin_count: usize) ![]u32 {
+    const p = scamin orelse return &.{};
+    if (scamin_count == 0) return &.{};
+    const buf = try gpa.alloc(u32, scamin_count);
+    // SCAMIN is a 1:N denominator (> 0); a negative is garbage from the host. Clamp
+    // to 0 ("no scale gate") rather than let a safety-checked @intCast abort the
+    // whole process across the ABI.
+    for (p[0..scamin_count], 0..) |v, i| buf[i] = if (v < 0) 0 else @intCast(v);
+    return buf;
+}
+
+/// Build a MapLibre style JSON from a template + mariner settings + colortables.
+/// See tile57.h.
+export fn tile57_style_build(
+    template_json: ?[*]const u8,
+    template_len: usize,
+    cm: ?*const CMariner,
+    colortables_json: ?[*]const u8,
+    colortables_len: usize,
+    enabled_bands: ?[*]const i32,
+    enabled_band_count: usize,
+    scamin: ?[*]const i32,
+    scamin_count: usize,
+    scamin_lat: f64,
+    out: ?*?[*]u8,
+    out_len: ?*usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const tp = template_json orelse return failWith(err, .badarg, "template_json must not be null");
+    const cmp = cm orelse return failWith(err, .badarg, "mariner must not be null");
+    const m = marinerFromC(cmp);
+    const tmpl = tp[0..template_len];
+    const cts: []const u8 = if (colortables_json) |p| p[0..colortables_len] else "";
+    const bands: ?[]const i32 = if (enabled_bands) |p| p[0..enabled_band_count] else null;
+    // SCAMIN manifest (the distinct denominators the host read from the source /
+    // TileJSON): converted from the host's i32 to the u32 denominators styleJson
+    // buckets on. Empty/NULL -> the *_scamin layers stay ungated.
+    const scamin_buf = scaminBuf(scamin, scamin_count) catch |e| return fail(err, e);
+    defer if (scamin_buf.len > 0) gpa.free(scamin_buf);
+    const now_unix: i64 = @intCast(time(null));
+    const style_json = style.buildFromTemplateScamin(gpa, tmpl, &m, cts, bands, now_unix, scamin_buf, scamin_lat) catch |e| return fail(err, e);
+    return exportOut(err, o, n, style_json);
+}
+
+/// Compute the minimal MapLibre style-mutation ops turning the style for `old_m`
+/// into the style for `new_m` (same inputs as tile57_style_build, so the styles are
+/// comparable): a JSON op array — "[]" when nothing changed, [{"op":"rebuild"}]
+/// when the layer SET differs (host falls back to setStyle). See tile57.h.
+export fn tile57_style_diff(
+    template_json: ?[*]const u8,
+    template_len: usize,
+    old_m: ?*const CMariner,
+    new_m: ?*const CMariner,
+    colortables_json: ?[*]const u8,
+    colortables_len: usize,
+    enabled_bands: ?[*]const i32,
+    enabled_band_count: usize,
+    scamin: ?[*]const i32,
+    scamin_count: usize,
+    scamin_lat: f64,
+    out: ?*?[*]u8,
+    out_len: ?*usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const tp = template_json orelse return failWith(err, .badarg, "template_json must not be null");
+    const omp = old_m orelse return failWith(err, .badarg, "old_m must not be null");
+    const nmp = new_m orelse return failWith(err, .badarg, "new_m must not be null");
+    const om = marinerFromC(omp);
+    const nm = marinerFromC(nmp);
+    const tmpl = tp[0..template_len];
+    const cts: []const u8 = if (colortables_json) |p| p[0..colortables_len] else "";
+    const bands: ?[]const i32 = if (enabled_bands) |p| p[0..enabled_band_count] else null;
+    const scamin_buf = scaminBuf(scamin, scamin_count) catch |e| return fail(err, e);
+    defer if (scamin_buf.len > 0) gpa.free(scamin_buf);
+    // One wall-clock read shared by both builds so "today" date resolution matches
+    // on both sides — otherwise a clock tick could show as a spurious date-filter op.
+    const now_unix: i64 = @intCast(time(null));
+
+    const old_style = style.buildFromTemplateScamin(gpa, tmpl, &om, cts, bands, now_unix, scamin_buf, scamin_lat) catch |e| return fail(err, e);
+    defer gpa.free(old_style);
+    const new_style = style.buildFromTemplateScamin(gpa, tmpl, &nm, cts, bands, now_unix, scamin_buf, scamin_lat) catch |e| return fail(err, e);
+    defer gpa.free(new_style);
+
+    const ops = style.diff(gpa, old_style, new_style) catch |e| return fail(err, e);
+    return exportOut(err, o, n, ops);
+}
+
+/// Generate the base MapLibre style template from the catalogue baked into the
+/// library — the chart `sources` block, sprite/glyph URLs and the layer set;
+/// mariner settings are then applied on top with tile57_style_build. See tile57.h
+/// for the parameter semantics (minzoom emitted verbatim; tile_encoding MLT emits
+/// "encoding":"mlt" on the source).
+export fn tile57_style_template(
+    scheme: c_int,
+    source_tiles: ?[*:0]const u8,
+    sprite_url: ?[*:0]const u8,
+    glyphs_url: ?[*:0]const u8,
+    minzoom: u32,
+    maxzoom: u32,
+    tile_encoding: u8,
+    out: ?*?[*]u8,
+    out_len: ?*usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const xml = embeddedColorProfileXml() orelse return failWith(err, .internal, "embedded colour profile missing");
+    const cts = style.colorTablesJson(gpa, xml) catch |e| return fail(err, e);
+    defer gpa.free(cts);
+    var opts = style.Options{
+        .scheme = switch (scheme) {
+            1 => "dusk",
+            2 => "night",
+            else => "day",
+        },
+        .colortables_json = cts,
+    };
+    if (source_tiles) |s| opts.source_tiles = std.mem.span(s);
+    if (sprite_url) |s| opts.sprite = std.mem.span(s);
+    if (glyphs_url) |g| opts.glyphs = std.mem.span(g);
+    opts.minzoom = minzoom;
+    if (maxzoom != 0) opts.maxzoom = maxzoom;
+    if (tile_encoding == TILE_TYPE_MLT) opts.encoding = "mlt";
+    // Analysed complex linestyles from the embedded catalogue: the template gains the
+    // ls_style decoration layers + the "tile57:linestyles" metadata carrier (tile57_style_build
+    // rebuilds them from that carrier on every mariner change). bundle.linestylesBytes does
+    // filesystem I/O for an on-disk catalogue, so stand up a threaded std.Io; "" = embedded.
+    var ls_arena = std.heap.ArenaAllocator.init(gpa);
+    defer ls_arena.deinit();
+    opts.linestyles_json = bundle.linestylesBytes(sharedIo(), ls_arena.allocator(), "") catch null;
+    const style_json = style.json(gpa, opts) catch |e| return fail(err, e);
+    return exportOut(err, o, n, style_json);
+}
+
+/// Fill `cm` with the canonical default mariner settings. date_view = "".
+export fn tile57_mariner_defaults(cm: ?*CMariner) callconv(.c) void {
+    const o = cm orelse return;
+    const d = mariner.Settings{};
+    o.* = .{
+        .scheme = @intCast(@intFromEnum(d.scheme)),
+        .shallow_contour = d.shallow_contour,
+        .safety_contour = d.safety_contour,
+        .deep_contour = d.deep_contour,
+        .safety_depth = d.safety_depth,
+        .four_shade_water = d.four_shade_water,
+        .depth_unit = @intCast(@intFromEnum(d.depth_unit)),
+        .display_base = d.display_base,
+        .display_standard = d.display_standard,
+        .display_other = d.display_other,
+        .soundings = if (d.show_soundings) |on| (if (on) @as(u8, 1) else @as(u8, 2)) else 0,
+        .data_quality = d.data_quality,
+        .show_inform_callouts = d.show_inform_callouts,
+        .show_meta_bounds = d.show_meta_bounds,
+        .show_isolated_dangers_shallow = d.show_isolated_dangers_shallow,
+        .boundary_style = @intCast(@intFromEnum(d.boundary_style)),
+        .simplified_points = d.simplified_points,
+        .show_full_sector_lines = d.show_full_sector_lines,
+        .text_names = d.text_names,
+        .show_light_descriptions = d.show_light_descriptions,
+        .text_other = d.text_other,
+        .date_dependent = d.date_dependent,
+        .highlight_date_dependent = d.highlight_date_dependent,
+        .date_view = [_]u8{0} ** 9,
+        .ignore_scamin = d.ignore_scamin,
+        .size_scale = d.size_scale,
+        .viewing_groups_off = null, // every viewing group shown
+        .viewing_groups_off_len = 0,
+        .scamin_filter_gate = d.scamin_filter_gate,
+        .show_overscale = d.show_overscale,
+        .text_size_scale = d.text_size_scale,
+        .sounding_size_scale = d.sounding_size_scale,
+        .device_scale = d.device_scale,
+        .chart_over_image = d.chart_over_image,
+        .preferred_language = langCode(d.preferred_language),
+    };
+}
+
+/// How far to dim a picture drawn beneath the chart, for this scheme. See tile57.h.
+export fn tile57_mariner_image_dim(cm: ?*const CMariner) callconv(.c) f32 {
+    const m = cm orelse return 1.0;
+    return marinerFromC(m).imageDim();
+}
+
+// ===========================================================================
+// 7. Util (see tile57.h)
+// ===========================================================================
+
+/// Populate the process-global read-only registries (S-100 catalogue + linestyles) on
+/// the calling thread. Call ONCE on the main thread before opening/baking charts from
+/// worker threads, so concurrent bake/render is race-free. See tile57.h.
+var g_warmup_logged = false;
+/// Drop the engine's reclaimable caches (the per-tile GPU geometry pool —
+/// the largest). For a host answering an OS memory warning. MUST be called
+/// with no scene build in flight (the caches feed the build in progress).
+export fn tile57_trim_caches() callconv(.c) void {
+    chart.geomDropAll();
+}
+
+/// GPU-scene ABI self-description: sizeof(vertex) | sizeof(quad)<<8 |
+/// sizeof(range)<<16 | sizeof(uniforms)<<24. A host compiled against a NEWER
+/// tile57.h than the library it links renders GARBAGE (a 28-byte shader stride
+/// over a 24-byte stream shears every vertex after the first) — comparing this
+/// at open turns silent shear into a loud refusal, and a host calling it
+/// against a library too old to export it fails at LINK time, which is better
+/// still. Uniforms rides in the top byte: 128 fits, and a block the shaders
+/// read past the end of is the same class of silent corruption.
+export fn tile57_abi_gpu_layout() callconv(.c) u32 {
+    const g = @import("render").gpu;
+    return @as(u32, @sizeOf(g.Vertex)) | (@as(u32, @sizeOf(g.Quad)) << 8) |
+        (@as(u32, @sizeOf(g.Range)) << 16) | (@as(u32, @sizeOf(g.Uniforms)) << 24);
+}
+
+/// Batch a scene's ranges into draw calls: which pipeline, which atlas, what
+/// the uniform block says, and which neighbours fold into one call. Pure — it
+/// reads the scene and writes `out`, allocating nothing and touching no GPU.
+///
+/// Returns how many draws the batch HAS. A return greater than `out_cap` means
+/// the buffer was too small and NOTHING should be drawn from it: a truncated
+/// batch is missing chart, silently. Size it from `scene->range_count`, which
+/// is the ceiling (draws only ever merge, never split).
+export fn tile57_gpu_batch(
+    ranges: ?[*]const gpu.Range,
+    range_count: usize,
+    opts: ?*const batch_mod.Opts,
+    out: ?[*]batch_mod.Draw,
+    out_cap: usize,
+) callconv(.c) usize {
+    const rs = if (ranges) |p| p[0..range_count] else return 0;
+    const o = if (opts) |p| p.* else batch_mod.Opts{};
+    // A null `out` is legal: it asks how many draws the batch would have.
+    var none: [0]batch_mod.Draw = .{};
+    const dst: []batch_mod.Draw = if (out) |p| p[0..out_cap] else &none;
+    return batch_mod.batch(rs, o, dst);
+}
+
+export fn tile57_warmup() callconv(.c) void {
+    if (!g_warmup_logged) {
+        g_warmup_logged = true;
+        // Which engine THIS process actually linked — the one line that settles
+        // every "is the app running the latest?" question at runtime.
+        std.debug.print("tile57 engine @ {s}\n", .{@import("buildinfo").commit});
+    }
+    chart.warmup();
+}
+
+/// Free any engine-returned buffer (tiles, style, the scamin array, colortables,
+/// …). Buffers are length-prefixed at allocation, so the pointer is all it
+/// needs — the universal free. See tile57.h.
+export fn tile57_free(ptr: ?*anyopaque) callconv(.c) void {
+    const p = ptr orelse return;
+    const base: [*]align(16) u8 = @alignCast(@as([*]u8, @ptrCast(p)) - EXPORT_HDR);
+    const total = std.mem.readInt(usize, base[0..@sizeOf(usize)], .little);
+    gpa.free(base[0..total]);
+}
+
+// ---- the inventory ----------------------------------------------------------
+
+const CInventoryRow = extern struct {
+    path: [*:0]const u8,
+    bytes: u64,
+    kind: u8,
+    standard: u8,
+    name: [*:0]const u8,
+    edition: [*:0]const u8,
+    update: [*:0]const u8,
+    issue_date: [*:0]const u8,
+    agency: u16,
+    scale: i32,
+    has_bounds: bool,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    reason: [*:0]const u8,
+};
+
+/// What one path holds: the rows, and the arena their strings live in.
+const Inventory = struct {
+    inv: *chart.Inventory,
+    rows: []CInventoryRow,
+};
+
+/// Look through a path and report the files under it that look like charts.
+/// See tile57.h.
+export fn tile57_inventory_open(path: ?[*:0]const u8, out: ?*?*Inventory, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
+    const inv = chart.inventoryOpen(sharedIo(), p) catch |e| return failCtx(err, e, p);
+    errdefer inv.close();
+    const rows = gpa.alloc(CInventoryRow, inv.rows.len) catch |e| return fail(err, e);
+    errdefer gpa.free(rows);
+    for (inv.rows, rows) |src, *dst| {
+        dst.* = .{
+            .path = src.path.ptr,
+            .bytes = src.bytes,
+            .kind = @intFromEnum(src.kind),
+            .standard = @intFromEnum(src.standard),
+            .name = src.name.ptr,
+            .edition = src.edition.ptr,
+            .update = src.update.ptr,
+            .issue_date = src.issue_date.ptr,
+            .agency = src.agency,
+            .scale = src.scale,
+            .has_bounds = src.bounds != null,
+            .west = if (src.bounds) |b| b[0] else 0,
+            .south = if (src.bounds) |b| b[1] else 0,
+            .east = if (src.bounds) |b| b[2] else 0,
+            .north = if (src.bounds) |b| b[3] else 0,
+            .reason = src.reason.ptr,
+        };
+    }
+    const handle = gpa.create(Inventory) catch |e| return fail(err, e);
+    handle.* = .{ .inv = inv, .rows = rows };
+    o.* = handle;
+    return OK;
+}
+
+export fn tile57_inventory_close(handle: ?*Inventory) callconv(.c) void {
+    const h = handle orelse return;
+    gpa.free(h.rows);
+    h.inv.close();
+    gpa.destroy(h);
+}
+
+/// The rows, in path order. Borrowed until close. See tile57.h.
+export fn tile57_inventory_rows(handle: ?*Inventory, out_n: ?*usize) callconv(.c) ?[*]const CInventoryRow {
+    const h = handle orelse {
+        if (out_n) |n| n.* = 0;
+        return null;
+    };
+    if (out_n) |n| n.* = h.rows.len;
+    if (h.rows.len == 0) return null;
+    return h.rows.ptr;
+}
