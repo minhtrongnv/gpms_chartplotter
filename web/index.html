@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#0b1b2b" />
+  <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <title>chartplotter — S-101 marine chart plotter</title>
+  <style>
+    html {
+      height: 100%;
+      overflow: hidden;
+      overscroll-behavior: none;
+      /* Backstop so the iOS standalone (Add-to-Home-Screen) home-indicator strip
+         is never the default white — it shows this dark navy if anything peeks. */
+      background: #0b1b2b;
+    }
+    body {
+      margin: 0;
+      /* Pin to ALL four viewport edges (incl. the bottom safe area). Edge-pinning
+         is what actually fills the screen in iOS standalone — height:100dvh alone
+         leaves a white bar behind the home indicator. fixed+overflow:hidden also
+         stops the iOS document rubber-band bounce. */
+      position: fixed;
+      inset: 0;
+      overflow: hidden;
+      overscroll-behavior: none;
+      background: #0b1b2b;
+      touch-action: manipulation;
+    }
+    chart-plotter {
+      display: block;
+      width: 100%;
+      height: 100%;   /* fills the edge-pinned body */
+    }
+    /* Splash: painted from the static HTML before any module/wasm/tiles load, so
+       the user sees feedback instantly; faded out on the plotter's `ready` event. */
+    #splash {
+      position: fixed; inset: 0; z-index: 9999;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 14px; background: #0b1b2b; color: #cfe3f5;
+      font: 15px/1.4 system-ui, -apple-system, sans-serif;
+      transition: opacity .4s ease;
+    }
+    #splash.hide { opacity: 0; pointer-events: none; }
+    #splash .spinner {
+      width: 40px; height: 40px; border-radius: 50%;
+      border: 4px solid #1d3a52; border-top-color: #4aa3df;
+      animation: cp-spin .9s linear infinite;
+    }
+    @keyframes cp-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { #splash .spinner { animation: none; } }
+  </style>
+  <!-- <chart-plotter> is the chart-management shell: discover charts on the
+       map (NOAA catalog cell boxes over an offline GSHHG coastline), get chart
+       data in, manage what's installed, and set S-52 mariner options.
+       Tiles are baked SERVER-SIDE. Get charts in by dropping a NOAA `.zip` /
+       `.000`; the cells are uploaded and the server bakes them (POST /api/import)
+       into a tile set the renderer reads from /tiles/{set}. Every S-52 mariner
+       setting is then applied client-side. A hosted deployment can instead serve
+       prebaked per-region `.pmtiles` (the `widget` mode / `pmtiles=` attribute).
+       Prereqs in this dir:
+       colortables/sprite/linestyles/patterns + glyphs (`chartplotter --emit-assets web`),
+       vendor/maplibre-gl.*, basemap/coastline.geojson (`scripts/fetch-basemap.sh`),
+       and optionally catalog.json (`chartplotter --catalog-json …`). -->
+  <script type="module" src="./src/chartplotter.mjs"></script>
+</head>
+<body>
+  <!-- `pmtiles="charts.pmtiles"` renders the hosted default archive (baked by
+       scripts/serve.sh / `zig build bake`) when nothing local is stored. Absent
+       file → app just starts at the empty state. -->
+  <div id="splash"><div class="spinner"></div><div>Loading charts…</div></div>
+  <script>
+    // Remove the splash once the map's first frame is up (the plotter fires a
+    // composed `ready` that bubbles to the document). Safety timeout guarantees we
+    // never trap the user behind it if `ready` never fires.
+    (function () {
+      var done = false;
+      function hide() {
+        if (done) return; done = true;
+        var s = document.getElementById("splash");
+        if (!s) return;
+        s.classList.add("hide");
+        setTimeout(function () { s.remove(); }, 500);
+      }
+      addEventListener("ready", hide, { once: true });
+      setTimeout(hide, 20000);
+    })();
+  </script>
+
+  <chart-plotter pmtiles="charts.pmtiles" center="-76.4875,38.975" zoom="11"></chart-plotter>
+
+  <!-- Embedding just the renderer (no management UI) stays a one-liner — point
+       it at a prebaked archive:
+       <script type="module" src="./src/chart-canvas/chart-canvas.mjs"></script>
+       <chart-canvas pmtiles="charts.pmtiles"></chart-canvas> -->
+</body>
+</html>

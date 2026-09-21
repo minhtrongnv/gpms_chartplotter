@@ -1,0 +1,605 @@
+// Package server is the chartplotter's HTTP hub. It serves the web frontend
+// (static files, with HTTP Range), bakes imported ENCs server-side into PMTiles
+// packs and serves their tiles, proxies raw NOAA ENC downloads (a CORS proxy,
+// since charts.noaa.gov sends no CORS headers), and exposes the vessel/AIS/NMEA
+// and chart-library APIs. State lives under the data dir and is shared across
+// connected clients.
+package server
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/beetlebugorg/chartplotter/internal/engine/nmea"
+	"github.com/beetlebugorg/chartplotter/internal/engine/plugin"
+	"github.com/beetlebugorg/chartplotter/internal/engine/tilesource"
+	"github.com/beetlebugorg/chartplotter/web"
+)
+
+// Server hosts the static web assets and the /api/cell proxy. Static assets come
+// from the embedded bundle (web.Assets) by default; if assetsDir is non-empty,
+// on-disk files there take precedence and anything missing falls back to the
+// embedded copy. Downloaded raw cells are cached under cacheDir/ENC_ROOT. The
+// zero value is not usable; use New.
+type Server struct {
+	assetsDir      string // optional on-disk asset override (dev); "" → embedded only
+	assetsFallback string // secondary on-disk asset root (emitted S-101 assets), searched after assetsDir, before embedded
+	cacheDir       string // XDG cache root: REGENERABLE baked tile sets (NOAA/<d>/*.pmtiles)
+	dataDir        string // XDG data root: SOURCE ENC (district zips, raw cells) — safe, not auto-deleted
+	allowRemote    bool
+	share          shareStore    // latest "share my view" snapshot (camera + cell list)
+	settings       settingsStore // persisted client display settings (<data>/client-settings.json)
+	Version        string        // build version
+	EngineCommit   string        // tile57 engine commit built into this binary ("unknown" without the ldflags stamp)
+
+	sets    *tileSets         // registry of ENABLED tile sets served at /tiles/{set}/…
+	imports *importJobs       // background server-side bake jobs (POST /api/import)
+	bakeMu  sync.Mutex        // serializes bakes: two imports must not interleave cross-pack peer rewrites / shared context
+	bakeWG  sync.WaitGroup    // tracks the New-triggered self-heal bake goroutine so Close can drain it (its asset writes must not race a test/temp-dir teardown)
+	packsMu sync.Mutex        // guards packs
+	packs   map[string]string // ALL baked packs on disk: set name → pmtiles path
+	prefs   *prefs            // persisted enable/disable state (<data>/prefs.json)
+	auxIdx  *auxIndex         // index of companion aux.zips for /api/aux (TXTDSC/PICREP)
+	cellIdx *cellIndex        // persistent name→bbox index over cached cells (/api/cells, search fly-to)
+
+	vessel    *nmea.Store       // latest NMEA0183 vessel state (fed by nmeaMgr)
+	nmeaMgr   *nmea.Manager     // live NMEA0183 connections (writes into vessel)
+	conns     *connectionsStore // persisted connection configs (<data>/connections.json)
+	rawHub    *rawHub           // raw-sentence fan-out for the per-connection sniffer
+	pluginMgr *plugin.Manager   // installed plugins: lifecycle + broker (<data>/plugins.json)
+}
+
+// New returns a Server. Pass an empty assetsDir to serve the embedded asset
+// bundle (the single-file default); pass a directory to override it from disk
+// during development. cacheDir is the XDG cache root for REGENERABLE baked tile
+// sets; dataDir is the XDG data root for the SOURCE ENC (district zips, raw cells)
+// that must survive a cache wipe — pass "" to default it to cacheDir (single-dir
+// mode). allowRemote is true when the bind host is not loopback (the operator
+// opted into network exposure), which skips the per-request Host-header check.
+func New(assetsDir, cacheDir, dataDir string, allowRemote bool, engineCommit string) *Server {
+	if dataDir == "" {
+		dataDir = cacheDir
+	}
+	migrateLegacyENCRoot(dataDir)             // one-time: retired flat ENC_ROOT → loose/cells (before indexing)
+	migrateProviderEncRoot(dataDir, cacheDir) // one-time: per-district-pack layout → per-provider ENC_ROOT
+	s := &Server{assetsDir: assetsDir, cacheDir: cacheDir, dataDir: dataDir, allowRemote: allowRemote, sets: newTileSets(), imports: newImportJobs(), auxIdx: newAuxIndex(), cellIdx: newCellIndex(dataDir)}
+	// The engine commit must be known BEFORE the boot registration below:
+	// registerLiveProviders/rebakeMissingProviders gate on the .enginever stamp,
+	// and an empty commit counts every kept archive as current (stale tiles
+	// would register and the self-heal re-bake would never fire).
+	s.EngineCommit = engineCommit
+	s.cellIdx.build() // backfill cell bounds in the background (kick spawns its own goroutine)
+	// Discover every baked pack on disk (provider trees + flat tiles/), then
+	// register the ENABLED ones (disabled packs stay on disk but off the map). State
+	// lives in <data>/prefs.json so it survives restarts and is shared across clients.
+	s.packs = scanPacks(cacheDir)
+	s.prefs = loadPrefs(dataDir)
+	s.initNMEA()    // load connections.json + start their live runners
+	s.initPlugins() // load plugins.json + start enabled plugins' host-side runners
+	n := 0
+	for _, name := range sortedKeys(s.packs) {
+		if s.prefs.isDisabled(name) {
+			continue
+		}
+		if src, err := tilesource.Open(s.packs[name]); err == nil {
+			s.sets.register(name, src)
+			n++
+		} else {
+			log.Printf("tilesets: skip %q: %v", s.packs[name], err)
+		}
+	}
+	if len(s.packs) > 0 {
+		log.Printf("tilesets: %d pack(s) on disk, %d enabled (from %s)", len(s.packs), n, cacheDir)
+	}
+	s.registerLiveProviders()  // re-register live runtime compositors from kept per-cell archives (survives restart)
+	s.registerLiveCompose()    // dev/test: on-demand runtime compositor from TILE57_LIVE_COMPOSE (no-op if unset)
+	s.rebakeMissingProviders() // self-heal: bake any provider with an ENC_ROOT but no set (→ live prep)
+	return s
+}
+
+// rebakeMissingProviders bakes, in the background, any provider that has an ENC_ROOT on
+// disk but no baked bundle registered — e.g. after migrateProviderEncRoot dropped the
+// old per-pack bundles, or a download that never finished baking. The provider's charts
+// reappear without a re-download (the ENC_ROOT is preserved). A no-op when nothing is
+// missing (the common case), so it's cheap on a normal start.
+func (s *Server) rebakeMissingProviders() {
+	var missing []string
+	for _, prov := range s.installedProviders() {
+		if _, live := s.sets.get(prov); live {
+			// Serving, but from another engine build's archives: re-bake to a staging
+			// tree and swap when done (prepareLiveProvider) — the old tiles keep
+			// serving meanwhile, and registerProviderSet replaces the composer.
+			if !s.liveEngineCurrent(s.liveCellsDir(prov)) {
+				missing = append(missing, prov)
+			}
+			continue
+		}
+		if _, ok := s.packPath(prov); !ok {
+			missing = append(missing, prov)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	s.bakeWG.Add(1)
+	go func() {
+		defer s.bakeWG.Done()
+		for _, prov := range missing {
+			job := s.imports.create(prov)
+			s.bakeMu.Lock()
+			if s.bakeProvider(job.ID, prov) {
+				s.imports.update(job.ID, func(j *importJob) { j.State = "done" })
+			}
+			s.bakeMu.Unlock()
+		}
+	}()
+}
+
+// Close releases server-held resources (open tile-set archives). Safe to call once
+// at shutdown.
+func (s *Server) Close() error {
+	s.bakeWG.Wait() // drain the New-triggered self-heal bake so its asset writes finish before teardown
+	if s.nmeaMgr != nil {
+		s.nmeaMgr.Close()
+	}
+	if s.pluginMgr != nil {
+		s.pluginMgr.Close()
+	}
+	s.sets.closeAll()
+	return nil
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	lw := &logResponseWriter{ResponseWriter: w, status: http.StatusOK}
+	setSecurityHeaders(lw)
+	switch {
+	case r.URL.Path == "/api/style.json":
+		// A complete MapLibre style document generated by the native tile57 engine
+		s.serveTile57Style(lw, r)
+	case r.URL.Path == "/api/style-diff":
+		// Minimal MapLibre mutation ops between two mariner selections, for flicker-
+		// free tile57 toggles (build-tagged; 501 stub in the default build).
+		s.serveTile57StyleDiff(lw, r)
+	case strings.HasPrefix(r.URL.Path, "/api/"):
+		s.handleAPI(lw, r)
+	case strings.HasPrefix(r.URL.Path, "/tiles/"):
+		s.serveTileSet(lw, r)
+	case strings.HasPrefix(r.URL.Path, "/plugins/"):
+		// Per-plugin, plugin-owned static: /plugins/<id>/ui/* (ES modules/assets from
+		// the unpacked archive) and /plugins/<id>/serve/* (published artifacts).
+		s.servePluginStatic(lw, r)
+	case r.URL.Path == "/aux/index.json" || strings.HasPrefix(r.URL.Path, "/aux/"):
+		// Feature attachments (TXTDSC/PICREP) as loose static files: GET /aux/index.json
+		// (the manifest) + GET /aux/<stored> (one file). The SAME path the offline bundle
+		// serves, so the client loads aux identically online or off — no zip, no /api.
+		s.serveAux(lw, r)
+	case strings.HasPrefix(r.URL.Path, "/osm/"):
+		// Proxy the OSM raster basemap through the server: a browser can't set the
+		// User-Agent that OSM's tile policy requires (it's a forbidden request
+		// header), so direct tile.openstreetmap.org fetches get 403'd. The server
+		// fetches them with a compliant, app-identifying UA and streams them back
+		// from same-origin.
+		s.serveOSM(lw, r)
+	default:
+		s.serveAsset(lw, r)
+	}
+	// One access-log line per request to stderr (method, status, path, range,
+	// duration) — so you can watch what the browser fetches when testing.
+	rng := ""
+	if v := r.Header.Get("Range"); v != "" {
+		rng = " " + v
+	}
+	log.Printf("%s %d %s%s %s", r.Method, lw.status, r.URL.RequestURI(), rng, time.Since(start).Round(time.Microsecond))
+}
+
+// logResponseWriter captures the status code for the access log while
+// forwarding everything (including http.ServeContent's Range handling) through.
+type logResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *logResponseWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// Flush forwards to the underlying writer so streaming responses (SSE) work
+// through the log wrapper.
+func (w *logResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+const jsonCT = "application/json"
+
+func apiErr(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", jsonCT)
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `{"ok":false,"error":%q}`, msg)
+}
+
+// hostIsLocal reports whether the request Host is a loopback name — the
+// DNS-rebind defence for the local webapp.
+func hostIsLocal(host string) bool {
+	return strings.HasPrefix(host, "127.0.0.1") ||
+		strings.HasPrefix(host, "localhost") ||
+		strings.HasPrefix(host, "[::1]")
+}
+
+// setSecurityHeaders applies defence-in-depth headers to every response: block
+// MIME sniffing, framing (clickjacking), and referrer leakage. Cheap and safe for
+// a map app — none of these constrain how the chart assets load.
+func setSecurityHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "DENY")
+	// connect-src 'self' keeps installed plugin UI (trusted, runs in the main
+	// document) from phoning home — all fetch/XHR/EventSource/WebSocket must be
+	// same-origin (spec §9). Everything the app itself fetches is same-origin
+	// (OSM + NOAA go through server-side proxies), so this is transparent to it.
+	h.Set("Content-Security-Policy", "frame-ancestors 'none'; connect-src 'self'")
+	h.Set("Referrer-Policy", "no-referrer")
+}
+
+// crossSiteWrite reports whether r is an unsafe (state-changing) request that did
+// NOT originate from our own page — i.e. a CSRF attempt. Safe methods are exempt.
+// The API has no cookies/credentials, but the server holds shared state and, when
+// bound to a LAN (the boat's network), is reachable by other devices, so a
+// malicious page open in a client browser must not be able to drive it. We accept
+// a write only if it is same-origin per Sec-Fetch-Site (modern browsers) or the
+// Origin header; a request with neither is a non-browser client (no ambient
+// authority to abuse) and is allowed.
+func crossSiteWrite(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "same-origin", "none":
+		return false
+	case "cross-site", "same-site":
+		return true
+	}
+	// No Sec-Fetch-Site header: fall back to Origin. A browser cross-origin fetch
+	// always sends Origin; a missing Origin means a non-browser client.
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return true
+	}
+	return !strings.EqualFold(u.Host, r.Host)
+}
+
+// chartHTTPClient fetches ENC data from the allowed chart hosts, re-validating the
+// host on every redirect hop so a redirect can't bounce the fetch to an internal
+// address (SSRF defence-in-depth, on top of the caller's initial host check).
+var chartHTTPClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		if providerForHost(req.URL.Hostname()) == nil {
+			return fmt.Errorf("redirect to disallowed host %q", req.URL.Hostname())
+		}
+		return nil
+	},
+}
+
+func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
+	if !s.allowRemote && !hostIsLocal(r.Host) {
+		apiErr(w, http.StatusForbidden, "non-local host")
+		return
+	}
+	if crossSiteWrite(r) {
+		apiErr(w, http.StatusForbidden, "cross-site request blocked")
+		return
+	}
+	switch {
+	case r.URL.Path == "/api/health":
+		w.Header().Set("Content-Type", jsonCT)
+		fmt.Fprintf(w, `{"ok":true,"version":%q}`, s.Version)
+	case r.URL.Path == "/api/cells":
+		s.serveCells(w, r) // GET: names of cells currently in the server's ENC_ROOT cache
+	case r.URL.Path == "/api/ienc/catalog":
+		s.serveIENCCatalog(w, r) // GET: USACE Inland ENC products catalogue (server-fetched JSON)
+	case strings.HasPrefix(r.URL.Path, "/api/cell/"):
+		if r.Method == http.MethodPut {
+			s.uploadCell(w, r) // PUT raw .000 into the cache (share: hand-imported cells)
+		} else {
+			s.serveCell(w, r) // GET raw .000 — the 100%-wasm path: NOAA download proxy + cache
+		}
+	case r.URL.Path == "/api/share":
+		s.serveShare(w, r) // GET/POST the latest "share my view" snapshot
+	case r.URL.Path == "/api/settings":
+		s.serveSettings(w, r) // GET/POST persisted client display settings (shared across screens)
+	case r.URL.Path == "/api/vessel":
+		s.serveVessel(w, r) // GET: latest NMEA0183 vessel-state snapshot
+	case r.URL.Path == "/api/vessel/stream":
+		s.serveVesselStream(w, r) // SSE: coalesced vessel-state deltas
+	case r.URL.Path == "/api/ais":
+		s.serveAIS(w, r) // GET: current AIS target list
+	case r.URL.Path == "/api/ais/stream":
+		s.serveAISStream(w, r) // SSE: AIS targets, pushed on change
+	case r.URL.Path == "/api/connections":
+		s.serveConnections(w, r) // GET list (+status) / POST create a connection
+	case r.URL.Path == "/api/connections/stream":
+		s.serveConnectionsStream(w, r) // SSE: live connection-status badges
+	case strings.HasPrefix(r.URL.Path, "/api/connections/"):
+		s.serveConnection(w, r) // GET/PUT/DELETE /<id>, or SSE /<id>/raw (sniffer)
+	case r.URL.Path == "/api/plugins":
+		s.servePlugins(w, r) // GET list (manifest + grants + status)
+	case r.URL.Path == "/api/plugins/install":
+		s.servePluginInstall(w, r) // POST multipart zip → verify → unpack
+	case r.URL.Path == "/api/plugins/stream":
+		s.servePluginsStream(w, r) // SSE: plugin status/state changes
+	case strings.HasPrefix(r.URL.Path, "/api/plugins/"):
+		s.servePluginItem(w, r) // enable/disable/grants/config/remove for one plugin
+	case strings.HasPrefix(r.URL.Path, "/api/import"):
+		s.handleImport(w, r) // POST: server-side native bake → register a tile set; status polling
+	case r.URL.Path == "/api/packs":
+		s.handlePacks(w, r) // GET: all baked packs + enabled state
+	case strings.HasPrefix(r.URL.Path, "/api/pack/"):
+		s.handlePackDetail(w, r) // GET: one pack's full extracted metadata (per-cell)
+	case r.URL.Path == "/api/set/enable" || r.URL.Path == "/api/set/disable":
+		s.handleSetEnabled(w, r) // POST: show/hide a pack on the map (data kept)
+	case r.URL.Path == "/api/set":
+		s.handleDeleteSet(w, r) // DELETE: uninstall a whole provider (baked bundle + ENC_ROOT)
+	case r.URL.Path == "/api/district":
+		s.handleDeleteDistrict(w, r) // DELETE: remove one district + re-bake the provider
+	case r.URL.Path == "/api/proxy":
+		s.serveProxy(w, r) // dumb CORS/Range passthrough for a NOAA URL (e.g. All_ENCs.zip)
+	case strings.HasPrefix(r.URL.Path, "/api/debug/partition"):
+		s.handleDebugPartition(w, r) // POST: bake ownership-partition overlays; GET: their status
+	default:
+		apiErr(w, http.StatusNotFound, "unknown endpoint")
+	}
+}
+
+// serveCell serves a raw S-57 base cell (.000) over HTTP. GET
+// /api/cell/<NAME>?url=<noaa-zip-url>: returns the cached cell from ENC_ROOT, or
+// (acting as a NOAA download proxy, since charts.noaa.gov sends no CORS headers)
+// downloads + caches it from `url` first.
+func (s *Server) serveCell(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		apiErr(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/cell/"), ".000")
+	if name == "" || !isCellName(name) {
+		apiErr(w, http.StatusBadRequest, "bad cell name")
+		return
+	}
+	// SSRF guard: the download URL is caller-supplied, so a registered chart
+	// provider must handle it before we fetch it.
+	rawURL := r.URL.Query().Get("url")
+	if rawURL != "" && !allowedChartURL(rawURL) {
+		apiErr(w, http.StatusBadRequest, "url must be from a known chart provider")
+		return
+	}
+	data, _, err := loadCellCached(chartHTTPClient, s.looseCellsDir(), name, rawURL)
+	if err != nil {
+		apiErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write(data)
+}
+
+// serveProxy is a dumb CORS proxy that streams a NOAA URL through to the browser
+// (which can't fetch charts.noaa.gov cross-origin — no CORS headers there). It
+// forwards Range so the client's random-access ZIP reader can pull just the
+// cells it needs out of the multi-GB All_ENCs.zip without downloading it whole.
+// No parsing, no caching, no extraction — all of that is done in-browser (wasm).
+// Restricted to NOAA hosts so it isn't an open relay.
+func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		apiErr(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	raw := r.URL.Query().Get("url")
+	if !allowedChartURL(raw) {
+		apiErr(w, http.StatusBadRequest, "url must be from a known chart provider")
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, raw, nil)
+	if err != nil {
+		apiErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if rng := r.Header.Get("Range"); rng != "" {
+		req.Header.Set("Range", rng) // forward range for random-access reads
+	}
+	resp, err := chartHTTPClient.Do(req)
+	if err != nil {
+		apiErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	for _, h := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Expose-Headers", "content-range,accept-ranges,content-length")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// Allowed ENC download hosts live in the provider registry (providers.go), the
+// single place to add a new source. See allowedChartURL / providerForHost.
+
+// isCellName accepts the alphanumeric NOAA cell ids (e.g. US5MD1MC) — a safe
+// single path component (no separators, dots, or traversal).
+func isCellName(s string) bool {
+	if len(s) == 0 || len(s) > 16 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// SetAssetFallback registers a secondary on-disk asset root, searched AFTER the
+// primary --assets dir and BEFORE the embedded bundle. Used to serve the freshly
+// emitted S-101 client assets (sprite/colortables/…) from a temp dir without
+// shadowing an explicit --assets directory (e.g. a prebaked widget bundle that
+// already carries its own copies). Pass "" to disable.
+func (s *Server) SetAssetFallback(dir string) { s.assetsFallback = dir }
+
+// serveAsset serves a static web asset: an on-disk --assets override (if set and
+// present), then the emitted S-101 asset fallback, then the embedded bundle.
+func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request) {
+	rel := r.URL.Path
+	if rel == "" || rel == "/" {
+		rel = "/index.html"
+	}
+	rel = path.Clean(rel)
+	if strings.Contains(rel, "..") {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	name := strings.TrimPrefix(rel, "/")
+
+	// A --assets directory (dev) overrides the embedded bundle when the file is
+	// present on disk; otherwise fall back to the embedded copy.
+	if s.assetsDir != "" {
+		full := filepath.Join(s.assetsDir, filepath.FromSlash(name))
+		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
+			s.serveFile(w, r, full, rel)
+			return
+		}
+	}
+	// Secondary on-disk root: the freshly-emitted S-101 client assets (sprite/
+	// colortables/…). Searched only after the primary --assets dir so an explicit
+	// bundle's own files win, and before the embedded copy so a `make`-less serve
+	// still gets the generated assets.
+	if s.assetsFallback != "" {
+		full := filepath.Join(s.assetsFallback, filepath.FromSlash(name))
+		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
+			s.serveFile(w, r, full, rel)
+			return
+		}
+	}
+	s.serveEmbedded(w, r, name, rel)
+}
+
+// serveFile streams an on-disk file with HTTP Range + permissive CORS (so the
+// pmtiles:// protocol can fetch byte ranges). `rel` is the request path (used
+// for the MIME type + cache policy).
+func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, full, rel string) {
+	f, err := os.Open(full)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	setAssetHeaders(w, rel)
+	http.ServeContent(w, r, fi.Name(), fi.ModTime(), f)
+}
+
+// serveEmbedded streams a file from the embedded asset bundle. Embedded files
+// have no modification time, so revalidation is driven by Cache-Control only.
+func (s *Server) serveEmbedded(w http.ResponseWriter, r *http.Request, name, rel string) {
+	f, err := web.Assets.Open(name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	rs, ok := f.(io.ReadSeeker)
+	if !ok { // every embed.FS file is seekable; guard defensively
+		http.Error(w, "asset not seekable", http.StatusInternalServerError)
+		return
+	}
+	setAssetHeaders(w, rel)
+	http.ServeContent(w, r, fi.Name(), time.Time{}, rs)
+}
+
+// setAssetHeaders writes the Range/CORS/cache headers shared by the on-disk and
+// embedded asset paths. The app code + manifests must always reflect the latest
+// build/bake, so HTML/JS/JSON revalidate (otherwise a cached chartplotter-app.mjs
+// serves stale app logic after an update). The .wasm module revalidates too: it
+// is loaded together with wasm_exec.js (a .js, already no-cache), and the two are
+// a matched pair — a cached .wasm against a fresh wasm_exec.js fails with "import
+// object field 'runtime.ticks' is not a Function" (a runtime mismatch).
+// Tiles/atlases are large and change only via a fresh provision
+// (cache-busted by ?t=), so they may cache.
+func setAssetHeaders(w http.ResponseWriter, rel string) {
+	w.Header().Set("Content-Type", mimeFor(rel))
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Expose-Headers", "content-range,accept-ranges,content-length")
+	switch strings.ToLower(filepath.Ext(rel)) {
+	case ".html", ".js", ".mjs", ".json", ".wasm":
+		w.Header().Set("Cache-Control", "no-cache")
+	default:
+		// The sprite / pattern atlas PNGs are a matched pair with their .json
+		// metadata (which is no-cache): the JSON holds each cell's x/y/w/h into the
+		// image, so a stale atlas PNG against fresh offsets crops every symbol and
+		// fill-pattern from the WRONG region — patterns vanish or render as black
+		// boxes (worse on Chrome, whose heuristic cache held the old PNG). Keep the
+		// pair in sync by revalidating these too. (Other PNGs — tiles, glyphs,
+		// basemap — are large and cache-busted by ?t=/?g=, so they may cache.)
+		switch strings.ToLower(filepath.Base(rel)) {
+		case "sprite.png", "patterns.png":
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+	}
+}
+
+// mimeFor maps a path's extension to a content type. Explicit for the types the
+// browser is strict about (.mjs/.wasm) and the chart formats.
+func mimeFor(p string) string {
+	switch strings.ToLower(filepath.Ext(p)) {
+	case ".html":
+		return "text/html; charset=utf-8"
+	case ".js", ".mjs":
+		return "text/javascript; charset=utf-8"
+	case ".json":
+		return "application/json"
+	case ".css":
+		return "text/css; charset=utf-8"
+	case ".png":
+		return "image/png"
+	case ".wasm":
+		return "application/wasm"
+	case ".pmtiles":
+		return "application/octet-stream"
+	case ".pbf":
+		return "application/x-protobuf"
+	case ".svg":
+		return "image/svg+xml"
+	default:
+		return "application/octet-stream"
+	}
+}

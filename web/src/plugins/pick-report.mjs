@@ -1,0 +1,557 @@
+// <pick-report> — the ECDIS cursor-pick report panel (S-52 PresLib §10.8).
+//
+// A self-contained, draggable floating panel. The shell (<chart-plotter>)
+// gathers the feature stack under a tapped point and hands it here; this element
+// owns the decode (full names, enumerated values, units, dates, the category-C
+// administrative split) and all panel behaviour. It:
+//   • renders the report from the baked S-57 attribute blob + the catalogue,
+//   • lets the mariner drag it anywhere (grab the header),
+//   • auto-places itself in the screen corner farthest from the picked point so
+//     it stays out of the way of what was just tapped,
+//   • emits "pick-feature" (the displayed feature, for the map highlight) and
+//     "pick-close" so the shell can sync the map.
+//
+// Public API: setCatalogue(cat) · setUnits(prefs) · setSnapshot(fn) ·
+// show(feats, anchor{x,y}) · hide().
+
+import { convertHeight, convertDistance, convertSpeed, unitSuffix, M_TO_FT } from "../lib/units.mjs";
+import { copyText, flashBtn } from "../lib/util.mjs";
+
+// Attributes whose numeric value carries a physical unit we let the mariner pick.
+// Each maps to a category whose canonical source unit matches the ENC encoding:
+// heights/clearances are metres, VALNMR is nautical miles, CURVEL is knots, and
+// the depth attributes are metres (shown in the depth unit). Everything else keeps
+// the catalogue's own unit string.
+const PICK_HEIGHT_ATTRS = new Set(["HEIGHT", "ELEVAT", "VERCLR", "VERCCL", "VERCOP", "VERCSA"]);
+const PICK_DEPTH_ATTRS = new Set(["VALSOU", "VALDCO", "DRVAL1", "DRVAL2"]);
+const PICK_DIST_ATTRS = new Set(["VALNMR"]);
+const PICK_SPEED_ATTRS = new Set(["CURVEL"]);
+
+// Format a converted number compactly + its unit suffix. Feet ALWAYS read as
+// whole numbers ("12 ft"); metric keeps at most one decimal (the tenths digit
+// feet drops). Other units keep the compact by-magnitude decimals.
+function fmtUnitNum(v, unit) {
+  if (!isFinite(v)) return "";
+  let dec = Math.abs(v) >= 100 ? 0 : Math.abs(v) >= 10 ? 1 : 2;
+  if (unit === "ft") dec = 0;
+  else if (unit === "m") dec = Math.min(1, dec);
+  let s = v.toFixed(dec);
+  if (s.includes(".")) s = s.replace(/\.?0+$/, "");
+  return s + " " + unitSuffix(unit);
+}
+
+// S-57 date attributes; rendered "DD-MMM-YYYY" (PresLib §10.8 rule 6).
+const PICK_DATE_ATTRS = new Set(["SORDAT", "RECDAT", "DATSTA", "DATEND", "PERSTA", "PEREND", "SURSTA", "SUREND"]);
+// Attributes whose value is an external filename (shipped in the aux zip): the
+// textual descriptions and the pictorial representation. Resolved to inline
+// content from the AuxStore when one is loaded; otherwise shown as the filename.
+const PICK_TEXT_ATTRS = new Set(["TXTDSC", "NTXTDS"]);
+const PICK_PIC_ATTRS = new Set(["PICREP"]);
+const PICK_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// The display name from an S-101 `featureName` complex — an array of
+// { name, language, nameUsage } instances; prefer the English one.
+function pickName(fn) {
+  if (!Array.isArray(fn) || !fn.length) return "";
+  const eng = fn.find((x) => x && (x.language === "eng" || x.language === "en"));
+  return ((eng || fn[0]) || {}).name || "";
+}
+
+// Left-indent a nested attribute's label by its depth in the S-101 complex tree.
+function indentK(depth) {
+  return depth > 0 ? ` style="padding-left:${depth * 14}px"` : "";
+}
+
+// Format an S-57 date value (YYYYMMDD / YYYYMM / YYYY) as the spec form (rule 6).
+function fmtS57Date(v) {
+  const s = String(v).trim();
+  const m = /^(\d{4})(\d{2})?(\d{2})?$/.exec(s);
+  if (!m) return s;
+  const [, y, mo, d] = m;
+  if (d && mo) return `${d}-${PICK_MONTHS[+mo - 1] || mo}-${y}`;
+  if (mo) return `${PICK_MONTHS[+mo - 1] || mo}-${y}`;
+  return y;
+}
+
+// Does an S-57 list/enumerated value (comma-separated) contain `id`?
+function attrHas(raw, id) {
+  return raw != null && String(raw).split(",").map((s) => s.trim()).includes(id);
+}
+
+// SORDAT is administrative (category C, normally withheld) but PresLib §10.8 rule 5
+// requires it shown — even with admin attributes hidden — for these objects.
+function sordatException(cls, attrs) {
+  if (["WRECKS", "OBSTRN", "UWTROC", "SWPARE"].includes(cls)) return true;
+  if (cls === "SOUNDG" && attrHas(attrs.QUASOU, "9")) return true;
+  if (cls === "DRGARE" && attrHas(attrs.QUASOU, "11")) return true;
+  return attrHas(attrs.CONDTN, "1") || attrHas(attrs.CONDTN, "3") || attrHas(attrs.CONDTN, "5");
+}
+
+const STYLE = `
+  :host { position:absolute; z-index:8; width:440px; max-width:calc(100% - 24px);
+    /* Cap to the viewport (minus 12px margins + notch/bottom-bar) so the body
+       scrolls instead of the whole card running off-screen for long stacks. */
+    max-height:calc(100% - 24px - var(--sa-top,0px) - var(--botbar-h,0px));
+    display:flex; flex-direction:column; background:var(--ui-surface,#fff); color:var(--ui-text,#2a2f35);
+    border:1px solid var(--ui-border,#e2e2e2); border-radius:12px; box-shadow:0 8px 30px var(--ui-shadow,rgba(0,0,0,.22));
+    overflow:hidden; font:13px/1.4 system-ui,sans-serif; }
+  :host([hidden]) { display:none; }
+  /* Header, subtitle, meta and admin are fixed; only .kv (the attribute list)
+     takes the remaining height and scrolls. Consistent 14px horizontal gutter. */
+  .head, #name, #adminWrap { flex:none; }
+  /* Top-align so the grip and cycle/close buttons sit level with the class name (the
+     always-present top line); the source cell stacks beneath it without nudging them. */
+  .head { display:flex; align-items:flex-start; gap:10px; padding:12px 16px; border-bottom:1px solid var(--ui-border-2,#ededed);
+    cursor:grab; touch-action:none; user-select:none; }
+  .head.drag { cursor:grabbing; }
+  .grip { flex:none; color:var(--ui-text-faint,#9aa0a8); font-size:14px; line-height:1; letter-spacing:-1px; }
+  /* Left header group: class name with the source cell STACKED beneath it, both
+     left-aligned to the group's edge — so the cell sits at a fixed left x regardless
+     of the class-name length (it doesn't trail/shift as you cycle). .htitle takes the
+     slack (flex:1) so the cycle buttons stay anchored right; the title ellipsises
+     rather than wrap. */
+  .htitle { flex:1; min-width:0; display:flex; flex-direction:column; align-items:stretch; gap:3px; overflow:hidden; }
+  .title { min-width:0; font-weight:600; font-size:14px; line-height:1.25;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .acr { font-size:10.5px; font-weight:600; color:var(--ui-text-faint,#9aa0a8); letter-spacing:.05em; }
+  .title .acr { margin-left:8px; }
+  .x { flex:none; border:none; background:none; color:var(--ui-text-dim,#7a828b); cursor:pointer; font-size:17px; line-height:1;
+    padding:3px 5px; border-radius:7px; margin:-3px -5px -3px 0;
+    touch-action:manipulation; -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; }
+  .x:hover { background:var(--ui-hover,#f0f3f6); color:var(--ui-text,#2a2f35); }
+  /* The copy-feature button shares the close button's chrome, one step smaller;
+     zero the .x negative right margin so the head gap spaces the pair evenly. */
+  .copy { font-size:14px; margin-right:0; }
+  .name { padding:12px 16px 0; font-size:13.5px; color:var(--ui-accent,#1565c0); font-weight:600; line-height:1.3; }
+  .cell { flex:none; font-size:12px; color:var(--ui-text-dim,#7a828b); white-space:nowrap; }
+  /* Feature-cycle controls, pinned in the header (right of the title) so they hold
+     their place regardless of the subtitle/meta below. */
+  .cyc { flex:none; display:inline-flex; align-items:center; gap:6px; }
+  .nav { border:1px solid var(--ui-border-strong,#cfcfcf); background:var(--ui-surface,#fff); color:var(--ui-text,#2a2f35);
+    border-radius:7px; cursor:pointer; width:26px; height:24px; font-size:11px; padding:0; display:inline-flex; align-items:center; justify-content:center;
+    touch-action:manipulation; -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; }
+  .nav:hover { background:var(--ui-hover,#f0f3f6); }
+  .count { font-size:12px; color:var(--ui-text-dim,#7a828b); min-width:46px; text-align:center; font-variant-numeric:tabular-nums; }
+  /* Attribute list is a two-column table: the KEY is right-aligned (so the colons
+     line up on a shared gutter) and the VALUE left-aligned. The key column is a
+     subgrid track that auto-sizes to the widest key. Genuinely block content (aux
+     text / pictures) spans both columns and stacks its label over the content.
+     min-height:0 lets .kv scroll as a flex child. */
+  .kv { flex:1 1 auto; min-height:0; overflow:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch;
+    display:grid; grid-template-columns:1fr 3fr; align-content:start; column-gap:18px; padding:4px 16px; }
+  .row { grid-column:1 / -1; display:grid; grid-template-columns:subgrid; align-items:baseline; padding:10px 0; }
+  .row + .row { border-top:1px solid var(--ui-border-2,#ededed); }
+  /* Readability: the VALUE is the data — dark and a touch larger so it reads at a
+     glance; the KEY stays a lighter secondary label. Both columns left-aligned into a
+     clean table with a generous row rhythm + gutter, not a cramped list. */
+  .k { text-align:left; color:var(--ui-text-dim,#6b7580); font-size:12.5px; line-height:1.4; }
+  .row:not(.block) .k::after { content:":"; }
+  .k .acr { margin-left:7px; }
+  .v { text-align:left; min-width:0; color:var(--ui-text,#20252b); font-size:14.5px;
+    line-height:1.4; word-break:break-word; }
+  /* Block rows: one column spanning both tracks; label over content. */
+  .row.block { grid-template-columns:1fr; gap:5px; }
+  /* Header row of an S-101 complex attribute: bold label, no value, no trailing colon;
+     its sub-attributes follow indented. */
+  .row.group .k { font-weight:600; color:var(--ui-text,#20252b); }
+  .row.group .k::after { content:""; }
+  .empty { grid-column:1 / -1; color:var(--ui-text-faint,#9aa0a8); font-size:12.5px; padding:10px 0 14px; }
+  /* Aux content (TXTDSC text / PICREP picture) resolved from the companion zip. */
+  .aux-text { white-space:pre-wrap; font-size:12.5px; line-height:1.4; }
+  .aux-img { display:block; max-width:100%; height:auto; margin-top:2px; border-radius:6px; border:1px solid var(--ui-border-2,#ededed); }
+  .aux-pending { color:var(--ui-text-faint,#9aa0a8); }
+  .admin { margin:10px 16px 14px; align-self:flex-start; border:1px solid var(--ui-border-strong,#cfcfcf);
+    background:var(--ui-surface,#fff); color:var(--ui-text-dim,#7a828b); border-radius:8px; padding:6px 12px;
+    font:inherit; font-size:12px; cursor:pointer;
+    touch-action:manipulation; -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; }
+  .admin:hover { background:var(--ui-hover,#f0f3f6); color:var(--ui-text,#2a2f35); }
+`;
+
+export class PickReport extends HTMLElement {
+  constructor() {
+    super();
+    if (!this.shadowRoot) this.attachShadow({ mode: "open" }); // guard double-upgrade
+    this._cat = { classes: {}, attributes: {} };
+    this._feats = [];
+    this._idx = 0;
+    this._admin = false;
+    this._userPos = null; // {left,top} once the mariner drags it; cleared on close
+    this._aux = null;     // AuxStore for TXTDSC/PICREP external files (optional)
+    this._snapshot = null; // shell-supplied debug-snapshot builder (copy button)
+    this._renderSeq = 0;  // guards async aux fills against a newer render
+    // NB: a custom-element constructor must not set attributes (incl. `hidden`) —
+    // the spec forbids it ("result must not have attributes"). Hide in connectedCallback.
+  }
+
+  connectedCallback() {
+    this.hidden = true;
+    this.shadowRoot.innerHTML = `<style>${STYLE}</style>
+      <div class="head" part="head">
+        <span class="grip" aria-hidden="true">⠿</span>
+        <div class="htitle">
+          <div class="title" id="title"></div>
+          <span class="cell" id="cell" title="Source ENC cell"></span>
+        </div>
+        <div class="cyc" id="cyc"></div>
+        <button class="x copy" id="copy" title="Copy feature data (JSON)" type="button" hidden>⧉</button>
+        <button class="x" id="close" title="Close" type="button">✕</button>
+      </div>
+      <div id="name"></div>
+      <div class="kv" id="kv"></div>
+      <div id="adminWrap"></div>`;
+    const $ = (id) => this.shadowRoot.getElementById(id);
+    $("close").onclick = () => this.hide();
+    $("copy").onclick = (e) => this._copyFeature(e.currentTarget);
+    $("copy").hidden = !this._snapshot; // covers setSnapshot-before-connect ordering
+    this._initDrag(this.shadowRoot.querySelector(".head"));
+    // Delegate clicks for the dynamic nav / admin controls.
+    this.shadowRoot.addEventListener("click", (e) => {
+      const b = e.target.closest("button");
+      if (!b) return;
+      if (b.id === "prev") this._step(-1);
+      else if (b.id === "next") this._step(1);
+      else if (b.id === "admin") { this._admin = !this._admin; this._render(); }
+    });
+    // Keyboard (captured so it pre-empts other shortcuts): Escape closes; ←/→ step
+    // through the picked stack, mirroring the header ◀ ▶ (and stealing the arrows from
+    // the map's pan only while a multi-feature pick is open). Ignored inside a text field.
+    this._onKey = (e) => {
+      if (this.hidden) return;
+      if (e.key === "Escape") { e.stopPropagation(); this.hide(); return; }
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      if (this._feats.length < 2) return;
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this._step(e.key === "ArrowLeft" ? -1 : 1);
+    };
+    window.addEventListener("keydown", this._onKey, true);
+  }
+
+  disconnectedCallback() {
+    if (this._onKey) window.removeEventListener("keydown", this._onKey, true);
+  }
+
+  setCatalogue(cat) { if (cat) this._cat = cat; }
+  // Mariner display-unit preferences (depthUnit/heightUnit/distanceUnit/…), so
+  // height/depth/range/speed attributes render in the chosen unit. See units.mjs.
+  setUnits(prefs) { this._units = prefs || null; }
+
+  // If `acr` is a unit-bearing attribute, return {to, fn} to convert its canonical
+  // numeric value into the mariner's chosen unit; else null (keep catalogue unit).
+  _unitConv(acr) {
+    const u = this._units;
+    if (!u) return null;
+    if (PICK_HEIGHT_ATTRS.has(acr)) return { to: u.heightUnit || "m", fn: convertHeight };
+    if (PICK_DEPTH_ATTRS.has(acr)) return { to: u.depthUnit || "ft", fn: (v, unit) => (unit === "ft" ? v * M_TO_FT : v) };
+    if (PICK_DIST_ATTRS.has(acr)) return { to: u.distanceUnit || "NM", fn: convertDistance };
+    if (PICK_SPEED_ATTRS.has(acr)) return { to: u.speedUnit || "kn", fn: convertSpeed };
+    return null;
+  }
+
+  // Provide the AuxStore so TXTDSC/PICREP filenames resolve to inline text/picture.
+  // Optional: without it (or for a feature whose file isn't in the set) the report
+  // falls back to showing the raw filename.
+  setAux(aux) { this._aux = aux || null; if (!this.hidden) this._render(); }
+
+  // The shell's debug-snapshot builder for the copy-feature button: fn(feature) →
+  // the machine-readable object to copy (featureDebugSnapshot in
+  // debug-snapshot.mjs — { when, view, feature, gates }). This element has no map
+  // handle of its own, so the view/gates context is injected like the catalogue.
+  // The copy button only shows once a builder is supplied.
+  setSnapshot(fn) {
+    this._snapshot = typeof fn === "function" ? fn : null;
+    const b = this.shadowRoot && this.shadowRoot.getElementById("copy");
+    if (b) b.hidden = !this._snapshot;
+  }
+
+  // Copy the SELECTED feature's debug snapshot — the same self-diagnosing JSON the
+  // dev-tools Inspect copy produces, scoped to this one feature — with a ✓/✗ flash
+  // on the button for feedback.
+  async _copyFeature(btn) {
+    const f = this._feats[Math.min(this._idx, this._feats.length - 1)];
+    let ok = false;
+    try {
+      const snap = f && this._snapshot ? this._snapshot(f) : null;
+      if (snap) ok = await copyText(JSON.stringify(snap, null, 2));
+    } catch (e) { ok = false; }
+    flashBtn(btn, ok ? "✓" : "✗");
+  }
+
+  // Show the report for a feature stack; `anchor` is the picked point {x,y} in
+  // viewport pixels, used for out-of-the-way auto-placement.
+  show(feats, anchor) {
+    this._feats = feats || [];
+    this._idx = 0;
+    this._admin = false;
+    this._userPos = null;
+    if (!this._feats.length) { this.hide(); return; }
+    this.hidden = false;
+    this._render();
+    this._place(anchor);
+    this._emitFeature();
+  }
+
+  hide() {
+    if (this.hidden) return;
+    this.hidden = true;
+    this._feats = [];
+    this._userPos = null;
+    this.dispatchEvent(new CustomEvent("pick-close"));
+  }
+
+  _step(d) {
+    const n = this._feats.length;
+    if (!n) return;
+    this._idx = (this._idx + d + n) % n;
+    this._render();
+    this._emitFeature();
+  }
+
+  _emitFeature() {
+    const f = this._feats[this._idx];
+    if (f) this.dispatchEvent(new CustomEvent("pick-feature", { detail: { feature: f } }));
+  }
+
+  _render() {
+    const cat = this._cat;
+    const seq = ++this._renderSeq;
+    const f = this._feats[Math.min(this._idx, this._feats.length - 1)];
+    if (!f) return;
+    const p = f.properties || {};
+    const cls = p.class || "";
+    const $ = (id) => this.shadowRoot.getElementById(id);
+
+    // Title = the class's full name; the acronym follows as a dim tag, but only
+    // when it adds something. With no catalogue the name falls back TO the acronym,
+    // so showing the tag too would read "LNDMRK LNDMRK" — suppress that duplicate.
+    const clsName = (cat.classes && cat.classes[cls]) || cls || "Feature";
+    const clsTag = cls && clsName !== cls ? `<span class="acr">${esc(cls)}</span>` : "";
+    $("title").innerHTML = `${esc(clsName)}${clsTag}`;
+
+    let attrs = {};
+    if (p.s57) { try { attrs = JSON.parse(p.s57); } catch { attrs = {}; } }
+    // Subtitle name: S-57 OBJNAM, or the S-101 `featureName` complex (its English name).
+    const featName = attrs.OBJNAM || pickName(attrs.featureName);
+    $("name").innerHTML = featName ? `<div class="name">${esc(featName)}</div>` : "";
+
+    const rows = [];
+    let adminTotal = 0, adminHidden = 0;
+    for (const acr of Object.keys(attrs).sort()) {
+      if (acr === "OBJNAM" || acr === "featureName") continue; // shown as the subtitle
+      const meta = cat.attributes && cat.attributes[acr];
+      const isAdmin = !!(meta && meta.admin);
+      if (isAdmin) adminTotal++;
+      const show = !isAdmin || this._admin || (acr === "SORDAT" && sordatException(cls, attrs));
+      if (!show) { adminHidden++; continue; }
+      // A value may be a string (simple attr) or, for an S-101 complex attribute, a
+      // nested object / array of instances — render those as an indented group.
+      rows.push(...this._attrRows(acr, attrs[acr], meta, 0));
+    }
+    $("kv").innerHTML = rows.length ? rows.join("") : `<div class="empty">No attributes encoded.</div>`;
+    this._fillAux(seq); // resolve any TXTDSC/PICREP rows from the aux zip
+
+    // Cycle controls live in the (always-present, fixed) header, so they don't jump
+    // vertically as you step across features whose subtitle/meta rows differ.
+    const n = this._feats.length;
+    const cyc = n > 1
+      ? `<button id="prev" class="nav" title="Previous" type="button">◀</button>`
+        + `<span class="count">${this._idx + 1} / ${n}</span>`
+        + `<button id="next" class="nav" title="Next" type="button">▶</button>`
+      : "";
+    $("cyc").innerHTML = cyc;
+    $("cyc").style.display = cyc ? "" : "none";
+    // Source cell rides in the header next to the class name — a fixed spot, so it
+    // doesn't jump as you cycle across features with different subtitles.
+    $("cell").textContent = p.cell ? `▦ ${p.cell}` : "";
+    $("cell").style.display = p.cell ? "" : "none";
+
+    $("adminWrap").innerHTML = adminTotal
+      ? `<button id="admin" class="admin" type="button">${this._admin ? "Hide" : "Show"} administrative${this._admin ? "" : ` (${adminHidden})`}</button>`
+      : "";
+  }
+
+  // Render one attribute — possibly a nested S-101 complex — to an array of row HTML
+  // strings. A simple value is a single leaf row; a complex attribute arrives as an
+  // array of instances (each a nested object of sub-attributes) and renders as an
+  // indented group (a bold header, then its sub-attributes one level deeper, and so
+  // on recursively). Repeated instances are numbered.
+  _attrRows(key, val, meta, depth) {
+    if (val == null || typeof val !== "object") return [this._row(key, val, meta, depth)];
+    const cat = this._cat;
+    const entries = (obj) =>
+      Object.keys(obj)
+        .map((k) => this._attrRows(k, obj[k], cat.attributes && cat.attributes[k], depth + 1))
+        .flat();
+    if (Array.isArray(val)) {
+      const rows = [];
+      val.forEach((inst, i) => {
+        rows.push(this._groupHeader(val.length > 1 ? `${key} ${i + 1}` : key, meta, depth));
+        rows.push(...(inst && typeof inst === "object" ? entries(inst) : [this._row("", inst, null, depth + 1)]));
+      });
+      return rows;
+    }
+    return [this._groupHeader(key, meta, depth), ...entries(val)];
+  }
+
+  // A complex attribute's header row: its name, no value; sub-rows follow indented.
+  _groupHeader(label, meta, depth) {
+    const rawName = (meta && meta.name) || label;
+    const k = `${esc(rawName)}${rawName !== label ? `<span class="acr">${esc(label)}</span>` : ""}`;
+    return `<div class="row group"><div class="k"${indentK(depth)}>${k}</div><div class="v"></div></div>`;
+  }
+
+  // One decoded attribute row: full name + acronym; value with enumerated names
+  // (rule 2), units (rule 4) and dates as DD-MMM-YYYY (rule 6). Numbers arrive
+  // unpadded from the tile (rule 3). Unknown attributes still show, by acronym (§10.8.6).
+  _row(acr, raw, meta, depth = 0) {
+    // Label = the attribute's full name; the acronym follows as a dim tag, but only
+    // when it isn't already the name (no catalogue → name falls back to the acronym,
+    // and "CATLMK CATLMK" is just noise). See the title's matching guard.
+    const rawName = (meta && meta.name) || acr;
+    const k = `${esc(rawName)}${rawName !== acr ? `<span class="acr">${esc(acr)}</span>` : ""}`;
+    // External-file attributes: render the filename now, tag the value cell so
+    // _fillAux can swap in the actual text/picture once the aux zip resolves it.
+    const isText = PICK_TEXT_ATTRS.has(acr), isPic = PICK_PIC_ATTRS.has(acr);
+    if (isText || isPic) {
+      const ref = String(raw).trim();
+      const tag = this._aux && this._aux.has(ref) ? ` data-aux="${esc(ref)}" data-auxkind="${isPic ? "image" : "text"}"` : "";
+      // Block row: the resolved text/picture wants its own full-width line under the label.
+      return `<div class="row block"><div class="k"${indentK(depth)}>${k}</div><div class="v"${tag}>${esc(ref)}</div></div>`;
+    }
+    let val;
+    if (PICK_DATE_ATTRS.has(acr)) {
+      val = String(raw).split(",").map((s) => fmtS57Date(s.trim())).join("; ");
+    } else if (meta && meta.values) {
+      val = String(raw).split(",").map((s) => { const id = s.trim(); return meta.values[id] || id; }).join("; ");
+    } else {
+      const conv = this._unitConv(acr);
+      if (conv) {
+        // Convert each (possibly comma-listed) numeric into the mariner's unit.
+        val = String(raw).split(",").map((s) => {
+          const n = parseFloat(s);
+          return isFinite(n) ? fmtUnitNum(conv.fn(n, conv.to), conv.to) : s.trim();
+        }).join("; ");
+      } else {
+        val = String(raw).trim();
+        if (meta && meta.unit) val += " " + meta.unit;
+      }
+    }
+    return `<div class="row"><div class="k"${indentK(depth)}>${k}</div><div class="v">${esc(val)}</div></div>`;
+  }
+
+  // Swap external-file filenames for their resolved content. Async (the aux zip
+  // inflates on demand); a `seq` guard drops the result if a newer render (a step
+  // or admin toggle) has since replaced the rows.
+  async _fillAux(seq) {
+    if (!this._aux) return;
+    const nodes = this.shadowRoot.querySelectorAll("[data-aux]");
+    for (const node of nodes) {
+      const ref = node.getAttribute("data-aux");
+      node.classList.add("aux-pending");
+      const res = await this._aux.resolve(ref).catch(() => null);
+      if (seq !== this._renderSeq) return; // a newer render owns the panel now
+      node.classList.remove("aux-pending");
+      if (!res) continue;
+      if (res.type === "image") {
+        node.innerHTML = `<img class="aux-img" src="${res.url}" alt="${esc(ref)}" loading="lazy">`;
+      } else {
+        node.innerHTML = `<div class="aux-text">${esc(res.text)}</div>`;
+      }
+    }
+  }
+
+  // --- placement & drag ----------------------------------------------------
+  // Host (the chart-plotter-app) is position:relative, so left/top are relative
+  // to it. Returns the host's content box for clamping.
+  _frame() {
+    const host = this.parentNode && this.parentNode.host;
+    const r = host ? host.getBoundingClientRect() : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+    return { left: r.left, top: r.top, w: r.width, h: r.height };
+  }
+
+  // Read the cascading safe-area + bottom-bar tokens (px) for clamping JS-placed
+  // cards away from the notch / rounded corners / home indicator / bottom tab bar.
+  // --botbar-h already includes env(safe-area-inset-bottom). Falls back to 0.
+  _insets() {
+    const px = (v) => { const n = parseFloat(v); return isFinite(n) ? n : 0; };
+    const cs = getComputedStyle(this);
+    return {
+      top: px(cs.getPropertyValue("--sa-top")),
+      right: px(cs.getPropertyValue("--sa-right")),
+      bottom: px(cs.getPropertyValue("--botbar-h")),
+      left: px(cs.getPropertyValue("--sa-left")),
+    };
+  }
+
+  // Place the panel right NEXT TO the picked point (a small gap to one side) so the
+  // report reads as attached to what was tapped — unless the mariner has dragged it
+  // (then keep that). Prefers the right of the point, flips left if it won't fit, and
+  // centres vertically on the point; _apply clamps it inside the viewport.
+  _place(anchor) {
+    const fr = this._frame();
+    const w = this.offsetWidth || 340, ht = this.offsetHeight || 240;
+    const M = 12, GAP = 16; // bottom reserve derives from --botbar-h (see _apply)
+    if (this._userPos) {
+      this._apply(this._userPos.left, this._userPos.top, fr, w, ht, M);
+      return;
+    }
+    // anchor is viewport-relative; convert to host-relative.
+    const ax = anchor ? anchor.x - fr.left : fr.w / 2;
+    const ay = anchor ? anchor.y - fr.top : fr.h / 2;
+    let left = ax + GAP; // to the right of the point…
+    if (left + w + M > fr.w) left = ax - GAP - w; // …unless it overflows → to the left
+    const top = ay - ht / 2; // vertically centred on the point
+    this._apply(left, top, fr, w, ht, M);
+  }
+
+  _apply(left, top, fr, w, ht, M) {
+    fr = fr || this._frame();
+    w = w || this.offsetWidth || 340;
+    ht = ht || this.offsetHeight || 240;
+    M = M || 12;
+    // Safe-area + real bottom-bar height keep the card off the notch / rounded
+    // corners / home indicator and out from behind the bottom tab bar.
+    const sa = this._insets();
+    const minLeft = M + sa.left, minTop = M + sa.top;
+    const maxLeft = Math.max(minLeft, fr.w - w - M - sa.right);
+    const maxTop = Math.max(minTop, fr.h - ht - M - sa.bottom);
+    this.style.left = Math.min(Math.max(minLeft, left), maxLeft) + "px";
+    this.style.top = Math.min(Math.max(minTop, top), maxTop) + "px";
+    this.style.right = "auto";
+  }
+
+  _initDrag(head) {
+    let sx = 0, sy = 0, sl = 0, st = 0, dragging = false;
+    head.addEventListener("pointerdown", (e) => {
+      if (e.target.closest("button")) return; // let the close button work
+      dragging = true;
+      head.classList.add("drag");
+      head.setPointerCapture(e.pointerId);
+      sx = e.clientX; sy = e.clientY;
+      const r = this.getBoundingClientRect(), fr = this._frame();
+      sl = r.left - fr.left; st = r.top - fr.top;
+      e.preventDefault();
+    });
+    head.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      this._apply(sl + (e.clientX - sx), st + (e.clientY - sy));
+    });
+    const end = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      head.classList.remove("drag");
+      try { head.releasePointerCapture(e.pointerId); } catch {}
+      this._userPos = { left: parseFloat(this.style.left) || 0, top: parseFloat(this.style.top) || 0 };
+    };
+    head.addEventListener("pointerup", end);
+    head.addEventListener("pointercancel", end);
+  }
+}
+
+customElements.define("pick-report", PickReport);

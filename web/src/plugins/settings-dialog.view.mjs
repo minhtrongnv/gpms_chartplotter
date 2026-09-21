@@ -1,0 +1,156 @@
+// settings-dialog.view.mjs — CHROME for <settings-dialog>: the CSS + pure markup
+// builders that turn a contribution's declarative items into the same control
+// look the app has always used (toggle switch, segmented single/multi, number +
+// unit, select). No `this`, no DOM, no state — (args) → HTML string.
+//
+// Item types (see SettingsRegistry):
+//   toggle    — a switch; value is boolean
+//   segmented — single-select segmented buttons; options [[value,label],…]
+//   multi     — independent boolean buttons in one segmented strip; options are
+//               [[key,label],…] (each its OWN boolean key) + optional locked[]
+//   number    — numeric input + optional unit; optional transform for display
+//   select    — a <select> dropdown; options [[value,label],…]
+// A control carries data-contrib (owning contribution id) + data-key so the host
+// can route a change back to contribution.set(key, value).
+
+import { esc } from "../lib/util.mjs";
+
+// Layout rules (see docs/docs/style-guide.md — "Layout stability" + "One scroll
+// container"): the shell has a FIXED height so the dialog never resizes as tabs
+// change, the PANE is the only scroll container (the drawer body must never also
+// scroll), and the drawer supplies the frame — no nested borders around the shell.
+export const STYLE = `
+  :host { display:block; }
+  .set-shell { display:flex; align-items:stretch; height:min(62dvh,620px); }
+  .set-rail { flex:0 0 136px; display:flex; flex-direction:column; gap:2px; padding:2px 12px 2px 0;
+    border-right:1px solid var(--ui-border-2); overflow-y:auto; overscroll-behavior:contain; }
+  .set-rail button { text-align:left; border:none; background:none; color:var(--ui-text-dim); font:inherit;
+    font-size:13px; font-weight:600; padding:8px 12px; border-radius:8px; cursor:pointer; transition:background .1s,color .1s; }
+  .set-rail button:hover { background:var(--ui-hover); color:var(--ui-text); }
+  .set-rail button.sel { background:var(--ui-accent); color:var(--ui-accent-text); }
+  /* No top padding: the first section header pins flush to the very top, so no row
+     can peek through the gap above a stuck sticky header. */
+  .set-pane { flex:1 1 0; min-width:0; overflow-y:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch;
+    padding:0 6px 20px 20px;
+    /* A short fade at the cut edge so a clipped row reads as "scroll for more". */
+    mask-image:linear-gradient(to bottom, #000 calc(100% - 14px), transparent);
+    -webkit-mask-image:linear-gradient(to bottom, #000 calc(100% - 14px), transparent); }
+  /* Section header: STICKS to the top of the scrolling pane until the next section's
+     header slides up and takes its place. Full-bleed and opaque in the DRAWER's
+     background so rows scroll cleanly underneath without a seam. */
+  .set-group { position:sticky; top:0; z-index:2; margin:0 -6px 0 -20px; padding:10px 6px 6px 20px;
+    font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase;
+    color:var(--ui-text-dim); background:var(--ui-bg); border-bottom:1px solid var(--ui-border-2); }
+  .set-host { /* a contribution's custom-render slot */ }
+  .set-host .dev-tools { border-top:1px solid var(--ui-border-2); margin-top:8px; }
+
+  /* The row stacks: a header line (label + control side-by-side) and, beneath it,
+     the description spanning the FULL row width so it doesn't wrap inside the narrow
+     label column when a control sits beside it. */
+  .set-row { display:flex; flex-direction:column; padding:12px 0; border-bottom:1px solid var(--ui-border-2); }
+  .set-row:last-child { border-bottom:none; }
+  .set-row .set-head { display:flex; align-items:center; gap:16px; }
+  .set-row .t { font-weight:600; font-size:13.5px; flex:1 1 auto; min-width:0; }
+  .set-row .d { font-size:12px; color:var(--ui-text-faint); margin-top:4px; line-height:1.5; max-width:56ch; }
+  .set-row .ctl { flex:none; margin-left:auto; display:flex; align-items:center; gap:6px; }
+  .set-row .ctl input[type=number] { width:64px; text-align:right; border:1px solid var(--ui-border-strong); border-radius:7px; padding:6px 8px; font:inherit; font-size:16px; background:var(--ui-surface); color:var(--ui-text); }
+  .set-row .ctl .unit { color:var(--ui-text-faint); font-size:12px; min-width:14px; }
+  .set-row .ctl select { border:1px solid var(--ui-border-strong); border-radius:7px; padding:6px 8px; font:inherit; font-size:16px; background:var(--ui-surface); color:var(--ui-text); }
+  .set-rail button, .seg button, .switch, .set-row .ctl input[type=number], .set-row .ctl select { touch-action:manipulation; -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; }
+
+  .switch { position:relative; width:38px; height:22px; display:inline-block; flex:none; }
+  .switch input { opacity:0; width:0; height:0; }
+  .switch .sl { position:absolute; inset:0; background:var(--ui-border-strong); border-radius:22px; cursor:pointer; transition:.15s; }
+  .switch .sl:before { content:""; position:absolute; width:16px; height:16px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.15s; box-shadow:0 1px 2px rgba(0,0,0,.3); }
+  .switch input:checked + .sl { background:var(--ui-accent); }
+  .switch input:checked + .sl:before { transform:translateX(16px); }
+
+  .seg { display:inline-flex; border:1px solid var(--ui-border-strong); border-radius:8px; overflow:hidden; }
+  .seg button { border:none; background:var(--ui-surface); padding:6px 12px; font:inherit; font-size:13px; cursor:pointer; border-left:1px solid var(--ui-border-2); color:var(--ui-text); }
+  .seg button:first-child { border-left:none; }
+  .seg button.sel { background:var(--ui-accent); color:var(--ui-accent-text); }
+  .seg button:disabled { cursor:default; }
+
+  .set-empty { padding:24px 2px; color:var(--ui-text-faint); font-size:13px; }
+  @media (max-width:560px) {
+    .set-row .set-head { flex-wrap:wrap; gap:8px 16px; }
+    /* Stack the shell: the rail becomes a horizontal scrolling tab strip above the
+       pane. Height stays FIXED (72dvh) so tab switches don't resize the dialog. */
+    .set-shell { flex-direction:column; height:min(72dvh,620px); }
+    .set-rail { flex:0 0 auto; flex-direction:row; gap:4px; overflow-x:auto; overflow-y:hidden; overscroll-behavior:contain; -webkit-overflow-scrolling:touch;
+      border-right:none; border-bottom:1px solid var(--ui-border-2); padding:0 0 8px; }
+    .set-rail button { flex:0 0 auto; white-space:nowrap; }
+    .set-pane { padding:0 2px 16px 2px; }
+    .set-group { margin:0 -2px; padding:10px 2px 6px; }
+  }
+  /* Touch: rail tabs, segmented buttons and the switch reach a 44px hit area. */
+  @media (pointer:coarse) {
+    .set-rail button { min-height:var(--tap-min,44px); }
+    .seg button { min-height:var(--tap-min,44px); }
+    /* Enlarge the switch hit area without distorting the 38x22 track: an invisible
+       overlay padded out to >=44px, sitting over the .sl which forwards the tap. */
+    .switch .sl:after { content:""; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+      min-width:var(--tap-min,44px); min-height:var(--tap-min,44px); width:100%; height:100%; }
+  }
+`;
+
+// "YYYYMMDD" → "YYYY-MM-DD" for the native date input (blank if unset/invalid).
+function ymdToInput(v) {
+  const s = String(v || "");
+  return /^\d{8}$/.test(s) ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : "";
+}
+
+// One control, dispatched by item.type. `value` is the item's current value (the
+// host read it from contribution.get). `on` reads a boolean key for `multi`.
+function control(item, value, on) {
+  const k = `data-contrib="${esc(item._cid)}" data-key="${esc(item.key)}"`;
+  switch (item.type) {
+    case "toggle":
+      return `<label class="switch"><input type="checkbox" ${k} data-type="toggle" ${value ? "checked" : ""}><span class="sl"></span></label>`;
+    case "segmented":
+      return `<div class="seg">${(item.options || []).map(([v, lbl]) =>
+        `<button ${k} data-type="segmented" data-val="${esc(v)}" class="${value === v ? "sel" : ""}">${esc(lbl)}</button>`).join("")}</div>`;
+    case "multi":
+      return `<div class="seg">${[
+        ...(item.locked || []).map(([lbl]) => `<button disabled class="sel" title="Always on">${esc(lbl)}</button>`),
+        ...(item.options || []).map(([key, lbl]) =>
+          `<button data-contrib="${esc(item._cid)}" data-key="${esc(key)}" data-type="multi" class="${on(key) ? "sel" : ""}">${esc(lbl)}</button>`),
+      ].join("")}</div>`;
+    case "number":
+      return `<input type="number" ${k} data-type="number" step="${esc(item.step || "any")}" value="${esc(value)}">${item.unit ? `<span class="unit">${esc(item.unit)}</span>` : ""}`;
+    case "date":
+      // Value is stored as compact "YYYYMMDD" (mariner.dateView); the native date
+      // input wants "YYYY-MM-DD". Blank = unset (use real today).
+      return `<input type="date" ${k} data-type="date" value="${esc(ymdToInput(value))}">`;
+    case "select":
+      return `<select ${k} data-type="select">${(item.options || []).map(([v, lbl]) =>
+        `<option value="${esc(v)}" ${value === v ? "selected" : ""}>${esc(lbl)}</option>`).join("")}</select>`;
+    default:
+      return "";
+  }
+}
+
+// A labelled settings row wrapping one control.
+export function settingRow(item, value, on) {
+  const desc = item.desc ? `<div class="d">${esc(item.desc)}</div>` : "";
+  return `<div class="set-row"><div class="set-head"><span class="t">${esc(item.label)}</span>
+    <div class="ctl">${control(item, value, on)}</div></div>${desc}</div>`;
+}
+
+// A group subheading (only when a group has a title).
+export function groupHead(title) { return title ? `<div class="set-group">${esc(title)}</div>` : ""; }
+
+// The left tab rail.
+export function tabRail(tabs, activeId) {
+  return `<div class="set-rail">${tabs.map((t) =>
+    `<button data-tab="${esc(t.id)}" class="${t.id === activeId ? "sel" : ""}">${esc(t.label)}</button>`).join("")}</div>`;
+}
+
+// The whole dialog shell: rail + the active pane's content.
+export function shell(railHtml, paneHtml) {
+  return `<div class="set-shell">${railHtml}<div class="set-pane">${paneHtml || `<div class="set-empty">Nothing to configure here.</div>`}</div></div>`;
+}
+
+// A host element for a contribution's custom render() — the host fills it after
+// mounting (e.g. the Advanced tab's dev tools). `id` lets the logic find it.
+export function customHost(id) { return `<div class="set-host" data-host="${esc(id)}"></div>`; }
