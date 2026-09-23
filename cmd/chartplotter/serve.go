@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -77,8 +78,36 @@ func (c serveCmd) Run() error {
 
 	// Loopback bind → enforce the Host-header DNS-rebind check on /api. Any
 	// other bind means the operator opted into network exposure.
-	allowRemote := !(c.Host == "127.0.0.1" || c.Host == "localhost" || c.Host == "::1")
+	allowRemote := !(c.Host == "127.0.0.1" ||
+		c.Host == "localhost" ||
+		c.Host == "::1")
+
+	accessToken := strings.TrimSpace(
+		os.Getenv("CHARTPLOTTER_ACCESS_TOKEN"),
+	)
+
+	if allowRemote && accessToken == "" {
+		return fmt.Errorf(
+			"CHARTPLOTTER_ACCESS_TOKEN is required when binding to a non-loopback host",
+		)
+	}
+
 	srv := server.New(c.Assets, cacheDir, dataDir, allowRemote, engineCommit)
+
+	var handler http.Handler = srv
+
+	if accessToken != "" {
+		handler = server.WithBearerAuth(
+			handler,
+			accessToken,
+		)
+
+		appLog.Println("Bearer authentication enabled")
+	} else {
+		appLog.Println(
+			"Bearer authentication disabled (loopback development mode)",
+		)
+	}
 
 	defer func() {
 		if err := srv.Close(); err != nil {
@@ -106,12 +135,14 @@ func (c serveCmd) Run() error {
 
 	httpServer := &http.Server{
 		Addr:              addr,
-		Handler:           srv,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 
-		BaseContext: func(net.Listener) context.Context {
+		BaseContext: func(
+			net.Listener,
+		) context.Context {
 			return appCtx
 		},
 	}
