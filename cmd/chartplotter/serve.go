@@ -138,7 +138,10 @@ func (c serveCmd) Run() error {
 		return nil
 
 	case <-signalCtx.Done():
+		srv.SetReady(false)
+
 		appLog.Println("Shutdown signal received")
+
 		appCancel()
 	}
 
