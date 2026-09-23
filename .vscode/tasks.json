@@ -1,0 +1,17 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Chartplotter Debug",
+            "type": "shell",
+            "command": "CGO_ENABLED=1 go build -gcflags='all=-N -l' -o bin/chartplotter-debug ./cmd/chartplotter",
+            "options": {
+                "cwd": "${workspaceFolder}/chartplotter"
+            },
+            "problemMatcher": [
+                "$go"
+            ],
+            "group": "build"
+        }
+    ]
+}
