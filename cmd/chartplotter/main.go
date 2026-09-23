@@ -8,11 +8,20 @@
 package main
 
 import (
-	"fmt"
+	"log"
+	"os"
 
 	"github.com/alecthomas/kong"
 
 	tile57 "github.com/beetlebugorg/tile57/bindings/go"
+)
+
+const appName = "GPMS Chartplotter"
+
+var appLog = log.New(
+	os.Stdout,
+	appName+": ",
+	0,
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
@@ -49,7 +58,7 @@ func (c emitAssetsCmd) Run() error {
 		return err
 	}
 	for _, f := range files {
-		fmt.Println("wrote", f)
+		appLog.Println("Wrote", f)
 	}
 	return nil
 }
@@ -57,8 +66,8 @@ func (c emitAssetsCmd) Run() error {
 type versionCmd struct{}
 
 func (versionCmd) Run() error {
-	fmt.Printf("chartplotter %s\n", version)
-	fmt.Printf("libtile57 %s (engine commit %s, S-101 catalogue embedded)\n", tile57.Version(), engineCommit)
+	appLog.Printf("%s\n", version)
+	appLog.Printf("Libtile57 %s (engine commit %s, S-101 catalogue embedded)\n", tile57.Version(), engineCommit)
 	return nil
 }
 

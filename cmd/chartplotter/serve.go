@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/beetlebugorg/chartplotter/internal/engine/server"
 )
@@ -33,6 +38,7 @@ func (c serveCmd) Run() error {
 	if err != nil {
 		return err
 	}
+	defer os.RemoveAll(assetDir)
 	if _, err := emitS101Assets(catalogDir, assetDir); err != nil {
 		return fmt.Errorf("emit S-101 assets: %w", err)
 	}
@@ -42,9 +48,14 @@ func (c serveCmd) Run() error {
 	// it lacks, and the embedded bundle backs the rest. Registered on the Server below.
 	s101AssetDir := assetDir
 	if catalogDir != "" {
-		fmt.Printf("portrayal: S-101 (catalogue=%s)\n", catalogDir)
+		appLog.Printf(
+			"portrayal: S-101 (catalogue=%s)",
+			catalogDir,
+		)
 	} else {
-		fmt.Println("portrayal: S-101 (libtile57 embedded catalogue)")
+		appLog.Println(
+			"portrayal: S-101 (libtile57 embedded catalogue)",
+		)
 	}
 
 	cacheDir := c.Cache
@@ -61,13 +72,20 @@ func (c serveCmd) Run() error {
 		if err != nil {
 			return fmt.Errorf("clear cache: %w", err)
 		}
-		fmt.Printf("cleared %d cached file(s) from %s\n", n, cacheDir)
+		appLog.Printf("Cleared %d cached file(s) from %s\n", n, cacheDir)
 	}
 
 	// Loopback bind → enforce the Host-header DNS-rebind check on /api. Any
 	// other bind means the operator opted into network exposure.
 	allowRemote := !(c.Host == "127.0.0.1" || c.Host == "localhost" || c.Host == "::1")
 	srv := server.New(c.Assets, cacheDir, dataDir, allowRemote, engineCommit)
+
+	defer func() {
+		if err := srv.Close(); err != nil {
+			appLog.Printf("Server cleanup failed: %v", err)
+		}
+	}()
+
 	srv.SetAssetFallback(s101AssetDir) // emitted S-101 assets, searched after --assets, before embedded
 	srv.Version = version
 	srv.ReportStaleCache() // loud warning if any served pack predates this binary
@@ -81,6 +99,74 @@ func (c serveCmd) Run() error {
 	if c.Assets != "" {
 		assetsDesc = c.Assets
 	}
-	fmt.Printf("chartplotter → http://%s/  (assets=%s, cache=%s, data=%s%s)\n", addr, assetsDesc, cacheDir, dataDir, remoteNote)
-	return http.ListenAndServe(addr, srv)
+	appLog.Printf("http://%s/  (assets=%s, cache=%s, data=%s%s)\n", addr, assetsDesc, cacheDir, dataDir, remoteNote)
+
+	appCtx, appCancel := context.WithCancel(context.Background())
+	defer appCancel()
+
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           srv,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+
+		BaseContext: func(net.Listener) context.Context {
+			return appCtx
+		},
+	}
+
+	signalCtx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- httpServer.ListenAndServe()
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("HTTP server: %w", err)
+		}
+
+		return nil
+
+	case <-signalCtx.Done():
+		appLog.Println("Shutdown signal received")
+		appCancel()
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(
+		context.Background(),
+		15*time.Second,
+	)
+	defer cancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		_ = httpServer.Close()
+
+		return fmt.Errorf(
+			"Graceful HTTP shutdown: %w",
+			err,
+		)
+	}
+
+	if err := <-errCh; err != nil &&
+		!errors.Is(err, http.ErrServerClosed) {
+
+		return fmt.Errorf(
+			"HTTP server after shutdown: %w",
+			err,
+		)
+	}
+
+	appLog.Println("HTTP server stopped cleanly")
+
+	return nil
 }
