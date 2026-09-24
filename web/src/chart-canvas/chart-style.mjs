@@ -413,6 +413,7 @@ export function buildChartLayers({
   bandsPresent = new Set(),                    // Set of band slugs that have data — gates the overscale pattern
   ignoreScamin,                                // DEBUG: drop the per-SCAMIN display gate (show everything in-band)
   sizeScale = 1,                               // per-screen feature-size multiplier; see _scaleSizes
+  pxPitch,                                     // calibrated CSS-pixel pitch (mm) used by physical SCAMIN cutoffs
 }) {
   active = scheme || "day";
   const layerBase = {}, variants = {}, layerVis = {};
@@ -502,13 +503,13 @@ export function buildChartLayers({
           // value). NOT quantized → SCAMIN is still honoured exactly.
           const floor = set.min || 0;
           const lowVals = [], hiVals = [];
-          for (const sc of scaminVals) (scaminDisplayZoom(sc, lat) <= floor + 1e-6 ? lowVals : hiVals).push(sc);
+          for (const sc of scaminVals) (scaminDisplayZoom(sc, lat, pxPitch) <= floor + 1e-6 ? lowVals : hiVals).push(sc);
           const noFilter = lowVals.length
             ? ["any", ["!", ["has", "scamin"]], ["in", ["get", "scamin"], ["literal", lowVals]]]
             : ["!", ["has", "scamin"]];
           mk("#no", and(noFilter), undefined);
           for (const sc of hiVals) {
-            mk("#sm" + sc, and(["==", ["get", "scamin"], sc]), scaminDisplayZoom(sc, lat));
+            mk("#sm" + sc, and(["==", ["get", "scamin"], sc]), scaminDisplayZoom(sc, lat, pxPitch));
           }
         } else {
           mk("", base, undefined);
@@ -573,13 +574,13 @@ export function buildChartLayers({
         // the layer count without quantizing (see the server path for the rationale).
         const floor = dmin || 0;
         const lowVals = [], hiVals = [];
-        for (const sc of scaminValues) (scaminDisplayZoom(sc, lat) <= floor + 1e-6 ? lowVals : hiVals).push(sc);
+        for (const sc of scaminValues) (scaminDisplayZoom(sc, lat, pxPitch) <= floor + 1e-6 ? lowVals : hiVals).push(sc);
         const noFilter = lowVals.length
           ? ["any", ["!", ["has", "scamin"]], ["in", ["get", "scamin"], ["literal", lowVals]]]
           : ["!", ["has", "scamin"]];
         mk("#no", and(noFilter), dmin || undefined);
         for (const sc of hiVals) {
-          mk("#sm" + sc, and(["==", ["get", "scamin"], sc]), scaminDisplayZoom(sc, lat));
+          mk("#sm" + sc, and(["==", ["get", "scamin"], sc]), scaminDisplayZoom(sc, lat, pxPitch));
         }
       } else {
         mk("", base, dmin || undefined);
