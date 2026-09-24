@@ -23,6 +23,18 @@ func TestResolveServeAccessPolicy(t *testing.T) {
 			wantMode: accessModeLocal,
 		},
 		{
+			name:            "legacy Cloudflare flags auto-select cloudflare",
+			trustedProxies:  "172.20.0.0/24",
+			trustCloudflare: true,
+			wantMode:        accessModeCloudflare,
+			wantTrustCF:     true,
+		},
+		{
+			name:           "trusted proxies alone do not auto-enable Cloudflare",
+			trustedProxies: "172.20.0.0/24",
+			wantErr:        true,
+		},
+		{
 			name:           "local rejects trusted proxies",
 			mode:           "local",
 			trustedProxies: "172.20.0.0/24",
