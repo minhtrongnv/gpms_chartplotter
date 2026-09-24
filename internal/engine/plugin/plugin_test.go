@@ -69,6 +69,158 @@ func TestInstallVerifiesHashesAndRejectsCore(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestInstallRejectsUnhashedArchivePayload(t *testing.T) {
+	dir := t.TempDir()
+	wasm := []byte("\x00asm verified")
+	sum := sha256.Sum256(wasm)
+
+	man := map[string]any{
+		"manifestVersion": 1,
+		"id":              "org.example.unhashed",
+		"name":            "Unhashed",
+		"version":         "1.0.0",
+		"apiVersion":      1,
+		"entry":           map[string]any{"wasm": "plugin.wasm"},
+		"files": map[string]string{
+			"plugin.wasm": "sha256:" + hex.EncodeToString(sum[:]),
+		},
+	}
+	manBytes, _ := json.Marshal(man)
+
+	archive := writeZip(
+		t,
+		dir,
+		"unhashed.zip",
+		map[string][]byte{
+			"plugin.json": manBytes,
+			"plugin.wasm": wasm,
+			"bin/extra":   []byte("unverified executable payload"),
+		},
+	)
+
+	_, err := Install(
+		archive,
+		filepath.Join(dir, "plugins"),
+		InstallOptions{},
+	)
+	require.ErrorContains(t, err, "not listed in manifest.files")
+}
+
+func TestInstallRejectsDuplicateArchivePath(t *testing.T) {
+	dir := t.TempDir()
+	good := []byte("\x00asm verified")
+	bad := []byte("\x00asm replacement")
+	sum := sha256.Sum256(good)
+
+	man := map[string]any{
+		"manifestVersion": 1,
+		"id":              "org.example.duplicate",
+		"name":            "Duplicate",
+		"version":         "1.0.0",
+		"apiVersion":      1,
+		"entry":           map[string]any{"wasm": "plugin.wasm"},
+		"files": map[string]string{
+			"plugin.wasm": "sha256:" + hex.EncodeToString(sum[:]),
+		},
+	}
+	manBytes, _ := json.Marshal(man)
+
+	archive := writeZipEntries(
+		t,
+		dir,
+		"duplicate.zip",
+		[]zipEntry{
+			{name: "plugin.json", body: manBytes},
+			{name: "plugin.wasm", body: good},
+			{name: "plugin.wasm", body: bad},
+		},
+	)
+
+	_, err := Install(
+		archive,
+		filepath.Join(dir, "plugins"),
+		InstallOptions{},
+	)
+	require.ErrorContains(t, err, "duplicate archive path")
+}
+
+func TestInstallRejectsUnsafeEntryPath(t *testing.T) {
+	dir := t.TempDir()
+	payload := []byte("x")
+	sum := sha256.Sum256(payload)
+
+	man := map[string]any{
+		"manifestVersion": 1,
+		"id":              "org.example.escape",
+		"name":            "Escape",
+		"version":         "1.0.0",
+		"apiVersion":      1,
+		"entry": map[string]any{
+			"native": map[string]string{
+				platformKey(): "../outside",
+			},
+		},
+		"files": map[string]string{
+			"payload.bin": "sha256:" + hex.EncodeToString(sum[:]),
+		},
+	}
+	manBytes, _ := json.Marshal(man)
+
+	archive := writeZip(
+		t,
+		dir,
+		"escape.zip",
+		map[string][]byte{
+			"plugin.json": manBytes,
+			"payload.bin": payload,
+		},
+	)
+
+	_, err := Install(
+		archive,
+		filepath.Join(dir, "plugins"),
+		InstallOptions{},
+	)
+	require.ErrorContains(t, err, "unsafe path")
+}
+
+func TestInstallAllowsReservedSignatureMetadata(t *testing.T) {
+	dir := t.TempDir()
+	wasm := []byte("\x00asm verified")
+	sum := sha256.Sum256(wasm)
+
+	man := map[string]any{
+		"manifestVersion": 1,
+		"id":              "org.example.signed",
+		"name":            "Signed",
+		"version":         "1.0.0",
+		"apiVersion":      1,
+		"entry":           map[string]any{"wasm": "plugin.wasm"},
+		"files": map[string]string{
+			"plugin.wasm": "sha256:" + hex.EncodeToString(sum[:]),
+		},
+	}
+	manBytes, _ := json.Marshal(man)
+
+	archive := writeZip(
+		t,
+		dir,
+		"signed.zip",
+		map[string][]byte{
+			"plugin.json": manBytes,
+			"plugin.wasm": wasm,
+			"plugin.sig":  []byte("future-signature-metadata"),
+		},
+	)
+
+	_, err := Install(
+		archive,
+		filepath.Join(dir, "plugins"),
+		InstallOptions{},
+	)
+	require.NoError(t, err)
+}
+
 func TestMatchHostAllow(t *testing.T) {
 	cases := []struct {
 		patterns  []string
@@ -113,6 +265,36 @@ func TestParseBytes(t *testing.T) {
 	require.Equal(t, int64(512<<10), parseBytes("512KB"))
 	require.Equal(t, int64(1024), parseBytes("1024"))
 	require.Equal(t, int64(2048), parseBytes("2048B"))
+}
+
+type zipEntry struct {
+	name string
+	body []byte
+}
+
+func writeZipEntries(
+	t *testing.T,
+	dir,
+	name string,
+	entries []zipEntry,
+) string {
+	t.Helper()
+
+	archivePath := filepath.Join(dir, name)
+	f, err := os.Create(archivePath)
+	require.NoError(t, err)
+	defer f.Close()
+
+	zw := zip.NewWriter(f)
+	for _, entry := range entries {
+		w, err := zw.Create(entry.name)
+		require.NoError(t, err)
+		_, err = w.Write(entry.body)
+		require.NoError(t, err)
+	}
+	require.NoError(t, zw.Close())
+
+	return archivePath
 }
 
 // writeZip builds a zip archive at dir/name from files and returns its path.
