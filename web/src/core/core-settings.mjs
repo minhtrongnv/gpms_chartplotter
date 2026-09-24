@@ -124,7 +124,7 @@ export function coreSettingsContributions(app) {
     items: [
       {
         key: "detailLevel", type: "segmented", label: "Display category",
-        desc: "Display Base is always shown — Standard adds normal chart content, Other adds every remaining feature",
+        desc: "Base → Standard → Other is cumulative. Spot soundings and text-group switches below remain independent, matching OpenCPN/S-52.",
         options: [["base", "Base"], ["standard", "Standard"], ["other", "Other"]],
       },
     ],
