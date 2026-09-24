@@ -116,6 +116,28 @@ func TestExtractZipCells(t *testing.T) {
 	}
 }
 
+func TestFetchURLProgressCancelsStalledBody(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			_, _ = w.Write([]byte("x"))
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	_, err := fetchURLProgressWithTimeout(
+		ts.URL,
+		ts.Client(),
+		50*time.Millisecond,
+		nil,
+	)
+	if !errors.Is(err, errChartDownloadStalled) {
+		t.Fatalf("stalled download error = %v, want %v", err, errChartDownloadStalled)
+	}
+}
+
 func TestImportValidation(t *testing.T) {
 	dir := t.TempDir()
 	ts := httptest.NewServer(New(dir, dir, dir, false, ""))
