@@ -36,9 +36,8 @@ export class HudController {
     // Physical CSS-pixel pitch (mm) for true on-screen 1:N scale, matching
     // OpenCPN's pixels-per-mm model. undefined -> browser/CSS reference default.
     this.getPxPitch = opts.getPxPitch || (() => undefined);
-    // HUD scale is a deterministic chart-scale coordinate shared with tile57.
-    // Screen calibration affects physical feature sizing only; it must not change
-    // the navigational 1:N readout, SCAMIN/overscale boundaries, or go-to-scale.
+    // One OpenCPN-style physical scale model: this pitch drives the HUD 1:N,
+    // go-to-scale, SCAMIN/overscale boundaries and physical portrayal sizing.
     this.coverScale = 0; // finest covering chart's CSCL — the overscale ×n reference
     this.detentZoom = null; // finest covering band's overscale cap — the wheel-zoom detent (not a hard maxZoom)
     // `move` fires several times per animation frame during a pan/zoom; coalesce
@@ -110,7 +109,7 @@ export class HudController {
     const box = this.root.getElementById("databox"); if (box) box.hidden = false;
     const z = this.map.getZoom(), c = this.map.getCenter();
     const band = bandForZoom(z);
-    // Deterministic chart scale: same zoom + latitude => same 1:N in every browser.
+    // True physical chart scale for this calibrated screen.
     const dispDenom = scaleDenomPhysical(z, c.lat, this.getPxPitch());
     // Build the span structure ONCE, then update text nodes in place. During a pan
     // the coordinate changes every frame, so a per-frame `innerHTML =` would re-PARSE
@@ -139,10 +138,8 @@ export class HudController {
     // amber band. "No charts enabled" outranks it (nothing is drawing at all).
     const warn = this.root.getElementById("db-warn");
     if (!warn) return;
-    // Overscale compares the deterministic chart-scale denominator against the
-    // cell's compilation scale (CSCL). This is the same fixed 0.2645 mm reference
-    // coordinate tile57 uses for SCAMIN, so every browser crosses the boundary at
-    // the same camera zoom/latitude.
+    // Overscale compares the same true physical denominator shown in the HUD
+    // against the cell compilation scale (CSCL), matching the SCAMIN coordinate.
     const f = this.coverScale && dispDenom < this.coverScale ? this.coverScale / dispDenom : 0;
     if (this.noChartsEnabled()) {
       warn.hidden = false;
@@ -192,7 +189,7 @@ export class HudController {
     this.coverScale = finestScale;
     const band = finest >= 0 ? BANDS[finest] : "general";
     // Detent right where overscale BEGINS for the covering chart: the zoom whose
-    // deterministic chart scale equals the chart's compilation scale, coverScale.
+    // physical chart scale equals the chart's compilation scale, coverScale.
     // Zoom past it and dispDenom < coverScale → "Overscale ×N" (same test as the
     // warning above). Falls back to the band's native-max zoom when no per-chart
     // scale is known (e.g. server sets without the NOAA catalogue).

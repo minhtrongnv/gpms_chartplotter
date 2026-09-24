@@ -71,14 +71,11 @@ const DEFAULT_MARINER = {
   safetyDepth: 10,
   deepContour: 30,
   depthUnit: "ft", // US/NOAA preference (engine default DepthUnitFeet)
-  // Display categories (S-52 §10.2). Base is the minimum safe-navigation set and
-  // can NEVER be deselected by the mariner — it is forced on at boot. We default
-  // to the full "Other" display (all charted detail) — friendlier for a
-  // recreational plotter than the ECDIS Standard default; the mariner can drop
-  // back to Standard/Base in Display settings (detailLevel).
+  // Display categories (S-52 §10.2). Match OpenCPN's normal working view:
+  // Base + Standard. "Other" remains an explicit extra-detail choice.
   displayBase: true,
   displayStandard: true,
-  displayOther: true,
+  displayOther: false,
   boundaryStyle: "symbolized", // IMO/S-52 default (vs "plain")
   simplifiedPoints: false,     // paper-chart point symbols (engine SimplifiedPoints=false)
   fourShadeWater: true,        // four depth shades (engine TwoShades=false)
@@ -86,9 +83,6 @@ const DEFAULT_MARINER = {
   showScaleBoundaries: false, // DATCVR §10.1.9.1 chart scale boundaries — off by default (opt-in)
   // Individually-selectable "Other" items (S-52/IMO), all default on.
   showSoundings: true,
-  // Recreational/demo density: keep more spot depths visible at coastal scales
-  // by ignoring SCAMIN for SOUNDG only. Other features remain normally gated.
-  denseSoundings: true,
   // Date-dependent display (S-52 §10.4.1.1, MANDATORY): show a dated feature only
   // when the viewing date is within its validity period. Default on (spec); set
   // false to show all dates regardless. dateView ("YYYYMMDD") pins a planning
@@ -109,7 +103,7 @@ const DEFAULT_MARINER = {
   showLightDescriptions: true, // group 23: light characteristics (e.g. Fl(2)R 10s)
   textImportant: true,         // group 11: bridge/cable/pipeline clearances, route/track bearings
   textNames: true,             // groups 21/26/29: buoy/beacon/geographic names, berth numbers
-  textOther: true,             // groups 0-10/22/24/25/27/28/30/32-49: notes, seabed, mag variation, heights
+  textOther: false,            // notes/seabed/mag-variation text is opt-in; avoids overview-scale clutter
   // Off by default.
   showFullSectorLines: false,        // 25mm legs (engine ShowFullLengthSectorLines=false, avoids clutter)
   showIsolatedDangersShallow: false, // ISODGR01 at DisplayBase (engine default); on → Standard category
@@ -269,6 +263,19 @@ export class ChartPlotter extends HTMLElement {
     // this._widget the same way, before any apply* runs.)
     const embed = this.hasAttribute("widget") || new URLSearchParams(location.search).has("widget");
     this._mariner = { ...DEFAULT_MARINER, ...(embed ? {} : loadJSON(LS_MARINER, {})) };
+    // One-time migration away from the short-lived dense/full-detail experiment.
+    // The presence of denseSoundings is the migration marker; OpenCPN-like normal
+    // presentation is STANDARD + the independent soundings switch.
+    if (Object.prototype.hasOwnProperty.call(this._mariner, "denseSoundings")) {
+      delete this._mariner.denseSoundings;
+      this._mariner.displayBase = true;
+      this._mariner.displayStandard = true;
+      this._mariner.displayOther = false;
+      this._mariner.textOther = false;
+      if (!embed) {
+        try { localStorage.setItem(LS_MARINER, JSON.stringify(this._mariner)); } catch (_) {}
+      }
+    }
     // Migrate the old single-value display category (base|standard|other) to
     // the multi-select Base/Standard/Other booleans (now client-side filters).
     if (this._mariner.displayCategory) {
@@ -2040,8 +2047,18 @@ export class ChartPlotter extends HTMLElement {
     if (Array.isArray(s.hiddenCells)) this._hiddenCells = new Set(s.hiddenCells);
     // pxPitch is intentionally NOT loaded from server settings: it belongs to the
     // current monitor/browser only. Older settings blobs may still contain it.
-    // Merge mariner over the (migrated) defaults; Display Base is always forced on.
-    if (s.mariner && typeof s.mariner === "object") this._mariner = { ...this._mariner, ...s.mariner, displayBase: true };
+    // Merge mariner over the defaults. Retire the dense/full-detail experiment
+    // when an older shared settings blob still contains its marker.
+    if (s.mariner && typeof s.mariner === "object") {
+      const hadDense = Object.prototype.hasOwnProperty.call(s.mariner, "denseSoundings");
+      this._mariner = { ...this._mariner, ...s.mariner, displayBase: true };
+      delete this._mariner.denseSoundings;
+      if (hadDense) {
+        this._mariner.displayStandard = true;
+        this._mariner.displayOther = false;
+        this._mariner.textOther = false;
+      }
+    }
   }
 
   // Persist the display settings server-side (shared across screens). Debounced so

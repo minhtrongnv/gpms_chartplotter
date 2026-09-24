@@ -132,10 +132,9 @@ function textLayers(mariner, palette) {
   }];
 }
 // Multiply every PIXEL-VALUED size property by `k` so S-52 features render at
-// their true physical size on THIS screen. The baker emits sizes (icon `scale`,
-// `width_px`, `font_size_px`) as if 1 CSS px = 1 typographic point (0.35278 mm /
-// 72 DPI); but a CSS px is 1/96 in (0.2645 mm) — and the actual screen may differ
-// again. The element computes the baked-reference-pitch / local pxPitch ratio and passes it in, scaling
+// their true physical size on THIS screen. The baker emits sizes against the
+// S-52/CSS reference pitch (0.26458 mm/reference-px). The element computes
+// referencePitch / localPxPitch and passes it in, scaling
 // icons/lines/text/halos together (line-dasharray is in line-width units, so it
 // scales for free). Only sizes are touched — colours/filters/placement are unchanged.
 function _scaleSizes(layers, k) {

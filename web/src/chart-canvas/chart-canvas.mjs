@@ -771,9 +771,9 @@ export class ChartCanvas extends HTMLElement {
     for (const k in osmPaint) setIf("osm", k, osmPaint[k]);
   }
 
-  // Feature-size multiplier that renders baked (point-pixel) sizes at true physical
-  // size on this screen: 0.35278 mm/baked-px ÷ the (calibrated) CSS-pixel pitch. On
-  // the default CSS pixel (0.2645 mm) ≈1.333×; calibration makes it exact.
+  // Feature-size multiplier that renders baked reference-pixel sizes at true
+  // physical size on this screen: 0.26458 mm/reference-px divided by the
+  // calibrated CSS-pixel pitch. A 0.26458 mm CSS pixel is exactly 1×.
   _featureSizeScale() {
     return BAKED_FEATURE_PITCH_MM / clampPxPitch(this._pxPitch || DEFAULT_PX_PITCH_MM);
   }
@@ -1140,9 +1140,17 @@ export class ChartCanvas extends HTMLElement {
     if ("showNoData" in settings && this._map) {
       this._eachLayer("nodata", (id) => this._setVis(id, this._mariner.showNoData === false ? "none" : "visible"));
     }
-    // tile57 engine mode: the display state lives in the engine-generated style, so a
-    // toggle is an engine-computed diff applied in place (no JS in-place updaters).
-    if (this._engineMode) { this._engineRestyle(); return; }
+    // tile57 engine mode: most mariner changes ride an engine-computed diff.
+    // Display-category changes affect the common predicate on almost every chart
+    // layer. Rebuild those filters from a fresh engine style so Base / Standard /
+    // Other cannot retain a stale category predicate; this is infrequent user input.
+    if (this._engineMode) {
+      const categoryChange = ["displayBase", "displayStandard", "displayOther"]
+        .some((k) => Object.prototype.hasOwnProperty.call(settings, k));
+      if (categoryChange) void this._engineRebuild();
+      else this._engineRestyle();
+      return;
+    }
     const keys = Object.keys(settings);
     const map = this._map;
     if (!map) return;
@@ -1469,7 +1477,7 @@ export class ChartCanvas extends HTMLElement {
     boolK("fourShadeWater");
     if (m.depthUnit) p.set("depthUnit", m.depthUnit);
     boolK("displayBase"); boolK("displayStandard"); boolK("displayOther");
-    boolK("showSoundings"); boolK("denseSoundings");
+    boolK("showSoundings");
     boolK("dataQuality"); boolK("showInformCallouts"); boolK("showMetaBounds"); boolK("showIsolatedDangersShallow");
     boolK("showOverscale");
     if (m.boundaryStyle) p.set("boundaryStyle", m.boundaryStyle);
@@ -1647,7 +1655,6 @@ export class ChartCanvas extends HTMLElement {
     bool("displayStandard", "display_standard");
     bool("displayOther", "display_other");
     bool("showSoundings", "show_soundings");
-    bool("denseSoundings", "dense_soundings");
     bool("dataQuality", "data_quality");
     bool("showInformCallouts", "show_inform_callouts");
     bool("showMetaBounds", "show_meta_bounds");

@@ -30,13 +30,6 @@ func TestMarinerFromQuerySoundingsOverride(t *testing.T) {
 		t.Fatalf("soundings=%v, want SoundingsHide", off.Soundings)
 	}
 
-	dense := marinerFromQuery(url.Values{
-		"denseSoundings": {"1"},
-	})
-	if !dense.DenseSoundings {
-		t.Fatal("denseSoundings=1 was not forwarded to tile57")
-	}
-
 	follow := marinerFromQuery(url.Values{})
 	defaults := tile57.MarinerDefaults()
 	if follow.Soundings != defaults.Soundings {
@@ -46,11 +39,42 @@ func TestMarinerFromQuerySoundingsOverride(t *testing.T) {
 			defaults.Soundings,
 		)
 	}
-	if follow.DenseSoundings != defaults.DenseSoundings {
-		t.Fatalf(
-			"omitted denseSoundings=%v, want engine default %v",
-			follow.DenseSoundings,
-			defaults.DenseSoundings,
-		)
+}
+
+
+func TestMarinerFromQueryDisplayCategory(t *testing.T) {
+	base := marinerFromQuery(url.Values{
+		"displayBase":     {"1"},
+		"displayStandard": {"0"},
+		"displayOther":    {"0"},
+	})
+	if !base.DisplayBase || base.DisplayStandard || base.DisplayOther {
+		t.Fatalf("base category = base:%v standard:%v other:%v", base.DisplayBase, base.DisplayStandard, base.DisplayOther)
+	}
+
+	standard := marinerFromQuery(url.Values{
+		"displayBase":     {"1"},
+		"displayStandard": {"1"},
+		"displayOther":    {"0"},
+	})
+	if !standard.DisplayBase || !standard.DisplayStandard || standard.DisplayOther {
+		t.Fatalf("standard category = base:%v standard:%v other:%v", standard.DisplayBase, standard.DisplayStandard, standard.DisplayOther)
+	}
+
+	other := marinerFromQuery(url.Values{
+		"displayBase":     {"1"},
+		"displayStandard": {"1"},
+		"displayOther":    {"1"},
+	})
+	if !other.DisplayBase || !other.DisplayStandard || !other.DisplayOther {
+		t.Fatalf("other category = base:%v standard:%v other:%v", other.DisplayBase, other.DisplayStandard, other.DisplayOther)
+	}
+}
+
+
+func TestMarinerFromQueryPhysicalSizeScale(t *testing.T) {
+	m := marinerFromQuery(url.Values{"sizeScale": {"0.977"}})
+	if m.SizeScale < 0.9769 || m.SizeScale > 0.9771 {
+		t.Fatalf("sizeScale=%v, want 0.977", m.SizeScale)
 	}
 }
