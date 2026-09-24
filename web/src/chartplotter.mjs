@@ -610,10 +610,15 @@ export class ChartPlotter extends HTMLElement {
     // the cap to reach a pack's detail — without re-enforcing here that raised cap
     // sticks and you can magnify past the floor (the 1:900 over-zoom).
     map.on("moveend", () => this._applyScaleFloor());
-    await this.restoreArchive();
-    // Local serve: render every baked pack the server holds (survives reload). The widget viewer
-    // already loaded its prebaked archives in restoreArchive() above.
-    if (!this._widget) {
+    // Hosted/widget mode restores prebaked PMTiles. Local GPMS serve is a different
+    // source mode: its single source of truth is /api/packs -> /tiles/{set}. Do NOT
+    // run the legacy region-archive restore first — it probes removed endpoints
+    // (/api/charts, charts/charts-user.json) and calls loadRegions(), which resets
+    // chart sources/styles immediately before setServerSets(). On reload that extra
+    // rebuild races image/style registration and can leave a partially rendered map.
+    if (this._widget) {
+      await this.restoreArchive();
+    } else {
       try { await this._renderInstalledSets(); } catch (e) { console.warn("[charts] initial render", e); }
     }
     this._applyBandsOff(); // re-apply any persisted band on/off now that chart layers exist
