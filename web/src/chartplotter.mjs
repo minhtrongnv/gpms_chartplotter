@@ -536,7 +536,7 @@ export class ChartPlotter extends HTMLElement {
     // Cap the fly target at the destination's scale floor (not a raw z18) so we
     // never overshoot it and snap back when moveend re-applies the floor.
     const destLat = cam ? cam.center.lat : (s + n) / 2;
-    const zoom = Math.min(maxZoomForScaleFloor(destLat), Math.max(cam ? cam.zoom : Math.max(need, 9), need));
+    const zoom = Math.min(maxZoomForScaleFloor(destLat, this._pxPitch), Math.max(cam ? cam.zoom : Math.max(need, 9), need));
     // Raise the dynamic zoom cap to the target FIRST — we're flying from open water
     // (low cap, set at the prior latitude) into the pack's coverage, so without this
     // the fly clamps short and a berthing-only set wouldn't reach the zoom where it
@@ -662,6 +662,7 @@ export class ChartPlotter extends HTMLElement {
       cellMeta: (name) => this._byName.get(name),
       serverSetMetas: () => (this._plotter && this._plotter.serverSetMetas) ? this._plotter.serverSetMetas() : [],
       noChartsEnabled: () => this._noChartsEnabled(),
+      getPxPitch: () => this._pxPitch,
     });
 
     // Scroll-wheel zoom: owns the wheel (native scrollZoom off) to give the band
@@ -669,8 +670,10 @@ export class ChartPlotter extends HTMLElement {
     // the detent from the HUD; own-ship registers a follow anchor below.
     this._wheelZoom = new WheelZoom({
       map,
-      getDetent: () => this._hud.getDetentZoom(),
-      getFloor: () => maxZoomForScaleFloor(map.getCenter().lat), // live 1:MIN_DETAIL_SCALE floor (matches _applyScaleFloor)
+      // OpenCPN-style continuous zoom: do not park at the native chart scale.
+      // Overscale is still shown by the HUD, but the user may zoom through it.
+      getDetent: () => null,
+      getFloor: () => maxZoomForScaleFloor(map.getCenter().lat, this._pxPitch),
       getAnchor: () => this._zoomAnchor(), // plugins contribute where zoom should anchor (vessel while following, else cursor)
     });
 
@@ -1587,7 +1590,7 @@ export class ChartPlotter extends HTMLElement {
     if (!this._map) return;
     // FLOOR_GIVE headroom above the floor so WheelZoom can let a hard-in scroll
     // over-pull a hair past it and settle back (a stop with give, not a wall).
-    let mz = maxZoomForScaleFloor(this._map.getCenter().lat) + FLOOR_GIVE;
+    let mz = maxZoomForScaleFloor(this._map.getCenter().lat, this._pxPitch) + FLOOR_GIVE;
     const c = this._map.getCenter();
     const band = this._finestBandAt(c.lng, c.lat);
     if (band) {
@@ -2002,15 +2005,21 @@ export class ChartPlotter extends HTMLElement {
     };
   }
 
-  // Set (or clear) this SCREEN's calibrated CSS-pixel pitch (mm). Calibration is
-  // deliberately local-only: it changes the physical size of symbols/lines/text on
-  // this monitor, but never the deterministic chart 1:N coordinate used by HUD,
-  // SCAMIN, overscale or go-to-scale.
+  // Set (or clear) THIS screen's physical CSS-pixel pitch (mm). Like OpenCPN's
+  // Physical Screen Width, this drives both true on-screen 1:N scale and physical
+  // S-52 object sizes. It is deliberately local-only because different monitors
+  // can have different pixels/mm.
   setPxPitch(mm) {
     this._pxPitch = (typeof mm === "number" && mm > 0) ? mm : undefined;
     try { localStorage.setItem(LS_PX_PITCH, JSON.stringify(this._pxPitch ?? null)); } catch (e) { /* quota/private */ }
-    // Re-render features at true physical size for the new pitch (icons/lines/text).
-    if (this._plotter && this._plotter.setPxPitch) { try { this._plotter.setPxPitch(this._pxPitch); } catch (e) { console.warn(e); } }
+    if (this._plotter && this._plotter.setPxPitch) {
+      try { this._plotter.setPxPitch(this._pxPitch); } catch (e) { console.warn(e); }
+    }
+    if (this._hud) {
+      this._hud.updateHud();
+      this._hud.updateZoomCap();
+    }
+    void this._applyScaleFloor();
   }
 
   // Fetch the server-persisted display settings at boot and adopt them over the

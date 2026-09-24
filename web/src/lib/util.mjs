@@ -84,8 +84,8 @@ export const MIN_DETAIL_SCALE = 4000;
 // over-pull a hair past the floor and settle back — a stop with a little give,
 // not a wall that bounces. See WheelZoom.
 export const FLOOR_GIVE = 0.15;
-export function maxZoomForScaleFloor(lat) {
-  return Math.max(1, Math.min(18, zoomForChartScale(MIN_DETAIL_SCALE, lat)));
+export function maxZoomForScaleFloor(lat, pxPitchMm = DEFAULT_PX_PITCH_MM) {
+  return Math.max(1, Math.min(18, zoomForScalePhysical(MIN_DETAIL_SCALE, lat, pxPitchMm)));
 }
 
 // NOAA ENC freshness from an issue date "YYYY-MM-DD". ENCs have no hard expiry —
