@@ -16,6 +16,40 @@ export class SpriteBuilder {
     this.atlasPpu = atlasPpu;
   }
 
+  // tile57 has two sprite metadata shapes:
+  //
+  //   legacy/custom atlas:
+  //     { x, y, w, h, pivot_x, pivot_y }
+  //
+  //   current MapLibre atlas (tile57_bake_sprite_mln):
+  //     { x, y, width, height, pixelRatio }
+  //
+  // The current MapLibre atlas is already pivot-centred by tile57, so its
+  // logical pivot is exactly the middle of the cell. Normalise both shapes here
+  // so the rest of SpriteBuilder stays allocation-light and branch-free.
+  _cell(name) {
+    const c = this.sprite && this.sprite[name];
+    if (!c) return null;
+
+    const w = Number.isFinite(c.w) ? c.w : c.width;
+    const h = Number.isFinite(c.h) ? c.h : c.height;
+    if (!Number.isFinite(c.x) || !Number.isFinite(c.y) ||
+        !Number.isFinite(w) || !Number.isFinite(h) ||
+        w <= 0 || h <= 0) {
+      return null;
+    }
+
+    return {
+      x: c.x,
+      y: c.y,
+      w,
+      h,
+      pivot_x: Number.isFinite(c.pivot_x) ? c.pivot_x : w / 2,
+      pivot_y: Number.isFinite(c.pivot_y) ? c.pivot_y : h / 2,
+      pixelRatio: Number.isFinite(c.pixelRatio) && c.pixelRatio > 0 ? c.pixelRatio : 1,
+    };
+  }
+
   // Build the ImageData for an image id (the dispatch lifted from registerImage):
   // a synthesized sounding (`snd:…`), a composited glyph list (comma-joined), or
   // a single centred point symbol. Returns ImageData or null.
@@ -32,7 +66,7 @@ export class SpriteBuilder {
   // cell is the glyph cropped to its content, so drawing it into a w×h canvas and
   // letting MapLibre centre that canvas puts the glyph centre on the point.
   centredGlyph(name) {
-    const c = this.sprite[name];
+    const c = this._cell(name);
     if (!c) return null;
     return this.rawCell(this.spriteImg, c);
   }
@@ -74,7 +108,7 @@ export class SpriteBuilder {
   }
 
   centredSymbol(name) {
-    const c = this.sprite[name];
+    const c = this._cell(name);
     if (!c) return null;
     const halfW = Math.max(c.pivot_x, c.w - c.pivot_x);
     const halfH = Math.max(c.pivot_y, c.h - c.pivot_y);
@@ -91,7 +125,7 @@ export class SpriteBuilder {
     const cells = [];
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const name of namesStr.split(",")) {
-      const c = this.sprite[name];
+      const c = this._cell(name);
       if (!c) continue;
       const left = -c.pivot_x, top = -c.pivot_y;
       cells.push({ c, left, top });
