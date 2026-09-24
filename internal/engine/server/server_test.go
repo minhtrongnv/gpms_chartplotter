@@ -10,6 +10,72 @@ import (
 	"testing"
 )
 
+func TestGeneratedTile57AssetsOverrideStaleDevCopies(t *testing.T) {
+	assets := t.TempDir()
+	generated := t.TempDir()
+	cache := t.TempDir()
+
+	// Simulate an old tile57 dev bake left under --assets.
+	if err := os.WriteFile(
+		filepath.Join(assets, "sprite.png"),
+		[]byte("OLD-SPRITE"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(assets, "index.html"),
+		[]byte("DEV-INDEX"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// The server-startup asset baker produced the matching current-engine sprite.
+	if err := os.WriteFile(
+		filepath.Join(generated, "sprite.png"),
+		[]byte("CURRENT-SPRITE"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(assets, cache, cache, false, "")
+	s.SetAssetFallback(generated)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+	defer s.Close()
+
+	resp, err := http.Get(ts.URL + "/sprite.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if string(got) != "CURRENT-SPRITE" {
+		t.Fatalf(
+			"sprite asset = %q, want current generated tile57 asset",
+			got,
+		)
+	}
+
+	// Non-portrayal assets keep the normal --assets development override.
+	resp, err = http.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if string(got) != "DEV-INDEX" {
+		t.Fatalf(
+			"index asset = %q, want explicit --assets override",
+			got,
+		)
+	}
+}
+
 func TestServeStaticAndRange(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<html>hi</html>"), 0o644); err != nil {
