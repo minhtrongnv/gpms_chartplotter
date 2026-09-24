@@ -34,7 +34,7 @@ export class PluginHost {
     this._ais = new AISFeed(services.aisStreamURL, services.aisPollURL);
     this._loaded = new Map(); // id -> { controller, cleanups }
     this._installed = new Set(); // ids loaded dynamically from installed archives
-    this._es = null;
+    this._syncTimer = null;
   }
 
   // register loads a controller for a plugin: builds its ctx, instantiates the
@@ -52,25 +52,24 @@ export class PluginHost {
     }
   }
 
-  // start discovers installed, enabled plugins that ship a UI (manifest ui.entry),
-  // dynamically imports each one's entry module from its archive, and keeps the set
-  // in sync as plugins are enabled/disabled (via the /api/plugins SSE). Builtins are
-  // registered separately by the shell before this runs.
+  // Discover installed plugin UIs once, then refresh with a short-lived poll.
+  //
+  // Local GPMS is plain HTTP/1.1, where browsers have a small per-origin socket
+  // budget (commonly 6). Vessel + AIS already need long-lived SSE connections and
+  // an active chart import adds another. Keeping a third always-open SSE only for
+  // plugin lifecycle/status can starve ordinary fetch/tile/navigation requests,
+  // which then sit "Pending" in DevTools and make refresh look hung.
+  //
+  // Plugin enable/disable is not latency-critical, so a 5 s visible-page poll is
+  // cheaper operationally than permanently pinning another browser socket.
   start() {
     this._syncInstalled();
-    if (typeof EventSource !== "undefined") {
-      this._es = new EventSource(this._svc.assets + "api/plugins/stream");
-      this._es.onmessage = (ev) => {
-        let d;
-        try {
-          d = JSON.parse(ev.data);
-        } catch {
-          return;
-        }
-        this._syncInstalled(d.plugins);
-      };
-      this._es.onerror = () => {};
-    }
+    if (this._syncTimer) return;
+
+    this._syncTimer = setInterval(() => {
+      if (document.visibilityState === "hidden") return;
+      this._syncInstalled();
+    }, 5000);
   }
 
   async _syncInstalled(list) {
@@ -136,7 +135,8 @@ export class PluginHost {
   }
 
   destroy() {
-    if (this._es) this._es.close();
+    if (this._syncTimer) clearInterval(this._syncTimer);
+    this._syncTimer = null;
     for (const id of [...this._loaded.keys()]) this.unregister(id);
     this._ais.destroy();
     this._layers.destroy();
