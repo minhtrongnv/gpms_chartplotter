@@ -18,6 +18,20 @@ func emitS101Assets(catalogDir, dir string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Current tile57's MapLibre style expects the dedicated drawn-scale sprite
+	// atlas from tile57_bake_sprite_mln. BakeAssets().Sprite* is the historical
+	// generic 0.08 atlas; pairing that atlas with the current style inflates ENC
+	// symbols by about 0.08/0.028346 = 2.82x.
+	spriteJSON, spritePNG, err := tile57.BakeMapLibreSprite(
+		catalogDir,
+		1,
+		tile57.SchemeDay,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -27,8 +41,8 @@ func emitS101Assets(catalogDir, dir string) ([]string, error) {
 	}{
 		{"colortables.json", a.Colortables},
 		{"linestyles.json", a.Linestyles},
-		{"sprite.json", a.SpriteJSON},
-		{"sprite.png", a.SpritePNG},
+		{"sprite.json", spriteJSON},
+		{"sprite.png", spritePNG},
 		{"patterns.json", a.PatternJSON},
 		{"patterns.png", a.PatternPNG},
 	}
