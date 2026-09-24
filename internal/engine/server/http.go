@@ -417,8 +417,8 @@ func crossSiteWrite(r *http.Request) bool {
 var chartHTTPClient = func() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// District bundles are large, so do not use a short whole-request timeout.
-	// Bound only the connection/setup phases here; body progress has its own
-	// no-progress watchdog in fetchURLProgress.
+	// Bound only the connection/setup phases here; body progress is watched by
+	// the disk-backed import downloader and the small IENC catalogue fetch.
 	transport.ResponseHeaderTimeout = 60 * time.Second
 	// /api/proxy legitimately performs many Range reads, but an unbounded number
 	// of client requests must not turn into unbounded upstream sockets.
