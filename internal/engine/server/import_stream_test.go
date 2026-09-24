@@ -164,3 +164,42 @@ func TestNewCleansInterruptedImportScratch(t *testing.T) {
 		t.Fatalf("stale import scratch survived New: %v", err)
 	}
 }
+
+
+func TestStageLooseCellsDoesNotRetainUpdatesWhenDisabled(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir, dir, dir, false, "")
+	defer s.Close()
+
+	loose := s.looseCellsDir()
+	if err := os.MkdirAll(loose, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(loose, "US5MD1MC.000"), []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(loose, "US5MD1MC.001"), []byte("update"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stage, err := s.stageLooseCells(
+		context.Background(),
+		"user",
+		"US5MD1MC",
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(stage.dir)
+
+	if len(stage.stems) != 1 || stage.stems[0] != "US5MD1MC" {
+		t.Fatalf("stems=%v, want [US5MD1MC]", stage.stems)
+	}
+	if _, err := os.Stat(filepath.Join(stage.dir, "US5MD1MC.000")); err != nil {
+		t.Fatalf("base not staged: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stage.dir, "US5MD1MC.001")); !os.IsNotExist(err) {
+		t.Fatalf("updates=false staged an update: %v", err)
+	}
+}
