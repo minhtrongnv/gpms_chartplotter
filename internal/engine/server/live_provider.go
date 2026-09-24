@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -42,6 +43,20 @@ func (s *Server) liveGenPath(provider string) string {
 // content, or the engine build changes — the engine composes live tiles at SERVE time, so its
 // identity is part of a tile's content address: a serve-path fix must bust client caches even
 // when the baked archives are byte-identical.
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func (s *Server) liveGenToken(provider string) int64 {
 	paths := s.liveCellArchives(provider)
 	if len(paths) == 0 {
@@ -55,9 +70,8 @@ func (s *Server) liveGenToken(provider string) int64 {
 		stem := strings.TrimSuffix(filepath.Base(p), ".pmtiles")
 		sha, err := os.ReadFile(p + ".sha")
 		if err != nil { // no sidecar (shouldn't happen post-bake) — hash the archive itself
-			if b, e := os.ReadFile(p); e == nil {
-				sum := sha256.Sum256(b)
-				sha = []byte(hex.EncodeToString(sum[:]))
+			if sum, e := sha256File(p); e == nil {
+				sha = []byte(sum)
 			}
 		}
 		lines = append(lines, stem+":"+strings.TrimSpace(string(sha)))
@@ -101,9 +115,15 @@ func archivesUnder(root string) []string {
 // liveBakeWorkers is how many cells bake in parallel — a MEMORY bound (each concurrent bake holds a
 // whole cell's parse+portray+raster working set), so the CPU count capped modestly, overridable via
 // CHARTPLOTTER_BAKE_WORKERS.
+const maxLiveBakeWorkers = 32
+
 func liveBakeWorkers() int {
 	if v := os.Getenv("CHARTPLOTTER_BAKE_WORKERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			if n > maxLiveBakeWorkers {
+				log.Printf("CHARTPLOTTER_BAKE_WORKERS=%d exceeds safe cap; using %d", n, maxLiveBakeWorkers)
+				return maxLiveBakeWorkers
+			}
 			return n
 		}
 	}
