@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,6 +21,8 @@ import (
 // iencCatalogURL is the USACE Inland ENC products catalogue (U37 = the national
 // USACE set, grouped by river).
 const iencCatalogURL = "https://ienccloud.us/ienc/products/catalog/IENCU37ProductsCatalog.xml"
+
+const maxIENCCatalogBytes int64 = 16 << 20
 
 // iencXMLCell mirrors a <Cell> in the products catalogue XML (root element name is
 // ignored, so this parses any IENC*ProductCatalog).
@@ -66,7 +71,7 @@ func (s *Server) serveIENCCatalog(w http.ResponseWriter, r *http.Request) {
 	iencCat.mu.Lock()
 	defer iencCat.mu.Unlock()
 	if iencCat.json == nil || time.Since(iencCat.at) > iencTTL {
-		body, err := fetchURLProgress(iencCatalogURL, nil)
+		body, err := fetchIENCCatalog(r.Context())
 		if err != nil {
 			apiErr(w, http.StatusBadGateway, "ienc catalogue: "+err.Error())
 			return
@@ -101,4 +106,95 @@ func (s *Server) serveIENCCatalog(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", jsonCT)
 	w.Header().Set("Cache-Control", "max-age=3600")
 	_, _ = fmt.Fprintf(w, "%s", iencCat.json)
+}
+
+
+// fetchIENCCatalog fetches the small USACE products XML into memory. Bulk ENC
+// downloads were moved to disk-backed streaming, which retired the old
+// fetchURLProgress helper; the catalogue still needs a bounded in-memory fetch.
+//
+// Keep the same no-progress watchdog semantics as ENC downloads so a stalled
+// upstream cannot pin an /api/ienc/catalog request forever.
+func fetchIENCCatalog(ctx context.Context) ([]byte, error) {
+	return fetchIENCCatalogURL(
+		ctx,
+		iencCatalogURL,
+		chartHTTPClient,
+		chartDownloadNoProgressTimeout,
+	)
+}
+
+func fetchIENCCatalogURL(
+	ctx context.Context,
+	raw string,
+	client *http.Client,
+	noProgressTimeout time.Duration,
+) ([]byte, error) {
+	if noProgressTimeout <= 0 {
+		noProgressTimeout = chartDownloadNoProgressTimeout
+	}
+
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("http %d", resp.StatusCode)
+	}
+	if resp.ContentLength > maxIENCCatalogBytes {
+		return nil, fmt.Errorf(
+			"ienc catalogue exceeds %d bytes",
+			maxIENCCatalogBytes,
+		)
+	}
+
+	var out bytes.Buffer
+	if resp.ContentLength > 0 {
+		out.Grow(int(resp.ContentLength))
+	}
+	buf := make([]byte, 64<<10)
+
+	stallTimer := time.AfterFunc(noProgressTimeout, func() {
+		cancel(fmt.Errorf(
+			"%w: no bytes received for %s",
+			errChartDownloadStalled,
+			noProgressTimeout,
+		))
+	})
+	defer stallTimer.Stop()
+
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			stallTimer.Reset(noProgressTimeout)
+			if int64(out.Len()+n) > maxIENCCatalogBytes {
+				return nil, fmt.Errorf(
+					"ienc catalogue exceeds %d bytes",
+					maxIENCCatalogBytes,
+				)
+			}
+			_, _ = out.Write(buf[:n])
+		}
+
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			if cause := context.Cause(ctx); cause != nil {
+				return nil, cause
+			}
+			return nil, rerr
+		}
+	}
+
+	return out.Bytes(), nil
 }
