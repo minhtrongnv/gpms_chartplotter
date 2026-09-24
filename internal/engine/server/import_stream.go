@@ -748,6 +748,9 @@ func (s *Server) commitStagedExchangeSet(
 		}
 	}
 
+	if err := s.markProviderDirty(provider); err != nil {
+		return err
+	}
 	if s.cellIdx != nil {
 		s.cellIdx.forget(stage.stems)
 		s.cellIdx.rebuild()
