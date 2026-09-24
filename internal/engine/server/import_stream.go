@@ -98,9 +98,12 @@ func spoolReaderToTemp(
 	}
 	path = tmp.Name()
 	ok := false
+	closed := false
 	defer func() {
-		if closeErr := tmp.Close(); err == nil && closeErr != nil {
-			err = closeErr
+		if !closed {
+			if closeErr := tmp.Close(); err == nil && closeErr != nil {
+				err = closeErr
+			}
 		}
 		if !ok {
 			_ = os.Remove(path)
@@ -111,6 +114,10 @@ func spoolReaderToTemp(
 	if err != nil {
 		return "", written, err
 	}
+	if err := tmp.Close(); err != nil {
+		return "", written, err
+	}
+	closed = true
 	ok = true
 	return path, written, nil
 }
