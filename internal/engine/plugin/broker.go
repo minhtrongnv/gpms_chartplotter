@@ -59,8 +59,9 @@ type brokerSession struct {
 	dialer   net.Dialer
 	statusFn func(PluginStatus) // optional: the runner records the plugin's reported status
 
-	mu      sync.Mutex
-	grants  []Capability
+	mu        sync.Mutex
+	storageMu sync.Mutex
+	grants    []Capability
 	config  map[string]any
 	quota   int64
 	nextID  int64
