@@ -28,9 +28,11 @@ type stagedExchangeSet struct {
 	catalog []tile57.CatalogEntry
 }
 
-// cleanupImportScratch removes only chartplotter-owned transient import data
-// left by an interrupted previous process. Source ENC lives under ENC_ROOT and is
-// never touched.
+const importScratchMarker = ".chartplotter-owned"
+
+// cleanupImportScratch removes only transient directories carrying our ownership
+// marker. This avoids treating an unrelated plugin/application ".imports" folder
+// under the shared data root as disposable.
 func cleanupImportScratch(dataDir string) {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
@@ -40,13 +42,23 @@ func cleanupImportScratch(dataDir string) {
 		if !entry.IsDir() {
 			continue
 		}
-		_ = os.RemoveAll(filepath.Join(dataDir, entry.Name(), ".imports"))
+		scratch := filepath.Join(dataDir, entry.Name(), ".imports")
+		if _, err := os.Stat(filepath.Join(scratch, importScratchMarker)); err == nil {
+			_ = os.RemoveAll(scratch)
+		}
 	}
 }
 
 func (s *Server) importScratchDir(provider string) (string, error) {
 	root := filepath.Join(s.providerDataDir(provider), ".imports")
 	if err := os.MkdirAll(root, 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, importScratchMarker),
+		[]byte("chartplotter transient import scratch\n"),
+		0o600,
+	); err != nil {
 		return "", err
 	}
 	return root, nil
