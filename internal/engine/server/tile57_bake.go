@@ -19,7 +19,7 @@ import (
 // (recorded for the pack list + stamped with the bake/engine version), or "" for a LIVE
 // runtime-compositor provider (no disk archive — its bounds come from the TileSource Meta/TileJSON,
 // and it is surfaced in /api/packs straight from the registry).
-func (s *Server) registerProviderSet(jobID, set string, src tilesource.TileSource, packPath string, aux map[string][]byte, cat []tile57.CatalogEntry, created string) bool {
+func (s *Server) registerProviderSet(jobID, set string, src tilesource.TileSource, packPath string, aux map[string]string, cat []tile57.CatalogEntry, created string) bool {
 	outDir := s.setDir(set)
 	s.sets.register(set, src)
 	s.prefs.setDisabled(set, false)
@@ -57,7 +57,7 @@ func (s *Server) registerProviderSet(jobID, set string, src tilesource.TileSourc
 	// index.json, so feature attachments serve via /aux AND resolve offline as
 	// plain files (no zip to unpack, no server needed) — one aux dir per provider.
 	if len(aux) > 0 {
-		if _, e := auxfiles.WriteDir(filepath.Join(outDir, "aux"), aux); e != nil {
+		if _, e := auxfiles.WriteDirFromPaths(filepath.Join(outDir, "aux"), aux); e != nil {
 			log.Printf("import %s: aux %q: %v", jobID, set, e)
 		}
 		_ = os.Remove(filepath.Join(outDir, set+".aux.zip")) // drop a stale legacy zip from a pre-loose bake
@@ -126,7 +126,7 @@ func (s *Server) bakeProvider(jobID, provider string) bool {
 	s.imports.update(jobID, func(j *importJob) {
 		j.Phase, j.Note, j.Zoom, j.Unit, j.Done, j.Total, j.ETA = "meta", "Reading chart metadata", 0, "", 0, 0, 0
 	})
-	aux := s.providerAux(provider)
+	aux := s.providerAuxPaths(provider)
 	cat := s.providerCatalog(provider)
 	if !s.registerProviderSet(jobID, provider, liveSrc, "", aux, cat, created) {
 		return fail(fmt.Errorf("could not register set for %q", provider))
