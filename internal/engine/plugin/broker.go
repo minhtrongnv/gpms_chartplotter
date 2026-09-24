@@ -41,6 +41,8 @@ type Host interface {
 	Log(pluginID, level, msg string)
 }
 
+const maxConcurrentPluginRequests = 32
+
 // ioHandle is one open host-mediated transport (a dialed TCP conn), addressed by an
 // opaque per-plugin integer handle.
 type ioHandle struct {
@@ -57,15 +59,17 @@ type brokerSession struct {
 	dialer   net.Dialer
 	statusFn func(PluginStatus) // optional: the runner records the plugin's reported status
 
-	mu      sync.Mutex
-	grants  []Capability
+	mu        sync.Mutex
+	storageMu sync.Mutex
+	grants    []Capability
 	config  map[string]any
 	quota   int64
 	nextID  int64
-	pending map[int64]chan *Message
-	nextH   int
-	handles map[int]*ioHandle
-	closed  bool
+	pending      map[int64]chan *Message
+	requestSlots chan struct{}
+	nextH        int
+	handles      map[int]*ioHandle
+	closed       bool
 }
 
 func newBrokerSession(id string, sess Session, host Host, storeDir string, grants []Capability, config map[string]any) *brokerSession {
@@ -78,8 +82,9 @@ func newBrokerSession(id string, sess Session, host Host, storeDir string, grant
 		grants:   grants,
 		config:   config,
 		quota:    storageQuota(grants),
-		pending:  map[int64]chan *Message{},
-		handles:  map[int]*ioHandle{},
+		pending:      map[int64]chan *Message{},
+		requestSlots: make(chan struct{}, maxConcurrentPluginRequests),
+		handles:      map[int]*ioHandle{},
 	}
 }
 
@@ -116,7 +121,21 @@ func (b *brokerSession) serve(ctx context.Context) error {
 		case m.isResponse():
 			b.deliverResponse(m)
 		case m.isRequest():
-			go b.handleRequest(ctx, m)
+			select {
+			case b.requestSlots <- struct{}{}:
+				go func(msg *Message) {
+					defer func() {
+						<-b.requestSlots
+					}()
+					b.handleRequest(ctx, msg)
+				}(m)
+			default:
+				b.replyErr(
+					m.ID,
+					CodeInternalError,
+					"too many concurrent plugin requests",
+				)
+			}
 		case m.isNotification():
 			b.handleNotification(m)
 		}

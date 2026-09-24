@@ -84,6 +84,34 @@ func TestSSEHeadersDoNotAllowCrossOrigin(t *testing.T) {
 	}
 }
 
+func TestSafeAuxStoredName(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"PIC01.png", true},
+		{"README.txt", true},
+		{"../secret", false},
+		{"subdir/file.png", false},
+		{"subdir\\file.png", false},
+		{"..", false},
+		{"", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := safeAuxStoredName(tc.name); got != tc.want {
+				t.Fatalf(
+					"safeAuxStoredName(%q) = %v, want %v",
+					tc.name,
+					got,
+					tc.want,
+				)
+			}
+		})
+	}
+}
+
 func TestAllowedChartURL(t *testing.T) {
 	cases := []struct {
 		url  string

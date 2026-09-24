@@ -18,8 +18,13 @@ import (
 	"github.com/beetlebugorg/chartplotter/internal/engine/nmea"
 )
 
-// maxHTTPBody caps an http.fetch response body (spec §6 "response size caps").
-const maxHTTPBody = 32 << 20
+// Host-mediated I/O limits keep a granted but buggy/malicious plugin from
+// exhausting process resources.
+const (
+	maxHTTPBody           = 32 << 20
+	maxPluginHandles      = 64
+	maxPluginStorageFiles = 1024
+)
 
 // capabilities.go implements the plugin→host surface: it dispatches inbound requests
 // and notifications to the granted capability, enforcing the grant set first (spec
@@ -181,7 +186,23 @@ func (b *brokerSession) handleTCPConnect(ctx context.Context, m *Message) {
 		b.replyErr(m.ID, CodeInternalError, "dial: "+err.Error())
 		return
 	}
-	handle := b.addHandle(&ioHandle{conn: conn, cancel: cancel})
+	handle, ok := b.addHandle(
+		&ioHandle{
+			conn:   conn,
+			cancel: cancel,
+		},
+	)
+	if !ok {
+		cancel()
+		_ = conn.Close()
+		b.replyErr(
+			m.ID,
+			CodeInternalError,
+			"too many open plugin I/O handles",
+		)
+		return
+	}
+
 	b.reply(m.ID, HandleResult{Handle: handle})
 	go b.pumpConn(handle, conn)
 }
@@ -244,12 +265,18 @@ func (b *brokerSession) serialOpen(m *Message) {
 
 // --- handle table ----------------------------------------------------------
 
-func (b *brokerSession) addHandle(h *ioHandle) int {
+func (b *brokerSession) addHandle(h *ioHandle) (int, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if len(b.handles) >= maxPluginHandles {
+		return 0, false
+	}
+
 	b.nextH++
 	b.handles[b.nextH] = h
-	return b.nextH
+
+	return b.nextH, true
 }
 
 func (b *brokerSession) getHandle(id int) *ioHandle {
@@ -280,6 +307,10 @@ func (b *brokerSession) handleStorage(m *Message) {
 		b.replyErr(m.ID, CodeCapabilityDenied, "storage not granted")
 		return
 	}
+
+	b.storageMu.Lock()
+	defer b.storageMu.Unlock()
+
 	switch m.Method {
 	case MethodStorageGet:
 		var k StorageKey
@@ -330,6 +361,10 @@ func (b *brokerSession) handleServe(m *Message) {
 		b.replyErr(m.ID, CodeCapabilityDenied, "storage not granted (required to publish served artifacts)")
 		return
 	}
+
+	b.storageMu.Lock()
+	defer b.storageMu.Unlock()
+
 	serveDir := filepath.Join(b.storeDir, "serve")
 	switch m.Method {
 	case MethodServeSet:
@@ -341,6 +376,13 @@ func (b *brokerSession) handleServe(m *Message) {
 		full, ok := safeJoin(serveDir, s.Name)
 		if !ok || full == serveDir {
 			b.replyErr(m.ID, CodeInvalidParams, "invalid serve name")
+			return
+		}
+		if err := b.ensureStorageBudget(
+			full,
+			int64(len(s.Data)),
+		); err != nil {
+			b.replyErr(m.ID, CodeInternalError, err.Error())
 			return
 		}
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
@@ -399,13 +441,31 @@ func (b *brokerSession) handleHTTPFetch(m *Message) {
 	for k, v := range f.Headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := newPluginHTTPClient(grant).Do(req)
 	if err != nil {
 		b.replyErr(m.ID, CodeInternalError, "fetch: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBody))
+	body, err := io.ReadAll(
+		io.LimitReader(
+			resp.Body,
+			maxHTTPBody+1,
+		),
+	)
+	if err != nil {
+		b.replyErr(m.ID, CodeInternalError, "read response: "+err.Error())
+		return
+	}
+	if len(body) > maxHTTPBody {
+		b.replyErr(
+			m.ID,
+			CodeInternalError,
+			"http response exceeds size limit",
+		)
+		return
+	}
+
 	hdr := map[string]string{}
 	for _, h := range []string{"Content-Type", "ETag", "Last-Modified", "Cache-Control", "Content-Length"} {
 		if v := resp.Header.Get(h); v != "" {
@@ -413,6 +473,34 @@ func (b *brokerSession) handleHTTPFetch(m *Message) {
 		}
 	}
 	b.reply(m.ID, HTTPResponse{Status: resp.StatusCode, Headers: hdr, Body: body})
+}
+
+func newPluginHTTPClient(grant Capability) *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(
+			req *http.Request,
+			via []*http.Request,
+		) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+
+			u := req.URL
+			if !matchHostAllow(
+				grant.Hosts,
+				u.Hostname(),
+				schemePort(u),
+			) {
+				return fmt.Errorf(
+					"redirect host %s not in the net.http allowlist",
+					u.Hostname(),
+				)
+			}
+
+			return nil
+		},
+	}
 }
 
 // schemePort returns the explicit port or the scheme default.
@@ -445,13 +533,94 @@ func (b *brokerSession) saveKV(kv map[string]json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	if b.quota > 0 && int64(len(data)) > b.quota {
-		return fmt.Errorf("storage quota exceeded (%d > %d bytes)", len(data), b.quota)
+
+	path := b.kvPath()
+	if err := b.ensureStorageBudget(
+		path,
+		int64(len(data)),
+	); err != nil {
+		return err
 	}
+
 	if err := os.MkdirAll(b.storeDir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(b.kvPath(), data, 0o644)
+
+	return os.WriteFile(path, data, 0o644)
+}
+
+func (b *brokerSession) ensureStorageBudget(
+	replacementPath string,
+	newBytes int64,
+) error {
+	if newBytes < 0 {
+		return fmt.Errorf("invalid storage size")
+	}
+
+	var (
+		used  int64
+		files int
+	)
+
+	err := filepath.WalkDir(
+		b.storeDir,
+		func(
+			current string,
+			entry os.DirEntry,
+			walkErr error,
+		) error {
+			if walkErr != nil {
+				if os.IsNotExist(walkErr) {
+					return nil
+				}
+				return walkErr
+			}
+			if entry.IsDir() || current == replacementPath {
+				return nil
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if !info.Mode().IsRegular() {
+				return nil
+			}
+
+			if info.Size() > (1<<63-1)-used {
+				return fmt.Errorf("storage usage overflow")
+			}
+
+			used += info.Size()
+			files++
+
+			return nil
+		},
+	)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	if _, err := os.Stat(replacementPath); os.IsNotExist(err) {
+		if files >= maxPluginStorageFiles {
+			return fmt.Errorf(
+				"storage file limit exceeded (%d)",
+				maxPluginStorageFiles,
+			)
+		}
+	}
+
+	if b.quota > 0 {
+		if newBytes > b.quota-used {
+			return fmt.Errorf(
+				"storage quota exceeded (%d > %d bytes)",
+				used+newBytes,
+				b.quota,
+			)
+		}
+	}
+
+	return nil
 }
 
 // --- allowlist + quota parsing ---------------------------------------------
@@ -500,6 +669,7 @@ func storageQuota(grants []Capability) int64 {
 func parseBytes(s string) int64 {
 	s = strings.TrimSpace(strings.ToUpper(s))
 	mult := int64(1)
+
 	switch {
 	case strings.HasSuffix(s, "MB"):
 		mult, s = 1<<20, strings.TrimSuffix(s, "MB")
@@ -508,9 +678,18 @@ func parseBytes(s string) int64 {
 	case strings.HasSuffix(s, "B"):
 		s = strings.TrimSuffix(s, "B")
 	}
-	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-	if err != nil {
+
+	n, err := strconv.ParseInt(
+		strings.TrimSpace(s),
+		10,
+		64,
+	)
+	if err != nil ||
+		n <= 0 ||
+		n > (1<<63-1)/mult {
+
 		return 5 << 20
 	}
+
 	return n * mult
 }

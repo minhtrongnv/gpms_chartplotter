@@ -12,6 +12,7 @@ package auxfiles
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -107,15 +108,40 @@ func WriteDir(dir string, files map[string][]byte) (int, error) {
 	return len(index), nil
 }
 
-// tiffToPNG decodes a TIFF image and re-encodes it as PNG.
+const maxAuxImagePixels uint64 = 20_000_000
+
+// tiffToPNG decodes a TIFF image and re-encodes it as PNG. DecodeConfig is
+// deliberately checked first: TIFF compression can describe an enormous image
+// with a small input, so decoding dimensions without a pixel budget is a memory
+// exhaustion path when importing an untrusted exchange set.
 func tiffToPNG(data []byte) ([]byte, error) {
+	cfg, err := tiff.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return nil, fmt.Errorf("invalid TIFF dimensions %dx%d", cfg.Width, cfg.Height)
+	}
+
+	pixels := uint64(cfg.Width) * uint64(cfg.Height)
+	if pixels > maxAuxImagePixels {
+		return nil, fmt.Errorf(
+			"TIFF dimensions %dx%d exceed %d-pixel limit",
+			cfg.Width,
+			cfg.Height,
+			maxAuxImagePixels,
+		)
+	}
+
 	img, err := tiff.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
+
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
 		return nil, err
 	}
+
 	return buf.Bytes(), nil
 }

@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -160,6 +161,15 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bound the complete upload request before multipart parsing. FormFile would
+	// otherwise parse/spill an arbitrarily large multipart body before the
+	// individual file-size check below gets a chance to run.
+	r.Body = http.MaxBytesReader(
+		w,
+		r.Body,
+		maxImportRequestBytes,
+	)
+
 	set := r.URL.Query().Get("set")
 	// "auto" (or empty) means "name this upload from its CATALOG identity" — the
 	// one-district-per-upload path (under the "user" provider). The real name is
@@ -173,7 +183,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 
 	cells, aux, cat, err := s.importInputs(r)
 	if err != nil {
-		apiErr(w, http.StatusBadRequest, err.Error())
+		writeJSONBodyError(w, err)
 		return
 	}
 	// No cells supplied in the request → re-bake the provider from its cached ENC_ROOT
@@ -446,7 +456,7 @@ func fetchURLProgress(raw string, onProgress func(done, total int)) ([]byte, err
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			out.Write(buf[:n])
-			if out.Len() > maxImportBytes {
+			if int64(out.Len()) > maxImportBytes {
 				return nil, fmt.Errorf("download exceeds %d bytes", maxImportBytes)
 			}
 			if onProgress != nil {
@@ -470,19 +480,35 @@ func fetchURLProgress(raw string, onProgress func(done, total int)) ([]byte, err
 func (s *Server) importInputs(r *http.Request) (map[string]baker.CellData, map[string][]byte, []tile57.CatalogEntry, error) {
 	ct := r.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "multipart/form-data") {
+		if err := r.ParseMultipartForm(maxImportMultipartMemory); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				return nil, nil, nil, fmt.Errorf(
+					"%w: import request exceeds %d bytes",
+					errRequestBodyTooLarge,
+					maxImportRequestBytes,
+				)
+			}
+			return nil, nil, nil, fmt.Errorf("multipart: %w", err)
+		}
+		if r.MultipartForm != nil {
+			defer r.MultipartForm.RemoveAll()
+		}
+
 		f, _, err := r.FormFile("file")
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("multipart: %w", err)
 		}
 		defer f.Close()
-		data, err := io.ReadAll(io.LimitReader(f, maxImportBytes))
+
+		data, err := readImportBytes(f, maxImportBytes)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		return extractZipCells(data)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxImportBytes))
+	body, err := readImportBytes(r.Body, maxImportBytes)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -533,9 +559,41 @@ func (s *Server) looseCellData(csv string) map[string]baker.CellData {
 	return cells
 }
 
-// maxImportBytes caps an uploaded exchange set (a single NOAA district zip is well
-// under this; the whole-nation All_ENCs.zip is multi-GB and is not an upload case).
-const maxImportBytes = 2 << 30 // 2 GiB
+// Upload limits. The whole-nation All_ENCs.zip is multi-GB and is intentionally
+// handled by the Range proxy rather than this in-memory upload path.
+const (
+	maxImportBytes           int64 = 2 << 30 // 2 GiB compressed/raw file payload
+	maxImportRequestBytes          = maxImportBytes + (8 << 20)
+	maxImportMultipartMemory int64 = 8 << 20
+	maxImportZipEntries            = 10_000
+	maxImportZipEntryBytes   int64 = 128 << 20
+	maxImportExpandedBytes   int64 = maxImportBytes
+)
+
+func readImportBytes(r io.Reader, maxBytes int64) ([]byte, error) {
+	b, err := io.ReadAll(
+		io.LimitReader(r, maxBytes+1),
+	)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return nil, fmt.Errorf(
+				"%w: import request exceeds %d bytes",
+				errRequestBodyTooLarge,
+				maxBytes,
+			)
+		}
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf(
+			"%w: import payload exceeds %d bytes",
+			errRequestBodyTooLarge,
+			maxBytes,
+		)
+	}
+	return b, nil
+}
 
 // runImport (re-)bakes the provider's whole ENC_ROOT into its one archive and registers
 // it — the shared tail for every single-set import path (upload, loose cells, cache
@@ -821,6 +879,14 @@ func extractZipCells(data []byte) (map[string]baker.CellData, map[string][]byte,
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("not a valid zip: %w", err)
 	}
+	if len(zr.File) > maxImportZipEntries {
+		return nil, nil, nil, fmt.Errorf(
+			"zip has too many entries (%d > %d)",
+			len(zr.File),
+			maxImportZipEntries,
+		)
+	}
+
 	type acc struct {
 		base    []byte
 		updates map[string][]byte
@@ -828,6 +894,8 @@ func extractZipCells(data []byte) (map[string]baker.CellData, map[string][]byte,
 	byCell := map[string]*acc{}
 	aux := map[string][]byte{}
 	var catalogBytes []byte // CATALOG.031 — parsed after the loop for per-cell metadata
+	var expandedBytes int64
+
 	for _, e := range zr.File {
 		// CATALOG.031 must be tested FIRST: its ".031" extension otherwise looks like
 		// an ENC update file to encExtServer and gets grouped as a baseless update.
@@ -840,15 +908,29 @@ func extractZipCells(data []byte) (map[string]baker.CellData, map[string][]byte,
 		if !isCat && ext == "" && !isAux {
 			continue
 		}
-		rc, err := e.Open()
+		if e.UncompressedSize64 > uint64(maxImportZipEntryBytes) {
+			return nil, nil, nil, fmt.Errorf(
+				"zip entry %q exceeds expanded limit of %d bytes",
+				e.Name,
+				maxImportZipEntryBytes,
+			)
+		}
+
+		b, err := readImportZipEntry(
+			e,
+			maxImportZipEntryBytes,
+		)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		b, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			return nil, nil, nil, err
+
+		if int64(len(b)) > maxImportExpandedBytes-expandedBytes {
+			return nil, nil, nil, fmt.Errorf(
+				"zip expanded payload exceeds %d bytes",
+				maxImportExpandedBytes,
+			)
 		}
+		expandedBytes += int64(len(b))
 		if isCat {
 			if catalogBytes == nil {
 				catalogBytes = b
@@ -892,6 +974,33 @@ func extractZipCells(data []byte) (map[string]baker.CellData, map[string][]byte,
 		}
 	}
 	return cells, aux, cat, nil
+}
+
+func readImportZipEntry(
+	f *zip.File,
+	maxBytes int64,
+) ([]byte, error) {
+	rc, err := f.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+
+	b, err := io.ReadAll(
+		io.LimitReader(rc, maxBytes+1),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf(
+			"zip entry %q exceeds expanded limit of %d bytes",
+			f.Name,
+			maxBytes,
+		)
+	}
+
+	return b, nil
 }
 
 // isCatalogFile reports whether a zip entry is an S-57 exchange-set catalogue
