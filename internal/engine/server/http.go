@@ -585,8 +585,32 @@ func isCellName(s string) bool {
 // already carries its own copies). Pass "" to disable.
 func (s *Server) SetAssetFallback(dir string) { s.assetsFallback = dir }
 
-// serveAsset serves a static web asset: an on-disk --assets override (if set and
-// present), then the emitted S-101 asset fallback, then the embedded bundle.
+var tile57PortrayalAssets = map[string]struct{}{
+	"colortables.json": {},
+	"linestyles.json":  {},
+	"sprite.json":      {},
+	"sprite.png":       {},
+	"patterns.json":    {},
+	"patterns.png":     {},
+}
+
+func isTile57PortrayalAsset(name string) bool {
+	_, ok := tile57PortrayalAssets[path.Base(name)]
+	return ok
+}
+
+// serveAsset serves a static web asset.
+//
+// The generated tile57 portrayal assets are a matched set with the currently
+// linked libtile57 style generator. They therefore take precedence over an
+// explicit --assets directory for those six files only. This prevents a stale
+// dev-time sprite.png/json (for example, from an older tile57 commit) from being
+// paired with a newer style whose atlas normalization changed.
+//
+// All other files keep the normal development precedence:
+//   1. explicit --assets dir
+//   2. generated S-101 fallback
+//   3. embedded bundle
 func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request) {
 	rel := r.URL.Path
 	if rel == "" || rel == "/" {
@@ -599,8 +623,19 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	name := strings.TrimPrefix(rel, "/")
 
-	// A --assets directory (dev) overrides the embedded bundle when the file is
-	// present on disk; otherwise fall back to the embedded copy.
+	// Portrayal assets must come from the same libtile57 build that generated the
+	// current style. A stale --assets copy can otherwise pair an old full-size
+	// sprite atlas with the newer drawn-scale icon-size normalization, inflating
+	// symbols by ~0.08/0.028346 = 2.82x.
+	if isTile57PortrayalAsset(name) && s.assetsFallback != "" {
+		full := filepath.Join(s.assetsFallback, filepath.FromSlash(name))
+		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
+			s.serveFile(w, r, full, rel)
+			return
+		}
+	}
+
+	// Ordinary development assets still override the embedded/fallback copy.
 	if s.assetsDir != "" {
 		full := filepath.Join(s.assetsDir, filepath.FromSlash(name))
 		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
@@ -608,10 +643,9 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Secondary on-disk root: the freshly-emitted S-101 client assets (sprite/
-	// colortables/…). Searched only after the primary --assets dir so an explicit
-	// bundle's own files win, and before the embedded copy so a `make`-less serve
-	// still gets the generated assets.
+
+	// Secondary on-disk root: freshly emitted S-101 assets and any future
+	// generated client assets not already handled above.
 	if s.assetsFallback != "" {
 		full := filepath.Join(s.assetsFallback, filepath.FromSlash(name))
 		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
