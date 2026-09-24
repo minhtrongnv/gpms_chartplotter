@@ -1469,7 +1469,7 @@ export class ChartCanvas extends HTMLElement {
     boolK("fourShadeWater");
     if (m.depthUnit) p.set("depthUnit", m.depthUnit);
     boolK("displayBase"); boolK("displayStandard"); boolK("displayOther");
-    boolK("showSoundings");
+    boolK("showSoundings"); boolK("denseSoundings");
     boolK("dataQuality"); boolK("showInformCallouts"); boolK("showMetaBounds"); boolK("showIsolatedDangersShallow");
     boolK("showOverscale");
     if (m.boundaryStyle) p.set("boundaryStyle", m.boundaryStyle);
@@ -1647,6 +1647,7 @@ export class ChartCanvas extends HTMLElement {
     bool("displayStandard", "display_standard");
     bool("displayOther", "display_other");
     bool("showSoundings", "show_soundings");
+    bool("denseSoundings", "dense_soundings");
     bool("dataQuality", "data_quality");
     bool("showInformCallouts", "show_inform_callouts");
     bool("showMetaBounds", "show_meta_bounds");
