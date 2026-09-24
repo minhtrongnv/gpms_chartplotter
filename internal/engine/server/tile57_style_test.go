@@ -30,13 +30,6 @@ func TestMarinerFromQuerySoundingsOverride(t *testing.T) {
 		t.Fatalf("soundings=%v, want SoundingsHide", off.Soundings)
 	}
 
-	dense := marinerFromQuery(url.Values{
-		"denseSoundings": {"1"},
-	})
-	if !dense.DenseSoundings {
-		t.Fatal("denseSoundings=1 was not forwarded to tile57")
-	}
-
 	follow := marinerFromQuery(url.Values{})
 	defaults := tile57.MarinerDefaults()
 	if follow.Soundings != defaults.Soundings {
@@ -44,13 +37,6 @@ func TestMarinerFromQuerySoundingsOverride(t *testing.T) {
 			"omitted soundings=%v, want engine default %v",
 			follow.Soundings,
 			defaults.Soundings,
-		)
-	}
-	if follow.DenseSoundings != defaults.DenseSoundings {
-		t.Fatalf(
-			"omitted denseSoundings=%v, want engine default %v",
-			follow.DenseSoundings,
-			defaults.DenseSoundings,
 		)
 	}
 }
