@@ -456,7 +456,7 @@ func fetchURLProgress(raw string, onProgress func(done, total int)) ([]byte, err
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			out.Write(buf[:n])
-			if out.Len() > maxImportBytes {
+			if int64(out.Len()) > maxImportBytes {
 				return nil, fmt.Errorf("download exceeds %d bytes", maxImportBytes)
 			}
 			if onProgress != nil {
