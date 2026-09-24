@@ -173,7 +173,7 @@ func WriteDirFromPaths(dir string, files map[string]string) (int, error) {
 	return len(index), nil
 }
 
-const maxAuxTranscodeInputBytes int64 = 64 << 20
+const maxAuxTranscodeInputBytes int64 = 128 << 20
 
 func copyAuxFile(source, dest string) error {
 	in, err := os.Open(source)
