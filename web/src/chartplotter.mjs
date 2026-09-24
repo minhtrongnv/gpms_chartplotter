@@ -71,14 +71,11 @@ const DEFAULT_MARINER = {
   safetyDepth: 10,
   deepContour: 30,
   depthUnit: "ft", // US/NOAA preference (engine default DepthUnitFeet)
-  // Display categories (S-52 §10.2). Base is the minimum safe-navigation set and
-  // can NEVER be deselected by the mariner — it is forced on at boot. We default
-  // to the full "Other" display (all charted detail) — friendlier for a
-  // recreational plotter than the ECDIS Standard default; the mariner can drop
-  // back to Standard/Base in Display settings (detailLevel).
+  // Display categories (S-52 §10.2). Match OpenCPN's normal working view:
+  // Base + Standard. "Other" remains an explicit extra-detail choice.
   displayBase: true,
   displayStandard: true,
-  displayOther: true,
+  displayOther: false,
   boundaryStyle: "symbolized", // IMO/S-52 default (vs "plain")
   simplifiedPoints: false,     // paper-chart point symbols (engine SimplifiedPoints=false)
   fourShadeWater: true,        // four depth shades (engine TwoShades=false)
@@ -106,7 +103,7 @@ const DEFAULT_MARINER = {
   showLightDescriptions: true, // group 23: light characteristics (e.g. Fl(2)R 10s)
   textImportant: true,         // group 11: bridge/cable/pipeline clearances, route/track bearings
   textNames: true,             // groups 21/26/29: buoy/beacon/geographic names, berth numbers
-  textOther: true,             // groups 0-10/22/24/25/27/28/30/32-49: notes, seabed, mag variation, heights
+  textOther: false,            // notes/seabed/mag-variation text is opt-in; avoids overview-scale clutter
   // Off by default.
   showFullSectorLines: false,        // 25mm legs (engine ShowFullLengthSectorLines=false, avoids clutter)
   showIsolatedDangersShallow: false, // ISODGR01 at DisplayBase (engine default); on → Standard category
@@ -274,6 +271,7 @@ export class ChartPlotter extends HTMLElement {
       this._mariner.displayBase = true;
       this._mariner.displayStandard = true;
       this._mariner.displayOther = false;
+      this._mariner.textOther = false;
       if (!embed) {
         try { localStorage.setItem(LS_MARINER, JSON.stringify(this._mariner)); } catch (_) {}
       }
@@ -2058,6 +2056,7 @@ export class ChartPlotter extends HTMLElement {
       if (hadDense) {
         this._mariner.displayStandard = true;
         this._mariner.displayOther = false;
+        this._mariner.textOther = false;
       }
     }
   }
