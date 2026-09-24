@@ -161,6 +161,15 @@ func (s *Server) handleDeleteDistrict(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		if len(s.providerDistricts(provider)) > 0 {
+			if err := s.markProviderDirty(provider); err != nil {
+				s.imports.update(jobID, func(j *importJob) {
+					j.State = "error"
+					j.Err = err.Error()
+				})
+				return
+			}
+		}
 		s.auxIdx.invalidate()
 		if s.bakeProvider(jobID, provider) {
 			s.imports.update(jobID, func(j *importJob) { j.State = "done" })
