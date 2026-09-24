@@ -75,6 +75,22 @@ export function zoomForScalePhysical(scale, lat, pxPitchMm = DEFAULT_PX_PITCH_MM
   return Math.max(0, Math.min(24, z));
 }
 
+
+// Deterministic chart-scale coordinate used by the HUD, SCAMIN, overscale,
+// go-to-scale and cross-browser comparisons. It intentionally uses the fixed
+// CSS-reference pitch shared with tile57 (0.2645 mm), NOT a per-screen
+// calibration. A monitor calibration is a rendering-size concern; letting it
+// change the navigational 1:N coordinate makes the same camera report different
+// scales in different browsers/origins and can disagree with tile57's static
+// zoom-gates.
+export function chartScaleDenom(z, lat) {
+  return scaleDenomPhysical(z, lat, DEFAULT_PX_PITCH_MM);
+}
+
+export function zoomForChartScale(scale, lat) {
+  return zoomForScalePhysical(scale, lat, DEFAULT_PX_PITCH_MM);
+}
+
 // Finest map scale we allow: don't magnify charts past 1:MIN_DETAIL_SCALE (past
 // this it's just blocky overzoom). The cap is a PHYSICAL scale — the 1:N a ruler
 // laid on the screen measures (scaleDenomPhysical) — so it matches the HUD readout.
