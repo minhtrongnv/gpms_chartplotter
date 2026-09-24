@@ -1140,9 +1140,18 @@ export class ChartCanvas extends HTMLElement {
     if ("showNoData" in settings && this._map) {
       this._eachLayer("nodata", (id) => this._setVis(id, this._mariner.showNoData === false ? "none" : "visible"));
     }
-    // tile57 engine mode: the display state lives in the engine-generated style, so a
-    // toggle is an engine-computed diff applied in place (no JS in-place updaters).
-    if (this._engineMode) { this._engineRestyle(); return; }
+    // tile57 engine mode: most mariner changes ride an engine-computed diff.
+    // Display-category changes are structural/high-impact filters used by almost
+    // every chart layer. Rebuild them from a fresh engine style instead of relying
+    // on a long chain of in-place setFilter ops: this is infrequent user input and
+    // guarantees Base / Standard / Other never leave stale category filters behind.
+    if (this._engineMode) {
+      const categoryChange = ["displayBase", "displayStandard", "displayOther"]
+        .some((k) => Object.prototype.hasOwnProperty.call(settings, k));
+      if (categoryChange) void this._engineRebuild();
+      else this._engineRestyle();
+      return;
+    }
     const keys = Object.keys(settings);
     const map = this._map;
     if (!map) return;
