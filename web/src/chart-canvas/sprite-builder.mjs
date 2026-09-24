@@ -66,7 +66,7 @@ export class SpriteBuilder {
   // hot path can continue returning a plain ImageData.
   pixelRatioFor(id) {
     if (id.startsWith("ctr:")) {
-      return (this._cell(id) || this._cell(id.slice(4)))?.pixelRatio || 1;
+      return this._cell(id)?.pixelRatio || 1;
     }
     if (id.startsWith("snd:")) {
       return this._ratioForNames(this._soundingNamesForId(id));
@@ -98,9 +98,9 @@ export class SpriteBuilder {
   // cell is the glyph cropped to its content, so drawing it into a w×h canvas and
   // letting MapLibre centre that canvas puts the glyph centre on the point.
   centredGlyph(name) {
-    // Current tile57 emits a dedicated bbox-centred "ctr:<id>" cell. Prefer it
-    // directly; legacy/custom atlases did not, so retain the plain-cell fallback.
-    const c = this._cell("ctr:" + name) || this._cell(name);
+    // Current tile57 already emits the exact MapLibre-ready cell requested by
+    // the style. Do not reinterpret the name or re-center it here.
+    const c = this._cell(name);
     if (!c) return null;
     return this.rawCell(this.spriteImg, c);
   }
@@ -137,17 +137,12 @@ export class SpriteBuilder {
   }
 
   centredSymbol(name) {
+    // Current tile57's MapLibre atlas already contains the symbol in the correct
+    // logical cell. The legacy path re-created a canvas and applied pivot offsets
+    // again, which could distort/double-center newer symbols and soften edges.
     const c = this._cell(name);
     if (!c) return null;
-    const halfW = Math.max(c.pivot_x, c.w - c.pivot_x);
-    const halfH = Math.max(c.pivot_y, c.h - c.pivot_y);
-    const w = Math.max(1, Math.ceil(2 * halfW));
-    const h = Math.max(1, Math.ceil(2 * halfH));
-    const cv = document.createElement("canvas");
-    cv.width = w; cv.height = h;
-    const ctx = cv.getContext("2d");
-    ctx.drawImage(this.spriteImg, c.x, c.y, c.w, c.h, w / 2 - c.pivot_x, h / 2 - c.pivot_y, c.w, c.h);
-    return ctx.getImageData(0, 0, w, h);
+    return this.rawCell(this.spriteImg, c);
   }
 
   compositeSounding(namesStr) {
