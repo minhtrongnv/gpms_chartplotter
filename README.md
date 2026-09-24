@@ -192,6 +192,43 @@ bin/chartplotter serve
 # open http://127.0.0.1:8080 → pick a region → it downloads and builds tiles → the chart appears
 ```
 
+### GPMS deployment modes
+
+The GPMS deployment intentionally supports two access modes.
+
+**Local/offline ship LAN (default)** — no Cloudflare or Internet dependency:
+
+```sh
+chartplotter serve \
+  --host 0.0.0.0 \
+  --access-mode=local
+```
+
+Use this only on the isolated/private ship network. Private, loopback, link-local,
+and wildcard bind addresses are accepted; a concrete public IP is rejected in
+local mode. `CHARTPLOTTER_ACCESS_TOKEN` remains optional and can be enabled for
+a deployment that explicitly wants application-level Bearer authentication.
+
+**Internet through Cloudflare Tunnel** — `cloudflared` is the only intended
+upstream:
+
+```sh
+chartplotter serve \
+  --host 0.0.0.0 \
+  --access-mode=cloudflare \
+  --trusted-proxies="<smallest Docker subnet or proxy CIDR>"
+```
+
+Cloudflare mode requires an explicit trusted-proxy CIDR and automatically trusts
+`CF-Connecting-IP` only from those peers. Do not publish the Chartplotter
+container port directly to the public Internet; expose it only to the
+`cloudflared` container/network. Cloudflare Access is optional and can be
+enabled upstream later to restrict the public hostname to selected users without
+changing Chartplotter's user model.
+
+The older `--trusted-proxies ... --trust-cloudflare` form is still accepted and
+auto-selects Cloudflare mode for compatibility.
+
 The server writes everything it generates to your cache directory
 (`~/.cache/chartplotter`), never into the binary's assets.
 
@@ -227,7 +264,7 @@ chartplotter serve --assets web
 | `emit-assets DIR` | Write the S-101 client assets (color tables, sprites, line styles, patterns) to a directory. |
 | `catalog-json IN.xml OUT.json` | Distil NOAA `ENCProdCat.xml` into a compact `catalog.json`. |
 | `bake -o OUT IN…` | Bake S-57 cells, directories, or NOAA ENC zips into a chart bundle (or per-band PMTiles with `--bands`). |
-| `serve [--host] [--port] [--assets DIR]` | Serve the web frontend, the baking API, and the NOAA cell proxy (baked tiles only). |
+| `serve [--host] [--port] [--access-mode local\|cloudflare] [--assets DIR]` | Serve the web frontend, baking API, and NOAA cell proxy in offline/LAN or Cloudflare Tunnel mode. |
 | `simulate` | Run an NMEA 0183 traffic generator over TCP (own-ship + AIS targets) for testing. |
 
 Run `chartplotter <command> --help` for the full flags.

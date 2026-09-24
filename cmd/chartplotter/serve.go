@@ -20,9 +20,10 @@ import (
 // in the backend (the browser only renders pre-baked tiles), alongside the
 // /api/cell NOAA-download proxy.
 type serveCmd struct {
-	Host   string `default:"127.0.0.1" help:"Bind host."`
-	Port   int    `default:"8080" help:"Bind port."`
-	Assets string `type:"existingdir" help:"Serve static assets from this directory instead of the built-in embedded bundle (for development)."`
+	Host       string `default:"127.0.0.1" help:"Bind host."`
+	Port       int    `default:"8080" help:"Bind port."`
+	AccessMode string `name:"access-mode" help:"Access mode: local for offline ship/LAN use; cloudflare for Internet access through a trusted Cloudflare Tunnel. Defaults to local; legacy Cloudflare proxy flags auto-select cloudflare."`
+	Assets     string `type:"existingdir" help:"Serve static assets from this directory instead of the built-in embedded bundle (for development)."`
 	Cache  string `help:"Cache dir for REGENERABLE baked .pmtiles tile sets (default: XDG cache)."`
 	Data   string `help:"Data dir for SOURCE ENC (district zips, raw cells) — safe, not auto-deleted (default: XDG data)."`
 
@@ -30,7 +31,7 @@ type serveCmd struct {
 
 	TrustedProxies string `name:"trusted-proxies" help:"Comma-separated trusted reverse-proxy CIDRs. Proxy headers are ignored unless RemoteAddr is inside one of these CIDRs."`
 
-	TrustCloudflare bool `name:"trust-cloudflare" help:"Trust CF-Connecting-IP from configured trusted proxies."`
+	TrustCloudflare bool `name:"trust-cloudflare" help:"Trust CF-Connecting-IP from configured trusted proxies. Implied by --access-mode=cloudflare; retained for compatibility."`
 
 	S101 string `name:"s101" type:"existingdir" help:"Override the embedded catalogue with an external S-101 PortrayalCatalog directory (for iterating on rules). Every chart baked by the server (chart library imports) uses this catalogue's symbology, and the matching client assets are served. Requires --s101-fc."`
 
@@ -38,22 +39,117 @@ type serveCmd struct {
 }
 
 
-func requiresAccessToken(
-	allowRemote bool,
+const (
+	accessModeLocal      = "local"
+	accessModeCloudflare = "cloudflare"
+)
+
+type serveAccessPolicy struct {
+	mode            string
+	trustCloudflare bool
+}
+
+func resolveServeAccessPolicy(
+	mode string,
 	trustedProxies string,
-	trustCloudflare bool,
-) bool {
-	if !allowRemote {
-		return false
+	trustCloudflareFlag bool,
+) (serveAccessPolicy, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	proxyConfigured := strings.TrimSpace(trustedProxies) != ""
+
+	// Preserve the 3.3.3 CLI while making the two deployment modes explicit:
+	// no mode + no proxy flags means offline/local; the old trusted-proxy +
+	// --trust-cloudflare form is treated as Cloudflare Tunnel mode.
+	if mode == "" {
+		if trustCloudflareFlag {
+			mode = accessModeCloudflare
+		} else {
+			mode = accessModeLocal
+		}
 	}
 
-	return !(
-		trustCloudflare &&
-			strings.TrimSpace(trustedProxies) != ""
+	switch mode {
+	case accessModeLocal:
+		if proxyConfigured {
+			return serveAccessPolicy{}, fmt.Errorf(
+				"--trusted-proxies is only valid with --access-mode=cloudflare",
+			)
+		}
+		if trustCloudflareFlag {
+			return serveAccessPolicy{}, fmt.Errorf(
+				"--trust-cloudflare is only valid with --access-mode=cloudflare",
+			)
+		}
+
+		return serveAccessPolicy{
+			mode: accessModeLocal,
+		}, nil
+
+	case accessModeCloudflare:
+		if !proxyConfigured {
+			return serveAccessPolicy{}, fmt.Errorf(
+				"--access-mode=cloudflare requires --trusted-proxies",
+			)
+		}
+
+		return serveAccessPolicy{
+			mode:            accessModeCloudflare,
+			trustCloudflare: true,
+		}, nil
+
+	default:
+		return serveAccessPolicy{}, fmt.Errorf(
+			"invalid --access-mode %q (want local or cloudflare)",
+			mode,
+		)
+	}
+}
+
+// validateLocalBindHost catches an accidental direct bind to a concrete public
+// IP while running in the offline/LAN mode. Wildcard binds remain valid because
+// Docker and ship deployments commonly listen on 0.0.0.0/:: inside an isolated
+// host/network namespace. Non-IP hostnames are left to the OS resolver.
+func validateLocalBindHost(host string) error {
+	host = strings.TrimSpace(host)
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return nil
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil
+	}
+
+	if ip.IsUnspecified() ||
+		ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() {
+
+		return nil
+	}
+
+	return fmt.Errorf(
+		"--access-mode=local cannot bind public IP %q; use a private/LAN address or --access-mode=cloudflare",
+		host,
 	)
 }
 
 func (c serveCmd) Run() error {
+	accessPolicy, err := resolveServeAccessPolicy(
+		c.AccessMode,
+		c.TrustedProxies,
+		c.TrustCloudflare,
+	)
+	if err != nil {
+		return err
+	}
+
+	if accessPolicy.mode == accessModeLocal {
+		if err := validateLocalBindHost(c.Host); err != nil {
+			return err
+		}
+	}
+
 	// Portrayal is S-101. Emit the client assets
 	// (colortables/linestyles/sprite/patterns) via libtile57's
 	// asset baker and serve them as a fallback.
@@ -141,41 +237,9 @@ func (c serveCmd) Run() error {
 		os.Getenv("CHARTPLOTTER_ACCESS_TOKEN"),
 	)
 
-	proxyConfigured := strings.TrimSpace(c.TrustedProxies) != ""
-
-	// CF-Connecting-IP is only meaningful when the immediate
-	// peer itself is an explicitly trusted proxy.
-	//
-	// Requiring --trusted-proxies together with
-	// --trust-cloudflare prevents accidentally trusting a
-	// caller-supplied CF-Connecting-IP header.
-	if c.TrustCloudflare && !proxyConfigured {
-		return fmt.Errorf(
-			"--trust-cloudflare requires --trusted-proxies",
-		)
-	}
-
-	cloudflareTunnelMode := c.TrustCloudflare && proxyConfigured
-
-	// Direct non-loopback exposure still requires application-level bearer
-	// authentication. A deliberately configured Cloudflare Tunnel is the
-	// exception: browser authentication may be left public at Cloudflare or
-	// restricted dynamically with Cloudflare Access without changing this
-	// process. The trusted-proxy requirement prevents an arbitrary client from
-	// enabling tunnel semantics merely by sending Cloudflare headers.
-	if requiresAccessToken(
-		allowRemote,
-		c.TrustedProxies,
-		c.TrustCloudflare,
-	) && accessToken == "" {
-		return fmt.Errorf(
-			"CHARTPLOTTER_ACCESS_TOKEN is required for direct non-loopback exposure",
-		)
-	}
-
 	clientIPResolver, err := server.NewClientIPResolver(
 		c.TrustedProxies,
-		c.TrustCloudflare,
+		accessPolicy.trustCloudflare,
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -202,16 +266,18 @@ func (c serveCmd) Run() error {
 		clientIPResolver,
 	)
 
-	if strings.TrimSpace(c.TrustedProxies) != "" {
-		if c.TrustCloudflare {
-			appLog.Println(
-				"Trusted proxy client-IP resolution enabled (Cloudflare headers allowed)",
-			)
-		} else {
-			appLog.Println(
-				"Trusted proxy client-IP resolution enabled",
-			)
-		}
+	switch accessPolicy.mode {
+	case accessModeCloudflare:
+		appLog.Println(
+			"Access mode: CLOUDFLARE TUNNEL (Internet)",
+		)
+		appLog.Println(
+			"Trusted proxy client-IP resolution enabled (Cloudflare headers allowed)",
+		)
+	case accessModeLocal:
+		appLog.Println(
+			"Access mode: LOCAL/OFFLINE (ship LAN; no Cloudflare dependency)",
+		)
 	}
 
 	var handler http.Handler = srv
@@ -225,13 +291,13 @@ func (c serveCmd) Run() error {
 		appLog.Println(
 			"Bearer authentication enabled",
 		)
-	} else if cloudflareTunnelMode {
+	} else if accessPolicy.mode == accessModeCloudflare {
 		appLog.Println(
-			"Bearer authentication disabled (trusted Cloudflare Tunnel mode)",
+			"Bearer authentication disabled (Cloudflare Tunnel mode; Cloudflare Access may be enabled upstream)",
 		)
 	} else {
 		appLog.Println(
-			"Bearer authentication disabled (loopback development mode)",
+			"Bearer authentication disabled (local/offline ship mode)",
 		)
 	}
 
@@ -292,8 +358,11 @@ func (c serveCmd) Run() error {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		MaxHeaderBytes:    64 << 10,
 
+		// ReadTimeout and WriteTimeout intentionally stay at zero. ENC/plugin
+		// uploads can be large, while SSE and Range responses are long-lived.
+		// Individual request bodies are size-capped by their handlers instead.
 		BaseContext: func(
 			net.Listener,
 		) context.Context {
