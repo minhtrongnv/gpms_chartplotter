@@ -181,22 +181,18 @@ export class ChartCanvas extends HTMLElement {
       try { return !new URLSearchParams(location.search).has("noScaminGate"); }
       catch (e) { return true; }
     })();
-    // SCAMIN merged mode is the DEFAULT: collapse the SCAMIN filter-gate/bucket
-    // layer explosion (~18 kinds × up to 33 SCAMIN values × N packs) down to ~1
-    // layer per kind by asking the engine for its MERGED zoom-expression gate
-    // (empty manifest → style.zig zoom_gate). That clause self-gates on the live
-    // zoom, so the entire client SCAMIN injection path (_scaminUpdate /
-    // _scaminApplySettled / _scaminForceWhenReady + the straggler sweep) is
-    // UNNECESSARY and disabled below — no setFilter, no source reload on zoom,
-    // which is what killed the "tiles crawl in a second after you stop scrolling"
-    // lag. Trade-off: integer-zoom snap (the clause steps at whole zoom levels, not
-    // the exact physical crossing) — imperceptible in practice since tiles are
-    // integer-zoom quantized anyway. Opt OUT to the exact per-value filter-gate
-    // (client-injected physical display denominator, no integer snap) with
-    // ?scaminexact — for side-by-side comparison or exact-declutter needs.
+    // Server/live mode defaults to the EXACT client-driven SCAMIN gate. It injects
+    // the same physical display denominator the HUD uses (zoom + latitude + this
+    // screen's calibrated pxPitch), so changing Physical Screen Width moves feature
+    // cutoffs exactly like OpenCPN. The older merged zoom-expression uses a fixed
+    // reference pixel and therefore cannot stay aligned with a manually calibrated
+    // monitor. Opt into that faster-but-reference-pixel mode with ?scaminmerge.
+    //
+    // The server-less widget/demo still forces merged mode later because it has no
+    // server style-diff/filter-gate endpoint.
     this._scaminMerged = (() => {
-      try { return !new URLSearchParams(location.search).has("scaminexact"); }
-      catch (e) { return true; }
+      try { return new URLSearchParams(location.search).has("scaminmerge"); }
+      catch (e) { return false; }
     })();
     this._engineScaminValues = []; // SCAMIN ladder (from the set tilejson) — the crossing boundaries
     this._scaminBandLast = -1;     // last-applied band index (count of ladder values below curDenom)
@@ -1818,8 +1814,9 @@ export class ChartCanvas extends HTMLElement {
   // Re-inject the current display-scale denominator (curDenom) into every gated chart
   // layer's SCAMIN clause, but ONLY when curDenom has crossed a SCAMIN-ladder boundary
   // since the last apply (≤19 boundaries across a full zoom sweep). curDenom is the
-  // deterministic chart-scale denominator (zoom + latitude, fixed 0.2645 mm reference)
-  // used by both the HUD and tile57. This is the client half of scamin-layers.md.
+  // true physical display-scale denominator (zoom + latitude + this screen's calibrated
+  // CSS-pixel pitch), exactly the value shown by the HUD. This is the client half of
+  // scamin-layers.md.
   //
   // COST: each setFilter here makes MapLibre reload the layer's whole SOURCE (worker
   // re-parse of every loaded tile + symbol re-placement), so this must only run from
