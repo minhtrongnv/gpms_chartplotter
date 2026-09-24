@@ -32,6 +32,24 @@ func emitS101Assets(catalogDir, dir string) ([]string, error) {
 		return nil, err
 	}
 
+	// Also emit the standard Retina/HiDPI pair. tile57 rasterizes the SAME
+	// logical S-52 symbol at 2 device pixels per reference pixel and writes
+	// pixelRatio=2 into the metadata, so MapLibre keeps the exact same chart
+	// symbol size while sampling a much sharper texture.
+	//
+	// This does not reintroduce the old oversized atlas: current tile57 bakes at
+	// the drawn scale (~0.354 of the historical linear size), so a 2x drawn-scale
+	// sprite still carries roughly half the pixel area of the old generic 1x
+	// sheet while materially improving edge/text/sounding sharpness.
+	sprite2xJSON, sprite2xPNG, err := tile57.BakeMapLibreSprite(
+		catalogDir,
+		2,
+		tile57.SchemeDay,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -43,6 +61,8 @@ func emitS101Assets(catalogDir, dir string) ([]string, error) {
 		{"linestyles.json", a.Linestyles},
 		{"sprite.json", spriteJSON},
 		{"sprite.png", spritePNG},
+		{"sprite@2x.json", sprite2xJSON},
+		{"sprite@2x.png", sprite2xPNG},
 		{"patterns.json", a.PatternJSON},
 		{"patterns.png", a.PatternPNG},
 	}
