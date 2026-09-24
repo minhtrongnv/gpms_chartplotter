@@ -136,12 +136,10 @@ export class HudController {
     // amber band. "No charts enabled" outranks it (nothing is drawing at all).
     const warn = this.root.getElementById("db-warn");
     if (!warn) return;
-    // Overscale compares the TRUE on-screen scale against the cell's compilation
-    // scale (CSCL) — both physical, real 1:N scales — so it reads the same physical
-    // denominator as the readout (dispDenom). The engine is now on one physical
-    // scale (no separate nominal coordinate), so ×n is literally how magnified the
-    // survey data is on glass: a 1:45k cell viewed at 1:26k shows ×1.7, in-band or
-    // not, which is the S-52 §10.1.10.1 intent.
+    // Overscale compares the deterministic chart-scale denominator against the
+    // cell's compilation scale (CSCL). This is the same fixed 0.2645 mm reference
+    // coordinate tile57 uses for SCAMIN, so every browser crosses the boundary at
+    // the same camera zoom/latitude.
     const f = this.coverScale && dispDenom < this.coverScale ? this.coverScale / dispDenom : 0;
     if (this.noChartsEnabled()) {
       warn.hidden = false;
@@ -191,7 +189,7 @@ export class HudController {
     this.coverScale = finestScale;
     const band = finest >= 0 ? BANDS[finest] : "general";
     // Detent right where overscale BEGINS for the covering chart: the zoom whose
-    // displayed (physical) scale equals the chart's compilation scale, coverScale.
+    // deterministic chart scale equals the chart's compilation scale, coverScale.
     // Zoom past it and dispDenom < coverScale → "Overscale ×N" (same test as the
     // warning above). Falls back to the band's native-max zoom when no per-chart
     // scale is known (e.g. server sets without the NOAA catalogue).
