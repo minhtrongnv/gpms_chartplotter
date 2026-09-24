@@ -599,6 +599,8 @@ var tile57PortrayalAssets = map[string]struct{}{
 	"linestyles.json":  {},
 	"sprite.json":      {},
 	"sprite.png":       {},
+	"sprite@2x.json":   {},
+	"sprite@2x.png":    {},
 	"patterns.json":    {},
 	"patterns.png":     {},
 }
@@ -614,7 +616,8 @@ func isTile57PortrayalAsset(name string) bool {
 // linked libtile57 style generator. They therefore take precedence over an
 // explicit --assets directory for those six files only. This prevents a stale
 // dev-time sprite.png/json (for example, from an older tile57 commit) from being
-// paired with a newer style whose atlas normalization changed.
+// paired with a newer style whose atlas normalization changed. The generated
+// 1x/2x sprite pairs are both covered by this rule.
 //
 // All other files keep the normal development precedence:
 //   1. explicit --assets dir
@@ -639,6 +642,10 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request) {
 	if isTile57PortrayalAsset(name) && s.assetsFallback != "" {
 		full := filepath.Join(s.assetsFallback, filepath.FromSlash(name))
 		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
+			// Portrayal files are regenerated on every server start. Force browser
+			// revalidation so a restarted/upgraded engine cannot keep using a stale
+			// sprite/style asset from disk cache.
+			w.Header().Set("Cache-Control", "no-cache")
 			s.serveFile(w, r, full, rel)
 			return
 		}
