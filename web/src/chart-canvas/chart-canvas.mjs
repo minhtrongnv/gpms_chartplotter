@@ -1809,8 +1809,8 @@ export class ChartCanvas extends HTMLElement {
   // Re-inject the current display-scale denominator (curDenom) into every gated chart
   // layer's SCAMIN clause, but ONLY when curDenom has crossed a SCAMIN-ladder boundary
   // since the last apply (≤19 boundaries across a full zoom sweep). curDenom is the
-  // physical display-scale denominator (zoom + lat + calibrated pxPitch — the same scale
-  // the HUD readout shows). This is the client half of scamin-layers.md.
+  // deterministic chart-scale denominator (zoom + latitude, fixed 0.2645 mm reference)
+  // used by both the HUD and tile57. This is the client half of scamin-layers.md.
   //
   // COST: each setFilter here makes MapLibre reload the layer's whole SOURCE (worker
   // re-parse of every loaded tile + symbol re-placement), so this must only run from
