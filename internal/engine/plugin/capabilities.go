@@ -399,7 +399,7 @@ func (b *brokerSession) handleHTTPFetch(m *Message) {
 	for k, v := range f.Headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := newPluginHTTPClient(grant).Do(req)
 	if err != nil {
 		b.replyErr(m.ID, CodeInternalError, "fetch: "+err.Error())
 		return
@@ -413,6 +413,34 @@ func (b *brokerSession) handleHTTPFetch(m *Message) {
 		}
 	}
 	b.reply(m.ID, HTTPResponse{Status: resp.StatusCode, Headers: hdr, Body: body})
+}
+
+func newPluginHTTPClient(grant Capability) *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(
+			req *http.Request,
+			via []*http.Request,
+		) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+
+			u := req.URL
+			if !matchHostAllow(
+				grant.Hosts,
+				u.Hostname(),
+				schemePort(u),
+			) {
+				return fmt.Errorf(
+					"redirect host %s not in the net.http allowlist",
+					u.Hostname(),
+				)
+			}
+
+			return nil
+		},
+	}
 }
 
 // schemePort returns the explicit port or the scheme default.
