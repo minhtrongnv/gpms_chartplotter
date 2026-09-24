@@ -377,6 +377,16 @@ func marinerFromQuery(q url.Values) tile57.Mariner {
 	boolP("displayBase", &m.DisplayBase)
 	boolP("displayStandard", &m.DisplayStandard)
 	boolP("displayOther", &m.DisplayOther)
+	// Spot soundings are intentionally independent of the OTHER category. The
+	// frontend exposes a plain bool; map it to tile57's tri-state so an omitted
+	// query keeps the engine's legacy/follow-category default.
+	if v := q.Get("showSoundings"); v != "" {
+		if v == "1" || v == "true" {
+			m.Soundings = tile57.SoundingsShow
+		} else {
+			m.Soundings = tile57.SoundingsHide
+		}
+	}
 	boolP("dataQuality", &m.DataQuality)
 	boolP("showInformCallouts", &m.ShowInformCallouts)
 	boolP("showMetaBounds", &m.ShowMetaBounds)
