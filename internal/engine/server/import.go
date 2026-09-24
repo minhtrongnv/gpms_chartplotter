@@ -784,15 +784,10 @@ func (s *Server) importEvents(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusNotFound, "unknown job")
 		return
 	}
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := sseStart(w)
 	if !ok {
-		apiErr(w, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
