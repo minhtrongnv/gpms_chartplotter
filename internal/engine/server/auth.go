@@ -39,6 +39,11 @@ func WithBearerAuth(
 		w http.ResponseWriter,
 		r *http.Request,
 	) {
+		// WithBearerAuth wraps Server, so rejected requests never reach
+		// Server.ServeHTTP. Apply the common headers here as well so 401 responses
+		// have the same browser hardening as successful responses.
+		setSecurityHeaders(w)
+
 		if isPublicProbe(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
@@ -53,6 +58,7 @@ func WithBearerAuth(
 				"WWW-Authenticate",
 				`Bearer realm="GPMS Chartplotter"`,
 			)
+			w.Header().Set("Cache-Control", "no-store")
 
 			http.Error(
 				w,
