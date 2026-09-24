@@ -63,7 +63,15 @@ func (s *Server) osmUserAgent() string {
 	return "chartplotter/" + v + " (+https://github.com/beetlebugorg/chartplotter)"
 }
 
-var osmClient = &http.Client{Timeout: 15 * time.Second}
+var osmClient = func() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxConnsPerHost = 16
+	transport.MaxIdleConnsPerHost = 8
+	return &http.Client{
+		Transport: transport,
+		Timeout:   15 * time.Second,
+	}
+}()
 
 // parseOSMPath pulls z/x/y out of "{z}/{x}/{y}[.png]".
 func parseOSMPath(rest string) (z, x, y int, ok bool) {
@@ -86,6 +94,10 @@ func parseOSMPath(rest string) (z, x, y int, ok bool) {
 	x, err2 = strconv.Atoi(parts[1])
 	y, err3 = strconv.Atoi(last)
 	if err1 != nil || err2 != nil || err3 != nil || z < 0 || z > 22 {
+		return 0, 0, 0, false
+	}
+	limit := 1 << z
+	if x < 0 || y < 0 || x >= limit || y >= limit {
 		return 0, 0, 0, false
 	}
 	return z, x, y, true
