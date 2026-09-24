@@ -1036,7 +1036,7 @@ export class ChartCanvas extends HTMLElement {
   //   setView({ lat, lng, scale, animate:true, duration:800 }) — fly instead of jump
   // `scale` is the paper-chart denominator (1:N) and is converted to the zoom that
   // yields that scale at the target latitude (web-Mercator scale is latitude-
-  // dependent), the inverse of the HUD's scale readout. `bearing`/`pitch` pass
+  // dependent), using the same deterministic chart-scale coordinate as the HUD. `bearing`/`pitch` pass
   // through. Omitted fields hold their current value. Returns the resolved
   // { center:[lng,lat], zoom }. The map's own max-zoom (scale floor) still
   // clamps an over-fine request, exactly as user zoom does.
@@ -1724,7 +1724,7 @@ export class ChartCanvas extends HTMLElement {
   // overlay churn, no flicker. A `rebuild` op (layer set changed) falls back to a full
   // re-fetch. Keeps _engineStyle current so a later full rebuild is correct.
   // DEBOUNCED trigger. The shell pushes several settings at boot (scheme, mariner,
-  // pxPitch) and a user can flip toggles fast; without coalescing, EACH call would fetch
+  // mariner toggles) and a user can flip toggles fast; without coalescing, EACH call would fetch
   // + apply a full diff — on the old bucket style that was ~1200 setFilter ops per call,
   // ×N calls = the "thousands of setFilter, page won't render" storm. Coalesce to ONE
   // diff against the last-applied mariner.
@@ -2037,7 +2037,7 @@ export class ChartCanvas extends HTMLElement {
       server: this._sources.server, serverSets: this._sources.sets,
       scaminValues: this._sources.scaminValues, scaminLat, bandsHidden: this._bandsHidden,
       bandsPresent: new Set(this._sources.loadedBands()),
-      ignoreScamin: this._ignoreScamin, sizeScale, pxPitch: this._pxPitch,
+      ignoreScamin: this._ignoreScamin, sizeScale,
     });
     this._layerBase = layerBase; this._variants = variants; this._layerVis = layerVis;
 
