@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"archive/zip"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -308,6 +309,50 @@ func TestVesselPublishDeltasMapping(t *testing.T) {
 	require.NotNil(t, snap.Navigation.Position)
 	require.InDelta(t, 48.1, snap.Navigation.Position.Lat, 1e-9)
 	require.Equal(t, "pluginX", store.Provenance()["navigation.sog"])
+}
+
+func TestLineLoggerBoundsUnterminatedLine(t *testing.T) {
+	var messages []string
+
+	logger := &lineLogger{
+		logf: func(level, msg string) {
+			messages = append(messages, msg)
+		},
+	}
+
+	payload := bytes.Repeat(
+		[]byte("x"),
+		maxPluginLogLine+1024,
+	)
+
+	n, err := logger.Write(payload)
+	require.NoError(t, err)
+	require.Equal(t, len(payload), n)
+	require.Len(t, logger.buf, 0)
+	require.True(t, logger.dropping)
+	require.Len(t, messages, 1)
+	require.Contains(t, messages[0], "[truncated]")
+
+	_, err = logger.Write([]byte("discard this\nok\n"))
+	require.NoError(t, err)
+	require.False(t, logger.dropping)
+	require.Equal(t, "ok", messages[len(messages)-1])
+}
+
+func TestPluginHandleTableIsBounded(t *testing.T) {
+	b := &brokerSession{
+		handles: map[int]*ioHandle{},
+	}
+
+	for i := 0; i < maxPluginHandles; i++ {
+		if _, ok := b.addHandle(&ioHandle{}); !ok {
+			t.Fatalf("handle %d should fit", i)
+		}
+	}
+
+	if _, ok := b.addHandle(&ioHandle{}); ok {
+		t.Fatal("expected handle table to reject overflow")
+	}
 }
 
 func TestParseBytes(t *testing.T) {
