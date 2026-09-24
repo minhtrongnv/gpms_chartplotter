@@ -14,9 +14,9 @@ export function loadJSON(key, fallback) {
 }
 
 // Legacy/reference Web-Mercator denominator using the OGC 0.28 mm rendering
-// pixel. Retained for bake/reference compatibility. The live chart HUD, SCAMIN,
-// overscale and go-to-scale use chartScaleDenom/zoomForChartScale below, which
-// intentionally share tile57's fixed 0.2645 mm CSS-reference pitch.
+// pixel. Retained only for compatibility/reference calculations. Live navigation
+// scale must use scaleDenomPhysical/zoomForScalePhysical with the calibrated
+// CSS-pixel pitch, matching OpenCPN's pixels-per-metre / map-ppm model.
 const M_PER_PX_Z0 = 78271.516964020485; // metres/CSS-px at z0, equator (512-tile)
 const OGC_PX_M = 0.00028; // 0.28 mm — the OGC "standardized rendering pixel"
 
@@ -34,9 +34,9 @@ export function zoomForScale(scale, lat) {
 }
 
 // --- SCREEN PHYSICAL CALIBRATION -------------------------------------------
-// Same 512-tile geometry, but with a per-screen measured CSS-pixel pitch. This is
-// screen-specific and is used only to make symbols/lines/text physically sized.
-// It is NOT the chart-scale coordinate used for HUD/SCAMIN/overscale.
+// Same 512-tile geometry, with the measured physical pitch of one CSS pixel.
+// This single screen-specific value drives the live 1:N coordinate AND physical
+// portrayal size: HUD, SCAMIN, overscale, go-to-scale, symbols, lines and text.
 // The default CSS reference pixel is 1/96 inch ≈ 0.2645 mm.
 export const DEFAULT_PX_PITCH_MM = 0.2645;
 export function clampPxPitch(mm) {
@@ -44,10 +44,10 @@ export function clampPxPitch(mm) {
   return isFinite(v) && v >= 0.05 && v <= 1 ? v : DEFAULT_PX_PITCH_MM;
 }
 
-// PHYSICAL paper-scale denominator — what a ruler laid on THIS calibrated screen
-// measures. This is screen-specific and is reserved for physical feature sizing /
-// calibration diagnostics; it is intentionally not the navigational chart 1:N
-// coordinate shown in the HUD.
+// True on-screen chart denominator — what a ruler laid on THIS calibrated screen
+// measures. OpenCPN computes the same quantity as screen pixels-per-metre divided
+// by map pixels-per-metre. MapLibre geometry is expressed in CSS pixels, therefore
+// pxPitchMm must also be mm/CSS-px (do NOT multiply screen.width by devicePixelRatio).
 export function scaleDenomPhysical(z, lat, pxPitchMm = DEFAULT_PX_PITCH_MM) {
   const mPerCssPx = M_PER_PX_Z0 * Math.cos((lat * Math.PI) / 180) / Math.pow(2, z);
   return mPerCssPx / (clampPxPitch(pxPitchMm) / 1000);
@@ -60,13 +60,10 @@ export function zoomForScalePhysical(scale, lat, pxPitchMm = DEFAULT_PX_PITCH_MM
 }
 
 
-// Deterministic chart-scale coordinate used by the HUD, SCAMIN, overscale,
-// go-to-scale and cross-browser comparisons. It intentionally uses the fixed
-// CSS-reference pitch shared with tile57 (0.2645 mm), NOT a per-screen
-// calibration. A monitor calibration is a rendering-size concern; letting it
-// change the navigational 1:N coordinate makes the same camera report different
-// scales in different browsers/origins and can disagree with tile57's static
-// zoom-gates.
+// Reference-screen helpers retained for callers that explicitly need the 96-DPI
+// CSS reference coordinate (for example baked/reference metadata). Do NOT use
+// these for live HUD/SCAMIN/overscale/go-to-scale; those must use the calibrated
+// physical helpers above.
 export function chartScaleDenom(z, lat) {
   return scaleDenomPhysical(z, lat, DEFAULT_PX_PITCH_MM);
 }
@@ -75,9 +72,9 @@ export function zoomForChartScale(scale, lat) {
   return zoomForScalePhysical(scale, lat, DEFAULT_PX_PITCH_MM);
 }
 
-// Finest deterministic chart scale we allow: don't magnify charts past
-// 1:MIN_DETAIL_SCALE. Callers use the default fixed 0.2645 mm reference so the cap
-// is identical across browsers/screens.
+// Finest physical chart scale we allow: don't magnify charts past
+// 1:MIN_DETAIL_SCALE. The live caller passes the calibrated screen pitch so the
+// limit is expressed in the same true 1:N coordinate as the HUD.
 export const MIN_DETAIL_SCALE = 4000;
 // A sliver of zoom headroom kept above the scale floor (set as the map's real
 // maxZoom in _applyScaleFloor) so the wheel-zoom handler can let a hard-in scroll
