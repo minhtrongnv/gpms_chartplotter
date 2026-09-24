@@ -106,6 +106,9 @@ func TestCommitStagedExchangeSetRemovesStaleUpdates(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dest, "US5MD1MC.001")); !os.IsNotExist(err) {
 		t.Fatalf("stale update survived replacement: %v", err)
 	}
+	if !s.providerDirty("user") {
+		t.Fatal("committed source change did not persist provider dirty marker")
+	}
 }
 
 func TestCloseCancelsTrackedImportJob(t *testing.T) {
