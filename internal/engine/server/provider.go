@@ -115,6 +115,37 @@ func (s *Server) installedProviders() []string {
 // re-gathered per provider bake).
 const districtCatFile = "_catalog.json"
 
+// rebake-needed is a durable source-dirty marker. Source ENC can be committed
+// immediately before a crash/shutdown; keeping this marker until registration
+// succeeds makes startup self-heal that provider even when old same-engine tiles
+// are still present and otherwise look current.
+const providerDirtyFile = ".rebake-needed"
+
+func (s *Server) providerDirtyPath(provider string) string {
+	return filepath.Join(s.providerDataDir(provider), providerDirtyFile)
+}
+
+func (s *Server) markProviderDirty(provider string) error {
+	if err := os.MkdirAll(s.providerDataDir(provider), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(
+		s.providerDirtyPath(provider),
+		[]byte("source ENC changed; provider needs bake\n"),
+		0o600,
+	)
+}
+
+func (s *Server) providerDirty(provider string) bool {
+	_, err := os.Stat(s.providerDirtyPath(provider))
+	return err == nil
+}
+
+func (s *Server) clearProviderDirty(provider string) {
+	_ = os.Remove(s.providerDirtyPath(provider))
+}
+
+
 // cacheDistrict writes one district's downloaded exchange-set content into its
 // ENC_ROOT subfolder: each cell FLAT as <STEM>.000 (+ .001… updates), aux content
 // files (TXTDSC/PICREP) flat beside them, and a _catalog.json of parsed titles. The
@@ -172,6 +203,7 @@ func (s *Server) cacheDistrict(provider, district string, cells map[string]baker
 		s.cellIdx.forget(stems) // re-imported cells: drop stale bounds so the rebuild re-parses
 		s.cellIdx.rebuild()     // re-index in the background (single-flight; a mid-scan rebuild re-runs)
 	}
+	_ = s.markProviderDirty(provider)
 }
 
 // providerAuxPaths is the disk-backed aux inventory used by the server bake path.
