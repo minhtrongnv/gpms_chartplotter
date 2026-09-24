@@ -74,23 +74,7 @@
        scripts/serve.sh / `zig build bake`) when nothing local is stored. Absent
        file → app just starts at the empty state. -->
   <div id="splash"><div class="spinner"></div><div>Loading charts…</div></div>
-  <script>
-    // Remove the splash once the map's first frame is up (the plotter fires a
-    // composed `ready` that bubbles to the document). Safety timeout guarantees we
-    // never trap the user behind it if `ready` never fires.
-    (function () {
-      var done = false;
-      function hide() {
-        if (done) return; done = true;
-        var s = document.getElementById("splash");
-        if (!s) return;
-        s.classList.add("hide");
-        setTimeout(function () { s.remove(); }, 500);
-      }
-      addEventListener("ready", hide, { once: true });
-      setTimeout(hide, 20000);
-    })();
-  </script>
+  <script src="./src/splash.js"></script>
 
   <chart-plotter pmtiles="charts.pmtiles" center="-76.4875,38.975" zoom="11"></chart-plotter>
 
