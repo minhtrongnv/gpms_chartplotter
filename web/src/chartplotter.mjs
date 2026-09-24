@@ -73,12 +73,11 @@ const DEFAULT_MARINER = {
   depthUnit: "ft", // US/NOAA preference (engine default DepthUnitFeet)
   // Display categories (S-52 §10.2). Base is the minimum safe-navigation set and
   // can NEVER be deselected by the mariner — it is forced on at boot. We default
-  // to the full "Other" display (all charted detail) — friendlier for a
-  // recreational plotter than the ECDIS Standard default; the mariner can drop
-  // back to Standard/Base in Display settings (detailLevel).
+  // to STANDARD + soundings ON, matching the common OpenCPN/ECDIS operating
+  // mode. The mariner can opt into Other explicitly from Detail level.
   displayBase: true,
   displayStandard: true,
-  displayOther: true,
+  displayOther: false,
   boundaryStyle: "symbolized", // IMO/S-52 default (vs "plain")
   simplifiedPoints: false,     // paper-chart point symbols (engine SimplifiedPoints=false)
   fourShadeWater: true,        // four depth shades (engine TwoShades=false)
@@ -86,9 +85,6 @@ const DEFAULT_MARINER = {
   showScaleBoundaries: false, // DATCVR §10.1.9.1 chart scale boundaries — off by default (opt-in)
   // Individually-selectable "Other" items (S-52/IMO), all default on.
   showSoundings: true,
-  // Recreational/demo density: keep more spot depths visible at coastal scales
-  // by ignoring SCAMIN for SOUNDG only. Other features remain normally gated.
-  denseSoundings: true,
   // Date-dependent display (S-52 §10.4.1.1, MANDATORY): show a dated feature only
   // when the viewing date is within its validity period. Default on (spec); set
   // false to show all dates regardless. dateView ("YYYYMMDD") pins a planning
@@ -286,6 +282,10 @@ export class ChartPlotter extends HTMLElement {
       this._mariner.textOther = false;
     }
     delete this._mariner.showNames;
+    // Dense soundings was a temporary demo-parity experiment that bypassed
+    // producer SCAMIN. Remove stale persisted values so normal OpenCPN-style
+    // scale gating is always restored.
+    delete this._mariner.denseSoundings;
     // S-52 §10.2: Display Base is the minimum safe-navigation set and can never
     // be deselected. Force it on regardless of any (stale) persisted value.
     this._mariner.displayBase = true;
