@@ -114,6 +114,13 @@ func TestServeTileSet(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("bad path: got %d, want 400", resp.StatusCode)
 	}
+
+	// x/y must be inside the XYZ matrix for the requested zoom.
+	resp, _ = http.Get(ts.URL + "/tiles/charts/8/256/20.mvt")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("out-of-range x: got %d, want 400", resp.StatusCode)
+	}
 }
 
 // TestServeTileGzip checks the wire gzip path round-trips to the same MVT body.
