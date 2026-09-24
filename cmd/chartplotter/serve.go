@@ -61,7 +61,7 @@ func resolveServeAccessPolicy(
 	// no mode + no proxy flags means offline/local; the old trusted-proxy +
 	// --trust-cloudflare form is treated as Cloudflare Tunnel mode.
 	if mode == "" {
-		if proxyConfigured || trustCloudflareFlag {
+		if trustCloudflareFlag {
 			mode = accessModeCloudflare
 		} else {
 			mode = accessModeLocal
