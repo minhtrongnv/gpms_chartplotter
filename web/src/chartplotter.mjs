@@ -2005,15 +2005,21 @@ export class ChartPlotter extends HTMLElement {
     };
   }
 
-  // Set (or clear) this SCREEN's calibrated CSS-pixel pitch (mm). Calibration is
-  // deliberately local-only: it changes the physical size of symbols/lines/text on
-  // this monitor, but never the deterministic chart 1:N coordinate used by HUD,
-  // SCAMIN, overscale or go-to-scale.
+  // Set (or clear) THIS screen's physical CSS-pixel pitch (mm). Like OpenCPN's
+  // Physical Screen Width, this drives both true on-screen 1:N scale and physical
+  // S-52 object sizes. It is deliberately local-only because different monitors
+  // can have different pixels/mm.
   setPxPitch(mm) {
     this._pxPitch = (typeof mm === "number" && mm > 0) ? mm : undefined;
     try { localStorage.setItem(LS_PX_PITCH, JSON.stringify(this._pxPitch ?? null)); } catch (e) { /* quota/private */ }
-    // Re-render features at true physical size for the new pitch (icons/lines/text).
-    if (this._plotter && this._plotter.setPxPitch) { try { this._plotter.setPxPitch(this._pxPitch); } catch (e) { console.warn(e); } }
+    if (this._plotter && this._plotter.setPxPitch) {
+      try { this._plotter.setPxPitch(this._pxPitch); } catch (e) { console.warn(e); }
+    }
+    if (this._hud) {
+      this._hud.updateHud();
+      this._hud.updateZoomCap();
+    }
+    void this._applyScaleFloor();
   }
 
   // Fetch the server-persisted display settings at boot and adopt them over the
