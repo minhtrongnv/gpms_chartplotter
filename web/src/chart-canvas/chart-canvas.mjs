@@ -282,13 +282,17 @@ export class ChartCanvas extends HTMLElement {
       return r.json();
     };
 
-    // Prefer the standard 2x atlas on HiDPI/scaled displays. The @2x metadata
-    // carries pixelRatio=2, so logical chart-symbol dimensions remain identical;
-    // only the sampled raster density doubles. Hosted/older bundles without @2x
-    // transparently fall back to the 1x pair.
+    // Prefer the standard 2x atlas even on a 1x display. The old hosted demo
+    // effectively supersampled symbols (a much larger source atlas scaled down),
+    // which is one reason its edges looked cleaner. Current tile57's drawn-scale
+    // atlas is dramatically smaller, so 2x restores useful sampling headroom while
+    // still staying well below the historical generic-atlas pixel cost.
+    //
+    // pixelRatio=2 keeps the LOGICAL/physical S-52 size identical. ?sprite1x
+    // is an escape hatch for unusually memory-constrained ship hardware.
     const loadSpritePair = async () => {
-      const prefer2x = (window.devicePixelRatio || 1) > 1;
-      const bases = prefer2x ? ["sprite@2x", "sprite"] : ["sprite"];
+      const force1x = new URLSearchParams(location.search).has("sprite1x");
+      const bases = force1x ? ["sprite"] : ["sprite@2x", "sprite"];
       let lastErr = null;
 
       for (const base of bases) {
