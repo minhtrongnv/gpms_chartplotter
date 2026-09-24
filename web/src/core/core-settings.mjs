@@ -141,7 +141,6 @@ export function coreSettingsContributions(app) {
       { key: "fourShadeWater", type: "toggle", label: "Four-shade water", desc: "Use four depth shades instead of two", default: true },
       { key: "shallowPattern", type: "toggle", label: "Shallow pattern", desc: "Diagonal fill in shallow water" },
       { key: "showSoundings", type: "toggle", label: "Spot soundings", desc: "Individual depth soundings", default: true },
-      { key: "denseSoundings", type: "toggle", label: "Dense soundings", desc: "Show more spot depths at coastal scales (demo-style; uses more screen/GPU detail)", default: true },
       { key: "showNoData", type: "toggle", label: "No-data hatch", desc: "Hatch areas that have no chart data", default: true },
     ],
   };
