@@ -37,6 +37,22 @@ type serveCmd struct {
 	S101FC string `name:"s101-fc" type:"existingfile" help:"S-101 FeatureCatalogue.xml path (with --s101)."`
 }
 
+
+func requiresAccessToken(
+	allowRemote bool,
+	trustedProxies string,
+	trustCloudflare bool,
+) bool {
+	if !allowRemote {
+		return false
+	}
+
+	return !(
+		trustCloudflare &&
+			strings.TrimSpace(trustedProxies) != ""
+	)
+}
+
 func (c serveCmd) Run() error {
 	// Portrayal is S-101. Emit the client assets
 	// (colortables/linestyles/sprite/patterns) via libtile57's
@@ -125,11 +141,7 @@ func (c serveCmd) Run() error {
 		os.Getenv("CHARTPLOTTER_ACCESS_TOKEN"),
 	)
 
-	if allowRemote && accessToken == "" {
-		return fmt.Errorf(
-			"CHARTPLOTTER_ACCESS_TOKEN is required when binding to a non-loopback host",
-		)
-	}
+	proxyConfigured := strings.TrimSpace(c.TrustedProxies) != ""
 
 	// CF-Connecting-IP is only meaningful when the immediate
 	// peer itself is an explicitly trusted proxy.
@@ -137,11 +149,27 @@ func (c serveCmd) Run() error {
 	// Requiring --trusted-proxies together with
 	// --trust-cloudflare prevents accidentally trusting a
 	// caller-supplied CF-Connecting-IP header.
-	if c.TrustCloudflare &&
-		strings.TrimSpace(c.TrustedProxies) == "" {
-
+	if c.TrustCloudflare && !proxyConfigured {
 		return fmt.Errorf(
 			"--trust-cloudflare requires --trusted-proxies",
+		)
+	}
+
+	cloudflareTunnelMode := c.TrustCloudflare && proxyConfigured
+
+	// Direct non-loopback exposure still requires application-level bearer
+	// authentication. A deliberately configured Cloudflare Tunnel is the
+	// exception: browser authentication may be left public at Cloudflare or
+	// restricted dynamically with Cloudflare Access without changing this
+	// process. The trusted-proxy requirement prevents an arbitrary client from
+	// enabling tunnel semantics merely by sending Cloudflare headers.
+	if requiresAccessToken(
+		allowRemote,
+		c.TrustedProxies,
+		c.TrustCloudflare,
+	) && accessToken == "" {
+		return fmt.Errorf(
+			"CHARTPLOTTER_ACCESS_TOKEN is required for direct non-loopback exposure",
 		)
 	}
 
@@ -196,6 +224,10 @@ func (c serveCmd) Run() error {
 
 		appLog.Println(
 			"Bearer authentication enabled",
+		)
+	} else if cloudflareTunnelMode {
+		appLog.Println(
+			"Bearer authentication disabled (trusted Cloudflare Tunnel mode)",
 		)
 	} else {
 		appLog.Println(
