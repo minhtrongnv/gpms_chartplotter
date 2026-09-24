@@ -97,7 +97,7 @@ func TestResolveServeAccessPolicy(t *testing.T) {
 				t.Fatalf(
 					"mode = %q, want %q",
 					got.mode,
-					t.wantMode,
+					tt.wantMode,
 				)
 			}
 
@@ -105,7 +105,7 @@ func TestResolveServeAccessPolicy(t *testing.T) {
 				t.Fatalf(
 					"trustCloudflare = %v, want %v",
 					got.trustCloudflare,
-					t.wantTrustCF,
+					tt.wantTrustCF,
 				)
 			}
 		})
