@@ -60,13 +60,47 @@ export class SpriteBuilder {
       : this.centredSymbol(id);
   }
 
+  // MapLibre's addImage pixelRatio is part of the symbol's geometry contract:
+  // 2x bitmap pixels must be registered as pixelRatio=2 or the symbol becomes
+  // physically twice as large. Keep it separate from ImageData so the synthesis
+  // hot path can continue returning a plain ImageData.
+  pixelRatioFor(id) {
+    if (id.startsWith("ctr:")) {
+      return (this._cell(id) || this._cell(id.slice(4)))?.pixelRatio || 1;
+    }
+    if (id.startsWith("snd:")) {
+      return this._ratioForNames(this._soundingNamesForId(id));
+    }
+    if (id.indexOf(",") >= 0) return this._ratioForNames(id);
+    return this._cell(id)?.pixelRatio || 1;
+  }
+
+  _ratioForNames(namesStr) {
+    for (const name of String(namesStr || "").split(",")) {
+      const c = this._cell(name);
+      if (c) return c.pixelRatio || 1;
+    }
+    return 1;
+  }
+
+  _soundingNamesForId(id) {
+    const [, unit, pal, dm] = id.split(":");
+    const meters = (parseInt(dm, 10) || 0) / 10;
+    const value = unit === "ft" ? Math.abs(meters) * M_TO_FT : Math.abs(meters);
+    let names = this.soundingGlyphs(Math.round(value), pal === "G" ? "G" : "S");
+    if (meters < 0) names = "SOUNDSA1," + names;
+    return names;
+  }
+
   // centredGlyph centres the GLYPH's bounding box on the point, ignoring the
   // catalogue pivot — used for a lone centred-area symbol (pivot_center) whose
   // corner pivot would otherwise throw the glyph far off its area. The rendered
   // cell is the glyph cropped to its content, so drawing it into a w×h canvas and
   // letting MapLibre centre that canvas puts the glyph centre on the point.
   centredGlyph(name) {
-    const c = this._cell(name);
+    // Current tile57 emits a dedicated bbox-centred "ctr:<id>" cell. Prefer it
+    // directly; legacy/custom atlases did not, so retain the plain-cell fallback.
+    const c = this._cell("ctr:" + name) || this._cell(name);
     if (!c) return null;
     return this.rawCell(this.spriteImg, c);
   }
@@ -77,12 +111,7 @@ export class SpriteBuilder {
   // the metres compositor. Quality/drying markers (QUASOU) aren't carried in the
   // numeric depth, so imperial soundings are the plain number (+ drying marker).
   synthSounding(id) {
-    const [, unit, pal, dm] = id.split(":");           // ["snd","ft","S","123"]
-    const meters = (parseInt(dm, 10) || 0) / 10;
-    const value = unit === "ft" ? Math.abs(meters) * M_TO_FT : Math.abs(meters);
-    let names = this.soundingGlyphs(Math.round(value), pal === "G" ? "G" : "S");
-    if (meters < 0) names = "SOUNDSA1," + names;        // drying-height marker (always bold)
-    return this.compositeSounding(names);
+    return this.compositeSounding(this._soundingNamesForId(id));
   }
 
   // S-52 SNDFRM04 whole-number column classes → a comma-joined glyph list. Each
