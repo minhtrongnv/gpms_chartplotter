@@ -536,7 +536,7 @@ export class ChartPlotter extends HTMLElement {
     // Cap the fly target at the destination's scale floor (not a raw z18) so we
     // never overshoot it and snap back when moveend re-applies the floor.
     const destLat = cam ? cam.center.lat : (s + n) / 2;
-    const zoom = Math.min(maxZoomForScaleFloor(destLat), Math.max(cam ? cam.zoom : Math.max(need, 9), need));
+    const zoom = Math.min(maxZoomForScaleFloor(destLat, this._pxPitch), Math.max(cam ? cam.zoom : Math.max(need, 9), need));
     // Raise the dynamic zoom cap to the target FIRST — we're flying from open water
     // (low cap, set at the prior latitude) into the pack's coverage, so without this
     // the fly clamps short and a berthing-only set wouldn't reach the zoom where it
@@ -1590,7 +1590,7 @@ export class ChartPlotter extends HTMLElement {
     if (!this._map) return;
     // FLOOR_GIVE headroom above the floor so WheelZoom can let a hard-in scroll
     // over-pull a hair past it and settle back (a stop with give, not a wall).
-    let mz = maxZoomForScaleFloor(this._map.getCenter().lat) + FLOOR_GIVE;
+    let mz = maxZoomForScaleFloor(this._map.getCenter().lat, this._pxPitch) + FLOOR_GIVE;
     const c = this._map.getCenter();
     const band = this._finestBandAt(c.lng, c.lat);
     if (band) {
