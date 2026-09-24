@@ -5,7 +5,6 @@ import (
 	"context"
 	"bytes"
 	"fmt"
-	"io"
 	"io/fs"
 	"net/http"
 	"os"
