@@ -50,7 +50,7 @@
 // Baking runs server-side; the client only renders tiles.
 import { PMTilesArchive, registerPmtilesProtocol } from "./pmtiles-source.mjs";
 import { convertDistance, unitSuffix } from "../lib/units.mjs";
-import { zoomForScale, scaleDenomPhysical, DEFAULT_PX_PITCH_MM, clampPxPitch } from "../lib/util.mjs"; // shared scale↔zoom (512-tile MapLibre resolution)
+import { zoomForChartScale, chartScaleDenom, DEFAULT_PX_PITCH_MM, clampPxPitch } from "../lib/util.mjs"; // deterministic chart scale + per-screen feature sizing
 import * as S52 from "./s52-style.mjs";
 import { SpriteBuilder } from "./sprite-builder.mjs";
 // Chart SOURCE / ARCHIVE management lives in its own stateful collaborator now (the
@@ -1049,7 +1049,7 @@ export class ChartCanvas extends HTMLElement {
     // cos(φ) negative and yield a NaN zoom (and so the centre is itself valid).
     const la = Math.max(-85.051129, Math.min(85.051129, Number.isFinite(lat) ? lat : c.lat));
     const lo = Number.isFinite(lng) ? lng : c.lng;
-    let z = Number.isFinite(zoom) ? zoom : (Number.isFinite(scale) ? zoomForScale(scale, la) : map.getZoom());
+    let z = Number.isFinite(zoom) ? zoom : (Number.isFinite(scale) ? zoomForChartScale(scale, la) : map.getZoom());
     const cam = { center: [lo, la], zoom: z };
     if (Number.isFinite(bearing)) cam.bearing = bearing;
     if (Number.isFinite(pitch)) cam.pitch = pitch;
@@ -1830,7 +1830,7 @@ export class ChartCanvas extends HTMLElement {
     // Engine mode gets the ladder from the tile57 set TileJSON; the JS builder gets it
     // from the chart-source manager (values discovered from the loaded tiles' manifest).
     const values = this._engineMode ? this._engineScaminValues : ((this._sources && this._sources.scaminValues) || []);
-    const denom = scaleDenomPhysical(this._map.getZoom(), this._map.getCenter().lat, this._pxPitch);
+    const denom = chartScaleDenom(this._map.getZoom(), this._map.getCenter().lat);
     let band = 0;
     for (const v of values) if (v < denom) band++;
     // Mid-gesture (the `move` hook) crossings get a LIGHT apply: sync the new cutoff
