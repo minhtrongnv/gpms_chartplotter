@@ -155,70 +155,132 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusMethodNotAllowed, "POST /api/import")
 		return
 	}
-	// JSON body → server-side fetch+bake (the download path: the server pulls the
-	// cells from NOAA itself rather than the client downloading + re-uploading).
 	if strings.HasPrefix(r.Header.Get("Content-Type"), jsonCT) {
 		s.handleImportFetch(w, r)
 		return
 	}
 
-	// Bound the complete upload request before multipart parsing. FormFile would
-	// otherwise parse/spill an arbitrarily large multipart body before the
-	// individual file-size check below gets a chance to run.
-	r.Body = http.MaxBytesReader(
-		w,
-		r.Body,
-		maxImportRequestBytes,
-	)
+	r.Body = http.MaxBytesReader(w, r.Body, maxImportRequestBytes)
 
 	set := r.URL.Query().Get("set")
-	// "auto" (or empty) means "name this upload from its CATALOG identity" — the
-	// one-district-per-upload path (under the "user" provider). The real name is
-	// derived below, after the zip is parsed (we need its catalogue / cell names first).
 	autoName := set == "" || set == "auto"
 	if !autoName && !isSetName(set) {
 		apiErr(w, http.StatusBadRequest, "set must be a valid name")
 		return
 	}
-	applyUpdates := r.URL.Query().Get("updates") != "0" // default: apply .001+ (NtM corrections)
+	applyUpdates := r.URL.Query().Get("updates") != "0"
 
-	cells, aux, cat, err := s.importInputs(r)
+	// ZIP uploads are spooled to disk, then each selected entry is streamed into a
+	// disk staging directory. This keeps peak RAM independent of the exchange-set
+	// size (the previous path held the compressed ZIP plus all expanded cells).
+	provider := "user"
+	if !autoName {
+		provider = providerOf(set)
+	}
+	spooled, size, err := s.spoolImportRequest(r.Context(), r, provider)
 	if err != nil {
 		writeJSONBodyError(w, err)
 		return
 	}
-	// No cells supplied in the request → re-bake the provider from its cached ENC_ROOT
-	// (a cache re-bake; ?set names the provider, e.g. "noaa").
-	if len(cells) == 0 {
-		provider := providerOf(set)
-		if autoName || len(s.providerDistricts(provider)) == 0 {
+	if spooled != "" {
+		defer os.Remove(spooled)
+	}
+
+	if size > 0 && fileIsZip(spooled) {
+		stage, err := s.stageExchangeSetZip(
+			r.Context(),
+			spooled,
+			provider,
+			nil,
+			applyUpdates,
+		)
+		if err != nil {
+			writeJSONBodyError(w, err)
+			return
+		}
+		defer os.RemoveAll(stage.dir)
+		if len(stage.stems) == 0 {
 			apiErr(w, http.StatusBadRequest, "no ENC base cells (.000) in input")
 			return
 		}
-		job := s.imports.create(provider)
-		go s.runImport(job.ID, provider)
+
+		if autoName {
+			set = s.deriveUploadSetFromStems(stage.catalog, stage.stems)
+		}
+		provider = providerOf(set)
+		district := districtOf(set)
+		if district == "" {
+			district = provider
+		}
+		if err := s.commitStagedExchangeSet(
+			r.Context(),
+			provider,
+			district,
+			stage,
+		); err != nil {
+			apiErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		job, ok := s.startImportJob(provider, func(ctx context.Context, jobID string) {
+			s.runImport(ctx, jobID, provider)
+		})
+		if !ok {
+			apiErr(w, http.StatusServiceUnavailable, "server shutting down")
+			return
+		}
 		w.Header().Set("Content-Type", jsonCT)
 		w.WriteHeader(http.StatusAccepted)
 		fmt.Fprintf(w, `{"ok":true,"job":%q,"set":%q}`, job.ID, provider)
 		return
 	}
-	if autoName {
-		set = s.deriveUploadSet(cat, cells)
-	}
-	if !applyUpdates { // bake the base .000 edition — persist base-only so the disk-read bake matches
-		cells = baseOnly(cells)
-	}
-	// Persist the cells into the district's ENC_ROOT subfolder now that the name is
-	// known, then bake the whole provider (all districts) into its one archive.
-	provider, district := providerOf(set), districtOf(set)
-	if district == "" {
-		district = provider // a bare-provider upload → one district named for the provider
-	}
-	s.cacheDistrict(provider, district, cells, aux, cat)
 
-	job := s.imports.create(provider)
-	go s.runImport(job.ID, provider)
+	// No ZIP body: retain the legacy loose-cell / provider re-bake paths. These
+	// operate on already-cached source files and therefore do not need a giant
+	// request-sized buffer.
+	if csv := r.URL.Query().Get("cells"); csv != "" {
+		cells := s.looseCellData(csv)
+		if len(cells) == 0 {
+			apiErr(w, http.StatusBadRequest, "no ENC base cells (.000) in input")
+			return
+		}
+		if autoName {
+			set = s.deriveUploadSet(nil, cells)
+		}
+		if !applyUpdates {
+			cells = baseOnly(cells)
+		}
+		provider = providerOf(set)
+		district := districtOf(set)
+		if district == "" {
+			district = provider
+		}
+		s.cacheDistrict(provider, district, cells, nil, nil)
+		job, ok := s.startImportJob(provider, func(ctx context.Context, jobID string) {
+			s.runImport(ctx, jobID, provider)
+		})
+		if !ok {
+			apiErr(w, http.StatusServiceUnavailable, "server shutting down")
+			return
+		}
+		w.Header().Set("Content-Type", jsonCT)
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `{"ok":true,"job":%q,"set":%q}`, job.ID, provider)
+		return
+	}
 
+	provider = providerOf(set)
+	if autoName || len(s.providerDistricts(provider)) == 0 {
+		apiErr(w, http.StatusBadRequest, "no ENC base cells (.000) in input")
+		return
+	}
+	job, ok := s.startImportJob(provider, func(ctx context.Context, jobID string) {
+		s.runImport(ctx, jobID, provider)
+	})
+	if !ok {
+		apiErr(w, http.StatusServiceUnavailable, "server shutting down")
+		return
+	}
 	w.Header().Set("Content-Type", jsonCT)
 	w.WriteHeader(http.StatusAccepted)
 	fmt.Fprintf(w, `{"ok":true,"job":%q,"set":%q}`, job.ID, provider)
@@ -229,12 +291,16 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 // shared prefix when there's no catalogue, then to "upload". Every upload is a DISTRICT
 // under the "user" provider ("user-<id>"), uniquified against existing user districts.
 func (s *Server) deriveUploadSet(cat []tile57.CatalogEntry, cells map[string]baker.CellData) string {
+	stems := make([]string, 0, len(cells))
+	for n := range cells {
+		stems = append(stems, strings.TrimSuffix(n, ".000"))
+	}
+	return s.deriveUploadSetFromStems(cat, stems)
+}
+
+func (s *Server) deriveUploadSetFromStems(cat []tile57.CatalogEntry, stems []string) string {
 	id := catalogPackIdentity(cat)
 	if id == "" {
-		stems := make([]string, 0, len(cells))
-		for n := range cells {
-			stems = append(stems, strings.TrimSuffix(n, ".000"))
-		}
 		id = commonPrefixIdentity(stems)
 	}
 	if id == "" {
@@ -307,105 +373,162 @@ func (s *Server) handleImportFetch(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusBadRequest, "zipUrl must be a charts.noaa.gov or ienccloud.us URL")
 		return
 	}
-	for _, c := range req.Cells {
-		if c.URL != "" && !isChartURL(c.URL) {
-			apiErr(w, http.StatusBadRequest, "cell url must be a charts.noaa.gov or ienccloud.us URL")
+	for _, cell := range req.Cells {
+		if cell.URL != "" && !isChartURL(cell.URL) {
+			apiErr(w, http.StatusBadRequest, "cell url must be from a charts.noaa.gov or ienccloud.us URL")
 			return
 		}
 	}
 
-	job := s.imports.create(req.Set)
-	go s.runImportFetch(job.ID, req)
+	job, ok := s.startImportJob(req.Set, func(ctx context.Context, jobID string) {
+		s.runImportFetch(ctx, jobID, req)
+	})
+	if !ok {
+		apiErr(w, http.StatusServiceUnavailable, "server shutting down")
+		return
+	}
 
 	w.Header().Set("Content-Type", jsonCT)
 	w.WriteHeader(http.StatusAccepted)
 	fmt.Fprintf(w, `{"ok":true,"job":%q,"set":%q}`, job.ID, req.Set)
 }
 
-// runImportFetch downloads the requested cells from NOAA into the district's ENC_ROOT
-// subfolder (reporting download progress on the job), then bakes + registers the
-// provider (its whole ENC_ROOT) as one archive.
-func (s *Server) runImportFetch(jobID string, req importFetchReq) {
+func (s *Server) runImportFetch(
+	ctx context.Context,
+	jobID string,
+	req importFetchReq,
+) {
 	fail := func(err error) {
 		log.Printf("import %s (%s): %v", jobID, req.Set, err)
-		s.imports.update(jobID, func(j *importJob) { j.State = "error"; j.Err = err.Error() })
+		s.imports.update(jobID, func(j *importJob) {
+			if j.State == "running" {
+				j.State = "error"
+				j.Err = err.Error()
+			}
+		})
 	}
-	applyUpdates := req.Updates == nil || *req.Updates // default: apply .001+
+	applyUpdates := req.Updates == nil || *req.Updates
 	provider, district := providerOf(req.Set), districtOf(req.Set)
 	if district == "" {
 		district = provider
 	}
 
-	var cells map[string]baker.CellData
-	var aux map[string][]byte
-	var cat []tile57.CatalogEntry
-
+	cellCount := 0
 	if req.ZipURL != "" {
-		// Bulk: stream the one zip (byte progress), then extract + cache its cells.
 		name := req.ZipURL[strings.LastIndexByte(req.ZipURL, '/')+1:]
 		s.imports.update(jobID, func(j *importJob) {
-			j.Phase, j.Unit, j.Note, j.Done, j.Total = "download", "bytes", "Downloading "+name, 0, 0
+			j.Phase, j.Unit, j.Note, j.Done, j.Total =
+				"download", "bytes", "Downloading "+name, 0, 0
 		})
-		data, err := fetchURLProgress(req.ZipURL, func(done, total int) {
-			s.imports.update(jobID, func(j *importJob) { j.Done, j.Total = done, total })
-		})
+		zipPath, err := s.downloadURLToTemp(
+			ctx,
+			req.ZipURL,
+			provider,
+			func(done, total int) {
+				s.imports.update(jobID, func(j *importJob) {
+					j.Done, j.Total = done, total
+				})
+			},
+		)
 		if err != nil {
-			fail(fmt.Errorf("download %s: %w", req.ZipURL, err))
+			if ctx.Err() == nil {
+				fail(fmt.Errorf("download %s: %w", req.ZipURL, err))
+			}
 			return
 		}
+		defer os.Remove(zipPath)
+
 		s.imports.update(jobID, func(j *importJob) {
-			j.Phase, j.Unit, j.Note, j.Done, j.Total = "extract", "cells", "Extracting "+name, 0, 0
+			j.Phase, j.Unit, j.Note, j.Done, j.Total =
+				"extract", "cells", "Extracting "+name, 0, 0
 		})
-		cells, aux, cat, err = extractZipCells(data)
+		stage, err := s.stageExchangeSetZip(
+			ctx,
+			zipPath,
+			provider,
+			req.Names,
+			applyUpdates,
+		)
 		if err != nil {
-			fail(err)
+			if ctx.Err() == nil {
+				fail(err)
+			}
 			return
 		}
-		if len(req.Names) > 0 {
-			cells = filterCells(cells, req.Names)
+		defer os.RemoveAll(stage.dir)
+		if len(stage.stems) == 0 {
+			fail(fmt.Errorf("no cells downloaded"))
+			return
 		}
-		if !applyUpdates {
-			cells = baseOnly(cells)
+		if err := s.commitStagedExchangeSet(
+			ctx,
+			provider,
+			district,
+			stage,
+		); err != nil {
+			if ctx.Err() == nil {
+				fail(err)
+			}
+			return
 		}
-		// Persist the extracted cells to the district's ENC_ROOT subfolder (the bake reads them there).
-		s.cacheDistrict(provider, district, cells, aux, cat)
+		cellCount = len(stage.stems)
 	} else {
-		// Per-cell: download each into the district's ENC_ROOT subfolder, then bake from there.
-		cells = map[string]baker.CellData{}
 		total := len(req.Cells)
-		s.imports.update(jobID, func(j *importJob) { j.Phase, j.Unit, j.Total = "download", "cells", total })
-		for i, c := range req.Cells {
-			if !isCellName(c.Name) {
+		s.imports.update(jobID, func(j *importJob) {
+			j.Phase, j.Unit, j.Total = "download", "cells", total
+		})
+		for i, cell := range req.Cells {
+			if err := ctx.Err(); err != nil {
+				return
+			}
+			if !isCellName(cell.Name) {
 				continue
 			}
-			// SSRF guard: skip any cell whose download URL no provider handles.
-			if c.URL != "" && !allowedChartURL(c.URL) {
-				log.Printf("import %s: skip %s: disallowed url", jobID, c.Name)
+			if cell.URL != "" && !allowedChartURL(cell.URL) {
+				log.Printf("import %s: skip %s: disallowed url", jobID, cell.Name)
 				continue
 			}
-			s.imports.update(jobID, func(j *importJob) { j.Note = "Downloading " + c.Name; j.Done = i })
-			base, _, err := loadCellCached(chartHTTPClient, s.districtDir(provider, district), c.Name, c.URL)
+			s.imports.update(jobID, func(j *importJob) {
+				j.Note = "Downloading " + cell.Name
+				j.Done = i
+			})
+			_, _, err := loadCellCachedContext(
+				ctx,
+				chartHTTPClient,
+				s.districtDir(provider, district),
+				cell.Name,
+				cell.URL,
+			)
 			if err != nil {
-				log.Printf("import %s: download %s: %v", jobID, c.Name, err) // skip, keep going
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("import %s: download %s: %v", jobID, cell.Name, err)
 			} else {
-				cells[c.Name+".000"] = baker.CellData{Base: base}
+				cellCount++
 			}
 			s.imports.update(jobID, func(j *importJob) { j.Done = i + 1 })
 		}
 	}
 
-	if len(cells) == 0 {
+	if cellCount == 0 {
 		fail(fmt.Errorf("no cells downloaded"))
 		return
 	}
-	// Download-only: the cells are now cached in the district's ENC_ROOT subfolder; the
-	// client triggers the bake separately (e.g. via /api/import/packs). Done.
 	if req.DownloadOnly {
-		log.Printf("import %s: downloaded %d cell(s) into %s", jobID, len(cells), s.districtDir(provider, district))
-		s.imports.update(jobID, func(j *importJob) { j.Cells = len(cells); j.State = "done" })
+		log.Printf(
+			"import %s: downloaded %d cell(s) into %s",
+			jobID,
+			cellCount,
+			s.districtDir(provider, district),
+		)
+		s.imports.update(jobID, func(j *importJob) {
+			j.Cells = cellCount
+			j.State = "done"
+		})
 		return
 	}
-	s.bakeAndRegister(jobID, provider)
+	s.bakeAndRegister(ctx, jobID, provider)
 }
 
 // baseOnly returns cells with their .001+ updates dropped — for a base-.000-edition
@@ -661,16 +784,22 @@ func readImportBytes(r io.Reader, maxBytes int64) ([]byte, error) {
 // runImport (re-)bakes the provider's whole ENC_ROOT into its one archive and registers
 // it — the shared tail for every single-set import path (upload, loose cells, cache
 // re-bake). The cells are already persisted under the provider's ENC_ROOT.
-func (s *Server) runImport(jobID, provider string) {
-	s.bakeAndRegister(jobID, provider)
+func (s *Server) runImport(ctx context.Context, jobID, provider string) {
+	s.bakeAndRegister(ctx, jobID, provider)
 }
 
 // bakeAndRegister bakes a provider (its whole ENC_ROOT) into ONE archive and records
-// the terminal job state. Serializes with the packs path — a bake rewrites bundle
-// output in place, which concurrent bakes must not interleave.
-func (s *Server) bakeAndRegister(jobID, provider string) {
+// the terminal job state. The native bake itself is not cancellable yet, so shutdown
+// checks the context before entering it and then waits for an already-running bake.
+func (s *Server) bakeAndRegister(ctx context.Context, jobID, provider string) {
+	if ctx.Err() != nil {
+		return
+	}
 	s.bakeMu.Lock()
 	defer s.bakeMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 	if s.bakeProvider(jobID, provider) {
 		s.imports.update(jobID, func(j *importJob) { j.State = "done" })
 	}
