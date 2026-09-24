@@ -137,6 +137,10 @@ func (s *Server) SetReady(ready bool) {
 func (s *Server) rebakeMissingProviders() {
 	var missing []string
 	for _, prov := range s.installedProviders() {
+		if s.providerDirty(prov) {
+			missing = append(missing, prov)
+			continue
+		}
 		if _, live := s.sets.get(prov); live {
 			// Serving, but from another engine build's archives: re-bake to a staging
 			// tree and swap when done (prepareLiveProvider) — the old tiles keep
