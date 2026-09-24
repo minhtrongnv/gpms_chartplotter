@@ -221,6 +221,10 @@ func parseTileSetPath(rest string) (set string, z, x, y uint32, ok bool) {
 	if e1 != nil || e2 != nil || e3 != nil || zi > 24 {
 		return "", 0, 0, 0, false
 	}
+	limit := uint64(1) << zi
+	if xi >= limit || yi >= limit {
+		return "", 0, 0, 0, false
+	}
 	return set, uint32(zi), uint32(xi), uint32(yi), true
 }
 
