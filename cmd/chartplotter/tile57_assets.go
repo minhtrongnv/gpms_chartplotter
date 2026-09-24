@@ -77,6 +77,40 @@ func emitS101Assets(catalogDir, dir string) ([]string, error) {
 		}
 		written = append(written, p)
 	}
+
+	// The engine style uses real Regular/Bold/Italic label tiers. Generate the
+	// same MapLibre glyph-PBF ranges from libtile57's embedded faces so the web
+	// renderer never falls back to browser-local glyph rendering (and so all
+	// portrayal assets stay coherent with this exact engine build).
+	glyphFaces := []struct {
+		name string
+		face int32
+	}{
+		{"Noto Sans Regular", tile57.MapLibreFontRegular},
+		{"Noto Sans Bold", tile57.MapLibreFontBold},
+		{"Noto Sans Italic", tile57.MapLibreFontItalic},
+	}
+	for _, gf := range glyphFaces {
+		for _, start := range []uint32{0, 256} {
+			pbf, err := tile57.MapLibreGlyphPBF(gf.face, start)
+			if err != nil {
+				return nil, fmt.Errorf("bake glyphs %s %d-%d: %w", gf.name, start, start+255, err)
+			}
+			p := filepath.Join(
+				dir,
+				"glyphs",
+				gf.name,
+				fmt.Sprintf("%d-%d.pbf", start, start+255),
+			)
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(p, pbf, 0o644); err != nil {
+				return nil, err
+			}
+			written = append(written, p)
+		}
+	}
 	src := "libtile57 embedded catalogue"
 	if catalogDir != "" {
 		src = catalogDir
