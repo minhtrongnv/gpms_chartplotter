@@ -5,6 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -219,6 +222,53 @@ func TestInstallAllowsReservedSignatureMetadata(t *testing.T) {
 		InstallOptions{},
 	)
 	require.NoError(t, err)
+}
+
+func TestPluginHTTPClientRejectsRedirectOutsideAllowlist(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	source := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		http.Redirect(
+			w,
+			r,
+			target.URL+"/secret",
+			http.StatusFound,
+		)
+	}))
+	defer source.Close()
+
+	sourceURL, err := url.Parse(source.URL)
+	require.NoError(t, err)
+
+	client := newPluginHTTPClient(Capability{
+		Hosts: []string{sourceURL.Host},
+	})
+
+	req, err := http.NewRequest(
+		http.MethodGet,
+		source.URL,
+		nil,
+	)
+	require.NoError(t, err)
+
+	resp, err := client.Do(req)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	require.ErrorContains(
+		t,
+		err,
+		"redirect host",
+	)
 }
 
 func TestMatchHostAllow(t *testing.T) {
