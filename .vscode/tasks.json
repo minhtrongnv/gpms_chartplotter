@@ -4,7 +4,7 @@
         {
             "label": "Build Chartplotter Debug",
             "type": "shell",
-            "command": "CGO_ENABLED=1 go build -gcflags='all=-N -l' -o bin/chartplotter-debug ./cmd/chartplotter",
+            "command": "TILE57_GO_DIR=$(go list -m -f '{{.Dir}}' github.com/beetlebugorg/tile57/bindings/go) && TILE57_DIR=$(cd \"$TILE57_GO_DIR/../..\" && pwd) && ENGINE_COMMIT=$(git -C \"$TILE57_DIR\" rev-parse --short=9 HEAD 2>/dev/null || echo unknown) && echo \"debug: tile57=$TILE57_DIR commit=$ENGINE_COMMIT\" && CGO_ENABLED=1 go build -gcflags='all=-N -l' -ldflags \"-X main.engineCommit=$ENGINE_COMMIT\" -o bin/chartplotter-debug ./cmd/chartplotter",
             "options": {
                 "cwd": "${workspaceFolder}/chartplotter"
             },
