@@ -135,7 +135,7 @@ function textLayers(mariner, palette) {
 // their true physical size on THIS screen. The baker emits sizes (icon `scale`,
 // `width_px`, `font_size_px`) as if 1 CSS px = 1 typographic point (0.35278 mm /
 // 72 DPI); but a CSS px is 1/96 in (0.2645 mm) — and the actual screen may differ
-// again. The element computes k = 0.35278 / pxPitch and passes it in, scaling
+// again. The element computes the baked-reference-pitch / local pxPitch ratio and passes it in, scaling
 // icons/lines/text/halos together (line-dasharray is in line-width units, so it
 // scales for free). Only sizes are touched — colours/filters/placement are unchanged.
 function _scaleSizes(layers, k) {
@@ -412,8 +412,7 @@ export function buildChartLayers({
   bandsHidden,                                 // Set (this._bandsHidden)
   bandsPresent = new Set(),                    // Set of band slugs that have data — gates the overscale pattern
   ignoreScamin,                                // DEBUG: drop the per-SCAMIN display gate (show everything in-band)
-  sizeScale = 1,                               // px→true-physical feature-size multiplier (0.35278/pxPitch); see _scaleSizes
-  pxPitch,                                     // calibrated CSS-pixel pitch (mm) → SCAMIN gates on the true physical scale
+  sizeScale = 1,                               // per-screen feature-size multiplier; see _scaleSizes
 }) {
   active = scheme || "day";
   const layerBase = {}, variants = {}, layerVis = {};
@@ -503,13 +502,13 @@ export function buildChartLayers({
           // value). NOT quantized → SCAMIN is still honoured exactly.
           const floor = set.min || 0;
           const lowVals = [], hiVals = [];
-          for (const sc of scaminVals) (scaminDisplayZoom(sc, lat, pxPitch) <= floor + 1e-6 ? lowVals : hiVals).push(sc);
+          for (const sc of scaminVals) (scaminDisplayZoom(sc, lat) <= floor + 1e-6 ? lowVals : hiVals).push(sc);
           const noFilter = lowVals.length
             ? ["any", ["!", ["has", "scamin"]], ["in", ["get", "scamin"], ["literal", lowVals]]]
             : ["!", ["has", "scamin"]];
           mk("#no", and(noFilter), undefined);
           for (const sc of hiVals) {
-            mk("#sm" + sc, and(["==", ["get", "scamin"], sc]), scaminDisplayZoom(sc, lat, pxPitch));
+            mk("#sm" + sc, and(["==", ["get", "scamin"], sc]), scaminDisplayZoom(sc, lat));
           }
         } else {
           mk("", base, undefined);
@@ -574,13 +573,13 @@ export function buildChartLayers({
         // the layer count without quantizing (see the server path for the rationale).
         const floor = dmin || 0;
         const lowVals = [], hiVals = [];
-        for (const sc of scaminValues) (scaminDisplayZoom(sc, lat, pxPitch) <= floor + 1e-6 ? lowVals : hiVals).push(sc);
+        for (const sc of scaminValues) (scaminDisplayZoom(sc, lat) <= floor + 1e-6 ? lowVals : hiVals).push(sc);
         const noFilter = lowVals.length
           ? ["any", ["!", ["has", "scamin"]], ["in", ["get", "scamin"], ["literal", lowVals]]]
           : ["!", ["has", "scamin"]];
         mk("#no", and(noFilter), dmin || undefined);
         for (const sc of hiVals) {
-          mk("#sm" + sc, and(["==", ["get", "scamin"], sc]), scaminDisplayZoom(sc, lat, pxPitch));
+          mk("#sm" + sc, and(["==", ["get", "scamin"], sc]), scaminDisplayZoom(sc, lat));
         }
       } else {
         mk("", base, dmin || undefined);
