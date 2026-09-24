@@ -320,19 +320,23 @@ func hostIsLocal(host string) bool {
 		strings.HasPrefix(host, "[::1]")
 }
 
-// setSecurityHeaders applies defence-in-depth headers to every response: block
-// MIME sniffing, framing (clickjacking), and referrer leakage. Cheap and safe for
-// a map app — none of these constrain how the chart assets load.
+const contentSecurityPolicy = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; connect-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; manifest-src 'self'; form-action 'self'"
+
+// setSecurityHeaders applies defence-in-depth headers to every response.
+//
+// The frontend is intentionally same-origin: NOAA/OSM traffic is proxied by the
+// server and plugin UI is served from /plugins/. WebAssembly needs
+// 'wasm-unsafe-eval', MapLibre may create blob workers, and the web components
+// use inline styles inside their shadow roots. Scripts themselves are kept
+// same-origin; the startup splash bootstrap lives in /src/splash.js rather than
+// requiring 'unsafe-inline'.
 func setSecurityHeaders(w http.ResponseWriter) {
 	h := w.Header()
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("X-Frame-Options", "DENY")
-	// connect-src 'self' keeps installed plugin UI (trusted, runs in the main
-	// document) from phoning home — all fetch/XHR/EventSource/WebSocket must be
-	// same-origin (spec §9). Everything the app itself fetches is same-origin
-	// (OSM + NOAA go through server-side proxies), so this is transparent to it.
-	h.Set("Content-Security-Policy", "frame-ancestors 'none'; connect-src 'self'")
+	h.Set("Content-Security-Policy", contentSecurityPolicy)
 	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("X-Permitted-Cross-Domain-Policies", "none")
 }
 
 // crossSiteWrite reports whether r is an unsafe (state-changing) request that did
