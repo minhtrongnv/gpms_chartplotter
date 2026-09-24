@@ -86,6 +86,9 @@ const DEFAULT_MARINER = {
   showScaleBoundaries: false, // DATCVR §10.1.9.1 chart scale boundaries — off by default (opt-in)
   // Individually-selectable "Other" items (S-52/IMO), all default on.
   showSoundings: true,
+  // Recreational/demo density: keep more spot depths visible at coastal scales
+  // by ignoring SCAMIN for SOUNDG only. Other features remain normally gated.
+  denseSoundings: true,
   // Date-dependent display (S-52 §10.4.1.1, MANDATORY): show a dated feature only
   // when the viewing date is within its validity period. Default on (spec); set
   // false to show all dates regardless. dateView ("YYYYMMDD") pins a planning
