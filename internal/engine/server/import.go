@@ -745,8 +745,9 @@ func (s *Server) looseCellData(csv string) map[string]baker.CellData {
 	return cells
 }
 
-// Upload limits. The whole-nation All_ENCs.zip is multi-GB and is intentionally
-// handled by the Range proxy rather than this in-memory upload path.
+// Import limits. Bulk ZIPs are disk-backed, but compressed size, entry count,
+// per-entry expansion and total expansion are still bounded to protect disk/CPU.
+// The whole-nation All_ENCs.zip remains a Range-proxy use case, not one import.
 const (
 	maxImportBytes           int64 = 2 << 30 // 2 GiB compressed/raw file payload
 	maxImportRequestBytes          = maxImportBytes + (8 << 20)
