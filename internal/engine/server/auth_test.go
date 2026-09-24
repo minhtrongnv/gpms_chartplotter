@@ -156,4 +156,26 @@ func TestBearerAuthSetsWWWAuthenticate(
 			"expected WWW-Authenticate header",
 		)
 	}
+
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf(
+			"Cache-Control = %q, want no-store",
+			got,
+		)
+	}
+
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf(
+			"X-Content-Type-Options = %q, want nosniff",
+			got,
+		)
+	}
+
+	if got := rec.Header().Get("Content-Security-Policy"); got != contentSecurityPolicy {
+		t.Fatalf(
+			"Content-Security-Policy = %q, want %q",
+			got,
+			contentSecurityPolicy,
+		)
+	}
 }
