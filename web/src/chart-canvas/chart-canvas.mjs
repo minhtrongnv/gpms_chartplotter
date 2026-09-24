@@ -237,7 +237,6 @@ export class ChartCanvas extends HTMLElement {
       assets,
       getMap: () => this._map,
       rebuild: () => this._map && this._map.setStyle(this.buildStyle(), { diff: false, validate: false }),
-      getPxPitch: () => this._pxPitch, // SCAMIN gates on the calibrated physical scale (in-place re-gate)
     });
 
     // Shadow DOM: MapLibre CSS must live inside the shadow root, plus a sized
