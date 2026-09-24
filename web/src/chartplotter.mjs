@@ -321,6 +321,20 @@ export class ChartPlotter extends HTMLElement {
     });
   }
 
+  disconnectedCallback() {
+    // Release long-lived browser connections/listeners when the shell is removed
+    // or re-mounted. Without explicit teardown, an SPA/remount can leave old
+    // EventSource instances alive while the new shell opens another set.
+    try { this._vessel?.stop?.(); } catch {}
+    try { this._pluginHost?.destroy?.(); } catch {}
+
+    if (this._dismissOverlays) {
+      document.removeEventListener("pointerdown", this._dismissOverlays, true);
+      document.removeEventListener("wheel", this._dismissOverlays, true);
+      this._dismissOverlays = null;
+    }
+  }
+
   async boot() {
     // Widget (read-only, prebaked) mode: a static, embeddable chart viewer with no
     // backend and no in-browser baking. Enabled by the `widget` attribute OR
