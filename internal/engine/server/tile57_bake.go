@@ -132,6 +132,7 @@ func (s *Server) bakeProvider(jobID, provider string) bool {
 		return fail(fmt.Errorf("could not register set for %q", provider))
 	}
 	s.imports.update(jobID, func(j *importJob) { j.Cells = n })
+	s.clearProviderDirty(provider)
 	log.Printf("import %s: baked provider %q (%d cell(s)) → %s", jobID, provider, n, outDir)
 	return true
 }
