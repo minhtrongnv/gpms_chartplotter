@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"archive/zip"
 	"bytes"
 	"encoding/json"
@@ -116,7 +117,7 @@ func TestExtractZipCells(t *testing.T) {
 	}
 }
 
-func TestFetchURLProgressCancelsStalledBody(t *testing.T) {
+func TestDiskDownloadCancelsStalledBody(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		if f, ok := w.(http.Flusher); ok {
@@ -127,8 +128,14 @@ func TestFetchURLProgressCancelsStalledBody(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	_, err := fetchURLProgressWithTimeout(
+	dir := t.TempDir()
+	s := New(dir, dir, dir, false, "")
+	defer s.Close()
+
+	_, err := s.downloadURLToTempWithTimeout(
+		context.Background(),
 		ts.URL,
+		"user",
 		ts.Client(),
 		50*time.Millisecond,
 		nil,
