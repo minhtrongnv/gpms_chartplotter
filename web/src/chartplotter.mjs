@@ -2040,8 +2040,13 @@ export class ChartPlotter extends HTMLElement {
     if (Array.isArray(s.hiddenCells)) this._hiddenCells = new Set(s.hiddenCells);
     // pxPitch is intentionally NOT loaded from server settings: it belongs to the
     // current monitor/browser only. Older settings blobs may still contain it.
-    // Merge mariner over the (migrated) defaults; Display Base is always forced on.
-    if (s.mariner && typeof s.mariner === "object") this._mariner = { ...this._mariner, ...s.mariner, displayBase: true };
+    // Merge mariner over the defaults. Strip retired experimental fields from the
+    // server-shared blob so an older client cannot silently re-enable them.
+    if (s.mariner && typeof s.mariner === "object") {
+      const sm = { ...s.mariner };
+      delete sm.denseSoundings;
+      this._mariner = { ...this._mariner, ...sm, displayBase: true };
+    }
   }
 
   // Persist the display settings server-side (shared across screens). Debounced so
