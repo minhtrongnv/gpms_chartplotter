@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -144,19 +145,31 @@ func (s *Server) handleDeleteDistrict(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusNotFound, "no such district")
 		return
 	}
-	job := s.imports.create(provider)
-	go func() {
-		s.bakeMu.Lock()
-		defer s.bakeMu.Unlock()
-		if err := os.RemoveAll(s.districtDir(provider, district)); err != nil {
-			s.imports.update(job.ID, func(j *importJob) { j.State = "error"; j.Err = err.Error() })
+	job, ok := s.startImportJob(provider, func(ctx context.Context, jobID string) {
+		if ctx.Err() != nil {
 			return
 		}
-		s.auxIdx.invalidate() // the district's aux content is gone — re-index /aux
-		if s.bakeProvider(job.ID, provider) {
-			s.imports.update(job.ID, func(j *importJob) { j.State = "done" })
+		s.bakeMu.Lock()
+		defer s.bakeMu.Unlock()
+		if ctx.Err() != nil {
+			return
 		}
-	}()
+		if err := os.RemoveAll(s.districtDir(provider, district)); err != nil {
+			s.imports.update(jobID, func(j *importJob) {
+				j.State = "error"
+				j.Err = err.Error()
+			})
+			return
+		}
+		s.auxIdx.invalidate()
+		if s.bakeProvider(jobID, provider) {
+			s.imports.update(jobID, func(j *importJob) { j.State = "done" })
+		}
+	})
+	if !ok {
+		apiErr(w, http.StatusServiceUnavailable, "server shutting down")
+		return
+	}
 	w.Header().Set("Content-Type", jsonCT)
 	w.WriteHeader(http.StatusAccepted)
 	fmt.Fprintf(w, `{"ok":true,"job":%q}`, job.ID)
