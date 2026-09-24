@@ -266,6 +266,18 @@ export class ChartPlotter extends HTMLElement {
     // this._widget the same way, before any apply* runs.)
     const embed = this.hasAttribute("widget") || new URLSearchParams(location.search).has("widget");
     this._mariner = { ...DEFAULT_MARINER, ...(embed ? {} : loadJSON(LS_MARINER, {})) };
+    // One-time migration away from the short-lived dense/full-detail experiment.
+    // The presence of denseSoundings is the migration marker; OpenCPN-like normal
+    // presentation is STANDARD + the independent soundings switch.
+    if (Object.prototype.hasOwnProperty.call(this._mariner, "denseSoundings")) {
+      delete this._mariner.denseSoundings;
+      this._mariner.displayBase = true;
+      this._mariner.displayStandard = true;
+      this._mariner.displayOther = false;
+      if (!embed) {
+        try { localStorage.setItem(LS_MARINER, JSON.stringify(this._mariner)); } catch (_) {}
+      }
+    }
     // Migrate the old single-value display category (base|standard|other) to
     // the multi-select Base/Standard/Other booleans (now client-side filters).
     if (this._mariner.displayCategory) {
@@ -2037,8 +2049,17 @@ export class ChartPlotter extends HTMLElement {
     if (Array.isArray(s.hiddenCells)) this._hiddenCells = new Set(s.hiddenCells);
     // pxPitch is intentionally NOT loaded from server settings: it belongs to the
     // current monitor/browser only. Older settings blobs may still contain it.
-    // Merge mariner over the (migrated) defaults; Display Base is always forced on.
-    if (s.mariner && typeof s.mariner === "object") this._mariner = { ...this._mariner, ...s.mariner, displayBase: true };
+    // Merge mariner over the defaults. Retire the dense/full-detail experiment
+    // when an older shared settings blob still contains its marker.
+    if (s.mariner && typeof s.mariner === "object") {
+      const hadDense = Object.prototype.hasOwnProperty.call(s.mariner, "denseSoundings");
+      this._mariner = { ...this._mariner, ...s.mariner, displayBase: true };
+      delete this._mariner.denseSoundings;
+      if (hadDense) {
+        this._mariner.displayStandard = true;
+        this._mariner.displayOther = false;
+      }
+    }
   }
 
   // Persist the display settings server-side (shared across screens). Debounced so
