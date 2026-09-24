@@ -124,7 +124,7 @@ export function coreSettingsContributions(app) {
     items: [
       {
         key: "detailLevel", type: "segmented", label: "Detail level",
-        desc: "Display Base is always shown — Standard adds normal chart content, Other adds every remaining feature",
+        desc: "Display Base is always shown — Standard adds normal chart content, Other adds remaining features. Spot soundings are controlled separately.",
         options: [["base", "Base"], ["standard", "Standard"], ["other", "Other"]],
       },
     ],
@@ -140,7 +140,7 @@ export function coreSettingsContributions(app) {
     items: [
       { key: "fourShadeWater", type: "toggle", label: "Four-shade water", desc: "Use four depth shades instead of two", default: true },
       { key: "shallowPattern", type: "toggle", label: "Shallow pattern", desc: "Diagonal fill in shallow water" },
-      { key: "showSoundings", type: "toggle", label: "Spot soundings", desc: "Individual depth soundings", default: true },
+      { key: "showSoundings", type: "toggle", label: "Spot soundings", desc: "Independent of detail level; chart SCAMIN decides when individual depths appear", default: true },
       { key: "showNoData", type: "toggle", label: "No-data hatch", desc: "Hatch areas that have no chart data", default: true },
     ],
   };
