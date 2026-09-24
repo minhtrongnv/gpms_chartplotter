@@ -52,11 +52,13 @@ type Server struct {
 	auxIdx         *auxIndex         // index of companion aux.zips for /api/aux (TXTDSC/PICREP)
 	cellIdx        *cellIndex        // persistent name→bbox index over cached cells (/api/cells, search fly-to)
 
-	vessel    *nmea.Store       // latest NMEA0183 vessel state (fed by nmeaMgr)
-	nmeaMgr   *nmea.Manager     // live NMEA0183 connections (writes into vessel)
-	conns     *connectionsStore // persisted connection configs (<data>/connections.json)
-	rawHub    *rawHub           // raw-sentence fan-out for the per-connection sniffer
-	pluginMgr *plugin.Manager   // installed plugins: lifecycle + broker (<data>/plugins.json)
+	vessel      *nmea.Store       // latest NMEA0183 vessel state (fed by nmeaMgr)
+	nmeaMgr     *nmea.Manager     // live NMEA0183 connections (writes into vessel)
+	conns       *connectionsStore // persisted connection configs (<data>/connections.json)
+	rawHub      *rawHub           // raw-sentence fan-out for the per-connection sniffer
+	pluginMgr   *plugin.Manager   // installed plugins: lifecycle + broker (<data>/plugins.json)
+	clientIPs   *ClientIPResolver // trusted-proxy-aware client identity for security controls
+	rateLimiter *requestRateLimiter
 }
 
 // New returns a Server. Pass an empty assetsDir to serve the embedded asset
@@ -72,7 +74,18 @@ func New(assetsDir, cacheDir, dataDir string, allowRemote bool, engineCommit str
 	}
 	migrateLegacyENCRoot(dataDir)             // one-time: retired flat ENC_ROOT → loose/cells (before indexing)
 	migrateProviderEncRoot(dataDir, cacheDir) // one-time: per-district-pack layout → per-provider ENC_ROOT
-	s := &Server{assetsDir: assetsDir, cacheDir: cacheDir, dataDir: dataDir, allowRemote: allowRemote, sets: newTileSets(), imports: newImportJobs(), auxIdx: newAuxIndex(), cellIdx: newCellIndex(dataDir)}
+	s := &Server{
+		assetsDir:   assetsDir,
+		cacheDir:    cacheDir,
+		dataDir:     dataDir,
+		allowRemote: allowRemote,
+		sets:        newTileSets(),
+		imports:     newImportJobs(),
+		auxIdx:      newAuxIndex(),
+		cellIdx:     newCellIndex(dataDir),
+		clientIPs:   &ClientIPResolver{},
+		rateLimiter: newRequestRateLimiter(),
+	}
 	// The engine commit must be known BEFORE the boot registration below:
 	// registerLiveProviders/rebakeMissingProviders gate on the .enginever stamp,
 	// and an empty commit counts every kept archive as current (stale tiles
@@ -181,12 +194,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/readyz":
 		s.serveReadyz(lw, r)
 
-	case r.URL.Path == "/api/style.json":
-		s.serveTile57Style(lw, r)
-	case r.URL.Path == "/api/style-diff":
-		// Minimal MapLibre mutation ops between two mariner selections, for flicker-
-		// free tile57 toggles (build-tagged; 501 stub in the default build).
-		s.serveTile57StyleDiff(lw, r)
 	case strings.HasPrefix(r.URL.Path, "/api/"):
 		s.handleAPI(lw, r)
 	case strings.HasPrefix(r.URL.Path, "/tiles/"):
@@ -384,7 +391,16 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusForbidden, "cross-site request blocked")
 		return
 	}
+	if !s.allowRateLimitedRequest(w, r) {
+		return
+	}
 	switch {
+	case r.URL.Path == "/api/style.json":
+		s.serveTile57Style(w, r)
+	case r.URL.Path == "/api/style-diff":
+		// Minimal MapLibre mutation ops between two mariner selections, for flicker-
+		// free tile57 toggles (build-tagged; 501 stub in the default build).
+		s.serveTile57StyleDiff(w, r)
 	case r.URL.Path == "/api/health":
 		w.Header().Set("Content-Type", jsonCT)
 		fmt.Fprintf(w, `{"ok":true,"version":%q}`, s.Version)
