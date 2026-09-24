@@ -360,6 +360,42 @@ func TestParseBytes(t *testing.T) {
 	require.Equal(t, int64(512<<10), parseBytes("512KB"))
 	require.Equal(t, int64(1024), parseBytes("1024"))
 	require.Equal(t, int64(2048), parseBytes("2048B"))
+
+	// Invalid, zero, negative, and overflowing quotas fall back to the
+	// conservative default rather than accidentally becoming "unlimited".
+	require.Equal(t, int64(5<<20), parseBytes("0"))
+	require.Equal(t, int64(5<<20), parseBytes("-1"))
+	require.Equal(t, int64(5<<20), parseBytes("9223372036854775807MB"))
+}
+
+func TestPluginStorageBudgetIncludesServedArtifacts(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(
+		t,
+		os.WriteFile(
+			filepath.Join(dir, "existing.bin"),
+			[]byte("123456"),
+			0o644,
+		),
+	)
+
+	b := &brokerSession{
+		storeDir: dir,
+		quota:    10,
+	}
+
+	err := b.ensureStorageBudget(
+		filepath.Join(dir, "new.bin"),
+		5,
+	)
+	require.ErrorContains(t, err, "storage quota exceeded")
+
+	err = b.ensureStorageBudget(
+		filepath.Join(dir, "existing.bin"),
+		9,
+	)
+	require.NoError(t, err)
 }
 
 type zipEntry struct {
