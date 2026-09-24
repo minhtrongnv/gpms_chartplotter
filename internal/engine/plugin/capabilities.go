@@ -685,7 +685,7 @@ func parseBytes(s string) int64 {
 		64,
 	)
 	if err != nil ||
-		n < 0 ||
+		n <= 0 ||
 		n > (1<<63-1)/mult {
 
 		return 5 << 20
