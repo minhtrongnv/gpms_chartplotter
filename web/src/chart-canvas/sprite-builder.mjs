@@ -66,7 +66,7 @@ export class SpriteBuilder {
   // hot path can continue returning a plain ImageData.
   pixelRatioFor(id) {
     if (id.startsWith("ctr:")) {
-      return this._cell(id)?.pixelRatio || 1;
+      return (this._cell(id) || this._cell(id.slice(4)))?.pixelRatio || 1;
     }
     if (id.startsWith("snd:")) {
       return this._ratioForNames(this._soundingNamesForId(id));
@@ -98,9 +98,10 @@ export class SpriteBuilder {
   // cell is the glyph cropped to its content, so drawing it into a w×h canvas and
   // letting MapLibre centre that canvas puts the glyph centre on the point.
   centredGlyph(name) {
-    // Current tile57 already emits the exact MapLibre-ready cell requested by
-    // the style. Do not reinterpret the name or re-center it here.
-    const c = this._cell(name);
+    // Current tile57 emits ctr:<id> specifically for bbox-centred portrayal
+    // (pivot ignored). Bare ids are the normal pivot-centred MapLibre cells.
+    // Fall back to bare for legacy/custom atlases that predate ctr: entries.
+    const c = this._cell("ctr:" + name) || this._cell(name);
     if (!c) return null;
     return this.rawCell(this.spriteImg, c);
   }
