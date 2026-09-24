@@ -62,7 +62,7 @@ function renderCalibration(host, app) {
           <p class="cal__cur">Pixel pitch: <b>${pitch.toFixed(4)} mm</b>${calibrated ? "" : " (default — uncalibrated)"}</p>
         </div>
       </div>
-      <p class="cal__hint">Tip: a wider measurement zooms the chart down, a narrower one up. Apply, then re-measure to confirm the box reads 5 mm.</p>
+      <p class="cal__hint">Tip: a wider measurement makes symbols/text physically smaller, a narrower one larger. This calibration does not change the chart zoom or 1:N scale readout. Apply, then re-measure to confirm the box reads 5 mm.</p>
     </div>`;
 
   const mmInput = host.querySelector("#cal-mm");

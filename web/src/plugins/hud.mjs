@@ -8,7 +8,7 @@
 // → {s:scale, bb:[w,s,e,n]} | undefined; serverSetMetas() → [{band, bounds}].
 
 import { bandForScale, bandForZoom, BANDS, BAND_COLOR, BAND_LABEL, BAND_MAXZOOM } from "../lib/bands.mjs";
-import { scaleDenomPhysical, zoomForScalePhysical, fmtScale, fmtLatLon } from "../lib/util.mjs";
+import { chartScaleDenom, zoomForChartScale, fmtScale, fmtLatLon } from "../lib/util.mjs";
 
 // Parse a user-typed scale into a denominator. Accepts "40000", "40,000",
 // "1:40000", "1:40,000", "40k", "40 000". Returns 0 if it can't.
@@ -33,10 +33,9 @@ export class HudController {
     this.cellMeta = opts.cellMeta || (() => undefined);
     this.serverSetMetas = opts.serverSetMetas || (() => []);
     this.noChartsEnabled = opts.noChartsEnabled || (() => false);
-    // Monitor's physical CSS-pixel pitch (mm), for the PHYSICAL (ruler-on-glass)
-    // scale shown in the readout / overscale / go-to-scale. undefined → util's
-    // default (CSS reference). The user calibrates it in settings.
-    this.getPxPitch = opts.getPxPitch || (() => undefined);
+    // HUD scale is a deterministic chart-scale coordinate shared with tile57.
+    // Screen calibration affects physical feature sizing only; it must not change
+    // the navigational 1:N readout, SCAMIN/overscale boundaries, or go-to-scale.
     this.coverScale = 0; // finest covering chart's CSCL — the overscale ×n reference
     this.detentZoom = null; // finest covering band's overscale cap — the wheel-zoom detent (not a hard maxZoom)
     // `move` fires several times per animation frame during a pan/zoom; coalesce
@@ -71,7 +70,7 @@ export class HudController {
 
     const open = () => {
       const c = this.map.getCenter();
-      input.value = String(Math.round(scaleDenomPhysical(this.map.getZoom(), c.lat, this.getPxPitch())));
+      input.value = String(Math.round(chartScaleDenom(this.map.getZoom(), c.lat)));
       pop.hidden = false;
       input.focus();
       input.select();
@@ -81,7 +80,7 @@ export class HudController {
       const denom = parseScale(input.value);
       if (denom > 0) {
         const c = this.map.getCenter();
-        this.map.easeTo({ zoom: zoomForScalePhysical(denom, c.lat, this.getPxPitch()), duration: 300 });
+        this.map.easeTo({ zoom: zoomForChartScale(denom, c.lat), duration: 300 });
       }
       close();
     };
@@ -108,8 +107,8 @@ export class HudController {
     const box = this.root.getElementById("databox"); if (box) box.hidden = false;
     const z = this.map.getZoom(), c = this.map.getCenter();
     const band = bandForZoom(z);
-    // The READOUT shows the PHYSICAL scale (matches a ruler / other ENCs).
-    const dispDenom = scaleDenomPhysical(z, c.lat, this.getPxPitch());
+    // Deterministic chart scale: same zoom + latitude => same 1:N in every browser.
+    const dispDenom = chartScaleDenom(z, c.lat);
     // Build the span structure ONCE, then update text nodes in place. During a pan
     // the coordinate changes every frame, so a per-frame `innerHTML =` would re-PARSE
     // the whole readout each time; writing textContent on stable spans skips the
@@ -137,12 +136,10 @@ export class HudController {
     // amber band. "No charts enabled" outranks it (nothing is drawing at all).
     const warn = this.root.getElementById("db-warn");
     if (!warn) return;
-    // Overscale compares the TRUE on-screen scale against the cell's compilation
-    // scale (CSCL) — both physical, real 1:N scales — so it reads the same physical
-    // denominator as the readout (dispDenom). The engine is now on one physical
-    // scale (no separate nominal coordinate), so ×n is literally how magnified the
-    // survey data is on glass: a 1:45k cell viewed at 1:26k shows ×1.7, in-band or
-    // not, which is the S-52 §10.1.10.1 intent.
+    // Overscale compares the deterministic chart-scale denominator against the
+    // cell's compilation scale (CSCL). This is the same fixed 0.2645 mm reference
+    // coordinate tile57 uses for SCAMIN, so every browser crosses the boundary at
+    // the same camera zoom/latitude.
     const f = this.coverScale && dispDenom < this.coverScale ? this.coverScale / dispDenom : 0;
     if (this.noChartsEnabled()) {
       warn.hidden = false;
@@ -192,12 +189,12 @@ export class HudController {
     this.coverScale = finestScale;
     const band = finest >= 0 ? BANDS[finest] : "general";
     // Detent right where overscale BEGINS for the covering chart: the zoom whose
-    // displayed (physical) scale equals the chart's compilation scale, coverScale.
+    // deterministic chart scale equals the chart's compilation scale, coverScale.
     // Zoom past it and dispDenom < coverScale → "Overscale ×N" (same test as the
     // warning above). Falls back to the band's native-max zoom when no per-chart
     // scale is known (e.g. server sets without the NOAA catalogue).
     this.detentZoom = finestScale
-      ? zoomForScalePhysical(finestScale, c.lat, this.getPxPitch())
+      ? zoomForChartScale(finestScale, c.lat)
       : Math.min(18, BAND_MAXZOOM[band] || 9);
     this.updateHud();
   }

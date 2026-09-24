@@ -50,7 +50,7 @@
 // Baking runs server-side; the client only renders tiles.
 import { PMTilesArchive, registerPmtilesProtocol } from "./pmtiles-source.mjs";
 import { convertDistance, unitSuffix } from "../lib/units.mjs";
-import { zoomForScale, scaleDenomPhysical, DEFAULT_PX_PITCH_MM, clampPxPitch } from "../lib/util.mjs"; // shared scale↔zoom (512-tile MapLibre resolution)
+import { zoomForChartScale, chartScaleDenom, DEFAULT_PX_PITCH_MM, clampPxPitch } from "../lib/util.mjs"; // deterministic chart scale + per-screen feature sizing
 import * as S52 from "./s52-style.mjs";
 import { SpriteBuilder } from "./sprite-builder.mjs";
 // Chart SOURCE / ARCHIVE management lives in its own stateful collaborator now (the
@@ -237,7 +237,6 @@ export class ChartCanvas extends HTMLElement {
       assets,
       getMap: () => this._map,
       rebuild: () => this._map && this._map.setStyle(this.buildStyle(), { diff: false, validate: false }),
-      getPxPitch: () => this._pxPitch, // SCAMIN gates on the calibrated physical scale (in-place re-gate)
     });
 
     // Shadow DOM: MapLibre CSS must live inside the shadow root, plus a sized
@@ -1037,7 +1036,7 @@ export class ChartCanvas extends HTMLElement {
   //   setView({ lat, lng, scale, animate:true, duration:800 }) — fly instead of jump
   // `scale` is the paper-chart denominator (1:N) and is converted to the zoom that
   // yields that scale at the target latitude (web-Mercator scale is latitude-
-  // dependent), the inverse of the HUD's scale readout. `bearing`/`pitch` pass
+  // dependent), using the same deterministic chart-scale coordinate as the HUD. `bearing`/`pitch` pass
   // through. Omitted fields hold their current value. Returns the resolved
   // { center:[lng,lat], zoom }. The map's own max-zoom (scale floor) still
   // clamps an over-fine request, exactly as user zoom does.
@@ -1049,7 +1048,7 @@ export class ChartCanvas extends HTMLElement {
     // cos(φ) negative and yield a NaN zoom (and so the centre is itself valid).
     const la = Math.max(-85.051129, Math.min(85.051129, Number.isFinite(lat) ? lat : c.lat));
     const lo = Number.isFinite(lng) ? lng : c.lng;
-    let z = Number.isFinite(zoom) ? zoom : (Number.isFinite(scale) ? zoomForScale(scale, la) : map.getZoom());
+    let z = Number.isFinite(zoom) ? zoom : (Number.isFinite(scale) ? zoomForChartScale(scale, la) : map.getZoom());
     const cam = { center: [lo, la], zoom: z };
     if (Number.isFinite(bearing)) cam.bearing = bearing;
     if (Number.isFinite(pitch)) cam.pitch = pitch;
@@ -1725,7 +1724,7 @@ export class ChartCanvas extends HTMLElement {
   // overlay churn, no flicker. A `rebuild` op (layer set changed) falls back to a full
   // re-fetch. Keeps _engineStyle current so a later full rebuild is correct.
   // DEBOUNCED trigger. The shell pushes several settings at boot (scheme, mariner,
-  // pxPitch) and a user can flip toggles fast; without coalescing, EACH call would fetch
+  // mariner toggles) and a user can flip toggles fast; without coalescing, EACH call would fetch
   // + apply a full diff — on the old bucket style that was ~1200 setFilter ops per call,
   // ×N calls = the "thousands of setFilter, page won't render" storm. Coalesce to ONE
   // diff against the last-applied mariner.
@@ -1810,8 +1809,8 @@ export class ChartCanvas extends HTMLElement {
   // Re-inject the current display-scale denominator (curDenom) into every gated chart
   // layer's SCAMIN clause, but ONLY when curDenom has crossed a SCAMIN-ladder boundary
   // since the last apply (≤19 boundaries across a full zoom sweep). curDenom is the
-  // physical display-scale denominator (zoom + lat + calibrated pxPitch — the same scale
-  // the HUD readout shows). This is the client half of scamin-layers.md.
+  // deterministic chart-scale denominator (zoom + latitude, fixed 0.2645 mm reference)
+  // used by both the HUD and tile57. This is the client half of scamin-layers.md.
   //
   // COST: each setFilter here makes MapLibre reload the layer's whole SOURCE (worker
   // re-parse of every loaded tile + symbol re-placement), so this must only run from
@@ -1830,7 +1829,7 @@ export class ChartCanvas extends HTMLElement {
     // Engine mode gets the ladder from the tile57 set TileJSON; the JS builder gets it
     // from the chart-source manager (values discovered from the loaded tiles' manifest).
     const values = this._engineMode ? this._engineScaminValues : ((this._sources && this._sources.scaminValues) || []);
-    const denom = scaleDenomPhysical(this._map.getZoom(), this._map.getCenter().lat, this._pxPitch);
+    const denom = chartScaleDenom(this._map.getZoom(), this._map.getCenter().lat);
     let band = 0;
     for (const v of values) if (v < denom) band++;
     // Mid-gesture (the `move` hook) crossings get a LIGHT apply: sync the new cutoff
@@ -2038,7 +2037,7 @@ export class ChartCanvas extends HTMLElement {
       server: this._sources.server, serverSets: this._sources.sets,
       scaminValues: this._sources.scaminValues, scaminLat, bandsHidden: this._bandsHidden,
       bandsPresent: new Set(this._sources.loadedBands()),
-      ignoreScamin: this._ignoreScamin, sizeScale, pxPitch: this._pxPitch,
+      ignoreScamin: this._ignoreScamin, sizeScale,
     });
     this._layerBase = layerBase; this._variants = variants; this._layerVis = layerVis;
 

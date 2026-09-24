@@ -133,7 +133,7 @@ const LS_VIEW = "chartplotter:view";
 const LS_SOURCE = "chartplotter:source"; // {type:"blob"} or {type:"url",file}
 const LS_BANDS_OFF = "chartplotter:bands-off"; // usage bands the user turned off (array of slugs)
 const LS_HIDDEN_CELLS = "chartplotter:hidden-cells"; // individual chart cells the user hid (array of cell names)
-const LS_PX_PITCH = "chartplotter:px-pitch-mm"; // calibrated physical size of a CSS pixel (mm) for the on-screen scale readout
+const LS_PX_PITCH = "chartplotter:px-pitch-mm"; // per-browser monitor calibration for physical feature sizing only
 // The NOAA ENC User Agreement gate (LS_AGREE) + agreement URLs now live in the
 // <chart-library> component, which owns the download flow; NOAA_ENC_URL is
 // imported above for the bottom-right attribution link the shell still renders.
@@ -595,8 +595,8 @@ export class ChartPlotter extends HTMLElement {
     // Apply persisted display prefs.
     if (this._scheme !== "day") this._plotter.setScheme(this._scheme);
     this.setAttribute("data-scheme", this._scheme);
-    // Calibrated CSS-pixel pitch drives true-physical feature sizing in the renderer
-    // (the same calibration the scale readout uses). Push it before the first frame.
+    // Calibrated CSS-pixel pitch drives true-physical feature sizing only.
+    // The chart 1:N readout/SCAMIN coordinate is deterministic and does not use it.
     if (typeof this._pxPitch === "number" && this._plotter.setPxPitch) {
       try { this._plotter.setPxPitch(this._pxPitch); } catch (e) { console.warn(e); }
     }
@@ -662,7 +662,6 @@ export class ChartPlotter extends HTMLElement {
       cellMeta: (name) => this._byName.get(name),
       serverSetMetas: () => (this._plotter && this._plotter.serverSetMetas) ? this._plotter.serverSetMetas() : [],
       noChartsEnabled: () => this._noChartsEnabled(),
-      getPxPitch: () => this._pxPitch, // calibrated physical CSS-pixel pitch (mm) for the on-screen scale
     });
 
     // Scroll-wheel zoom: owns the wheel (native scrollZoom off) to give the band
@@ -1999,18 +1998,17 @@ export class ChartPlotter extends HTMLElement {
       chartRadar: this._showChartRadar,
       bandsOff: [...this._bandsOff],
       hiddenCells: [...this._hiddenCells],
-      pxPitch: this._pxPitch,
       mariner: this._mariner,
     };
   }
 
-  // Set (or clear) the calibrated physical CSS-pixel pitch (mm) used for the
-  // on-screen scale readout / overscale / go-to-scale. Persists + refreshes the HUD.
+  // Set (or clear) this SCREEN's calibrated CSS-pixel pitch (mm). Calibration is
+  // deliberately local-only: it changes the physical size of symbols/lines/text on
+  // this monitor, but never the deterministic chart 1:N coordinate used by HUD,
+  // SCAMIN, overscale or go-to-scale.
   setPxPitch(mm) {
     this._pxPitch = (typeof mm === "number" && mm > 0) ? mm : undefined;
     try { localStorage.setItem(LS_PX_PITCH, JSON.stringify(this._pxPitch ?? null)); } catch (e) { /* quota/private */ }
-    this._persistSettings();
-    if (this._hud) this._hud.updateHud();
     // Re-render features at true physical size for the new pitch (icons/lines/text).
     if (this._plotter && this._plotter.setPxPitch) { try { this._plotter.setPxPitch(this._pxPitch); } catch (e) { console.warn(e); } }
   }
@@ -2031,7 +2029,8 @@ export class ChartPlotter extends HTMLElement {
     if (typeof s.chartRadar === "boolean") this._showChartRadar = s.chartRadar;
     if (Array.isArray(s.bandsOff)) this._bandsOff = new Set(s.bandsOff);
     if (Array.isArray(s.hiddenCells)) this._hiddenCells = new Set(s.hiddenCells);
-    if (typeof s.pxPitch === "number" && s.pxPitch > 0) this._pxPitch = s.pxPitch;
+    // pxPitch is intentionally NOT loaded from server settings: it belongs to the
+    // current monitor/browser only. Older settings blobs may still contain it.
     // Merge mariner over the (migrated) defaults; Display Base is always forced on.
     if (s.mariner && typeof s.mariner === "object") this._mariner = { ...this._mariner, ...s.mariner, displayBase: true };
   }
