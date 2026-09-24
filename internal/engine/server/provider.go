@@ -174,6 +174,28 @@ func (s *Server) cacheDistrict(provider, district string, cells map[string]baker
 	}
 }
 
+// providerAuxPaths is the disk-backed aux inventory used by the server bake path.
+// Only paths are retained in memory; auxfiles.WriteDirFromPaths streams each file
+// independently when publishing the provider's loose aux directory.
+func (s *Server) providerAuxPaths(provider string) map[string]string {
+	root := s.encRootDir(provider)
+	aux := map[string]string{}
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if encExtServer(d.Name()) != "" || isCatalogFile(d.Name()) || !isAuxContentServer(d.Name()) {
+			return nil
+		}
+		key := strings.ToUpper(d.Name())
+		if _, ok := aux[key]; !ok {
+			aux[key] = path
+		}
+		return nil
+	})
+	return aux
+}
+
 // providerAux gathers the aux content files (TXTDSC/PICREP text + pictures) across a
 // provider's ENC_ROOT, de-duplicated by upper-cased basename, for the provider's one
 // companion aux.zip.
