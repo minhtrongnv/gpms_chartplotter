@@ -53,7 +53,7 @@ func TestRequiresAccessToken(t *testing.T) {
 				t.Fatalf(
 					"requiresAccessToken() = %v, want %v",
 					got,
-					t.want,
+					tt.want,
 				)
 			}
 		})
