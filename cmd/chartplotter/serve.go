@@ -22,7 +22,7 @@ import (
 type serveCmd struct {
 	Host       string `default:"127.0.0.1" help:"Bind host."`
 	Port       int    `default:"8080" help:"Bind port."`
-	AccessMode string `name:"access-mode" default:"local" help:"Access mode: local for offline ship/LAN use; cloudflare for Internet access through a trusted Cloudflare Tunnel."`
+	AccessMode string `name:"access-mode" help:"Access mode: local for offline ship/LAN use; cloudflare for Internet access through a trusted Cloudflare Tunnel. Defaults to local; legacy Cloudflare proxy flags auto-select cloudflare."`
 	Assets     string `type:"existingdir" help:"Serve static assets from this directory instead of the built-in embedded bundle (for development)."`
 	Cache  string `help:"Cache dir for REGENERABLE baked .pmtiles tile sets (default: XDG cache)."`
 	Data   string `help:"Data dir for SOURCE ENC (district zips, raw cells) — safe, not auto-deleted (default: XDG data)."`
@@ -55,11 +55,18 @@ func resolveServeAccessPolicy(
 	trustCloudflareFlag bool,
 ) (serveAccessPolicy, error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
-	if mode == "" {
-		mode = accessModeLocal
-	}
-
 	proxyConfigured := strings.TrimSpace(trustedProxies) != ""
+
+	// Preserve the 3.3.3 CLI while making the two deployment modes explicit:
+	// no mode + no proxy flags means offline/local; the old trusted-proxy +
+	// --trust-cloudflare form is treated as Cloudflare Tunnel mode.
+	if mode == "" {
+		if proxyConfigured || trustCloudflareFlag {
+			mode = accessModeCloudflare
+		} else {
+			mode = accessModeLocal
+		}
+	}
 
 	switch mode {
 	case accessModeLocal:
