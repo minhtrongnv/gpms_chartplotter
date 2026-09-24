@@ -68,7 +68,10 @@ type LogEntry struct {
 }
 
 // maxLogEntries caps the per-plugin ring (oldest lines drop off).
-const maxLogEntries = 400
+const (
+	maxLogEntries      = 400
+	maxPluginLogLine   = 64 << 10
+)
 
 func (m *Manager) appendLog(id, level, msg string) {
 	m.logMu.Lock()
@@ -541,22 +544,57 @@ func platformKey() string { return runtime.GOOS + "-" + runtime.GOARCH }
 // line that parses as {"level":…,"msg":…} keeps its structure; anything else logs at
 // info verbatim (spec §4).
 type lineLogger struct {
-	logf func(level, msg string)
-	buf  []byte
+	logf     func(level, msg string)
+	buf      []byte
+	dropping bool
 }
 
 func (l *lineLogger) Write(p []byte) (int, error) {
-	l.buf = append(l.buf, p...)
-	for {
-		i := indexByte(l.buf, '\n')
-		if i < 0 {
-			break
+	written := len(p)
+
+	for len(p) > 0 {
+		if l.dropping {
+			i := indexByte(p, '\n')
+			if i < 0 {
+				return written, nil
+			}
+			p = p[i+1:]
+			l.dropping = false
+			continue
 		}
-		line := strings.TrimRight(string(l.buf[:i]), "\r")
-		l.buf = l.buf[i+1:]
-		l.emit(line)
+
+		i := indexByte(p, '\n')
+		if i >= 0 {
+			chunk := p[:i]
+			room := maxPluginLogLine - len(l.buf)
+
+			if len(chunk) > room {
+				l.buf = append(l.buf, chunk[:room]...)
+				l.emit(string(l.buf) + " [truncated]")
+			} else {
+				l.buf = append(l.buf, chunk...)
+				l.emit(strings.TrimRight(string(l.buf), "\r"))
+			}
+
+			l.buf = l.buf[:0]
+			p = p[i+1:]
+			continue
+		}
+
+		room := maxPluginLogLine - len(l.buf)
+		if len(p) <= room {
+			l.buf = append(l.buf, p...)
+			return written, nil
+		}
+
+		l.buf = append(l.buf, p[:room]...)
+		l.emit(string(l.buf) + " [truncated]")
+		l.buf = l.buf[:0]
+		l.dropping = true
+		return written, nil
 	}
-	return len(p), nil
+
+	return written, nil
 }
 
 func (l *lineLogger) emit(line string) {
