@@ -13,9 +13,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"image/png"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/image/tiff"
@@ -106,6 +108,100 @@ func WriteDir(dir string, files map[string][]byte) (int, error) {
 		return 0, err
 	}
 	return len(index), nil
+}
+
+// WriteDirFromPaths is the disk-backed counterpart of WriteDir. It keeps only
+// one auxiliary file in memory at a time (and streams non-TIFF files directly),
+// so a provider with many PICREP/TXTDSC files does not recreate the import-time
+// all-files-in-RAM spike after the ENC ZIP itself has been streamed to disk.
+func WriteDirFromPaths(dir string, files map[string]string) (int, error) {
+	if len(files) == 0 {
+		return 0, nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, err
+	}
+
+	keys := make([]string, 0, len(files))
+	for key := range files {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	index := make(map[string]Entry, len(files))
+	for _, key := range keys {
+		source := files[key]
+		stored := filepath.Base(key)
+		typ := contentType(stored)
+		from := ""
+
+		ext := strings.ToLower(filepath.Ext(stored))
+		if ext == ".tif" || ext == ".tiff" {
+			// TIFF transcode still needs one source image in memory, but never the
+			// whole provider. Large source TIFFs are served verbatim rather than
+			// risking a large temporary allocation before DecodeConfig can inspect it.
+			if info, err := os.Stat(source); err == nil &&
+				info.Size() >= 0 && info.Size() <= maxAuxTranscodeInputBytes {
+				if data, err := os.ReadFile(source); err == nil {
+					if pngBytes, err := tiffToPNG(data); err == nil {
+						from = stored
+						stored = strings.TrimSuffix(stored, filepath.Ext(stored)) + ".png"
+						typ = "image/png"
+						if err := os.WriteFile(filepath.Join(dir, stored), pngBytes, 0o644); err != nil {
+							return 0, err
+						}
+						index[key] = Entry{Stored: stored, Type: typ, From: from}
+						continue
+					}
+				}
+			}
+		}
+
+		if err := copyAuxFile(source, filepath.Join(dir, stored)); err != nil {
+			return 0, err
+		}
+		index[key] = Entry{Stored: stored, Type: typ, From: from}
+	}
+
+	b, err := json.MarshalIndent(Manifest{Version: 1, Files: index}, "", "  ")
+	if err != nil {
+		return 0, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, IndexName), b, 0o644); err != nil {
+		return 0, err
+	}
+	return len(index), nil
+}
+
+const maxAuxTranscodeInputBytes int64 = 64 << 20
+
+func copyAuxFile(source, dest string) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	ok := false
+	defer func() {
+		_ = out.Close()
+		if !ok {
+			_ = os.Remove(dest)
+		}
+	}()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 const maxAuxImagePixels uint64 = 20_000_000
