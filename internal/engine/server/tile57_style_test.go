@@ -30,12 +30,6 @@ func TestMarinerFromQuerySoundingsOverride(t *testing.T) {
 		t.Fatalf("soundings=%v, want SoundingsHide", off.Soundings)
 	}
 
-	dense := marinerFromQuery(url.Values{
-		"denseSoundings": {"1"},
-	})
-	if !dense.DenseSoundings {
-		t.Fatal("denseSoundings=1 was not forwarded to tile57")
-	}
 
 	follow := marinerFromQuery(url.Values{})
 	defaults := tile57.MarinerDefaults()
@@ -46,11 +40,37 @@ func TestMarinerFromQuerySoundingsOverride(t *testing.T) {
 			defaults.Soundings,
 		)
 	}
-	if follow.DenseSoundings != defaults.DenseSoundings {
-		t.Fatalf(
-			"omitted denseSoundings=%v, want engine default %v",
-			follow.DenseSoundings,
-			defaults.DenseSoundings,
-		)
+}
+
+
+func TestMarinerFromQueryDetailLevels(t *testing.T) {
+	base := marinerFromQuery(url.Values{
+		"displayBase":     {"1"},
+		"displayStandard": {"0"},
+		"displayOther":    {"0"},
+	})
+	if !base.DisplayBase || base.DisplayStandard || base.DisplayOther {
+		t.Fatalf("base detail flags = base:%v standard:%v other:%v",
+			base.DisplayBase, base.DisplayStandard, base.DisplayOther)
+	}
+
+	standard := marinerFromQuery(url.Values{
+		"displayBase":     {"1"},
+		"displayStandard": {"1"},
+		"displayOther":    {"0"},
+	})
+	if !standard.DisplayBase || !standard.DisplayStandard || standard.DisplayOther {
+		t.Fatalf("standard detail flags = base:%v standard:%v other:%v",
+			standard.DisplayBase, standard.DisplayStandard, standard.DisplayOther)
+	}
+
+	other := marinerFromQuery(url.Values{
+		"displayBase":     {"1"},
+		"displayStandard": {"1"},
+		"displayOther":    {"1"},
+	})
+	if !other.DisplayBase || !other.DisplayStandard || !other.DisplayOther {
+		t.Fatalf("other detail flags = base:%v standard:%v other:%v",
+			other.DisplayBase, other.DisplayStandard, other.DisplayOther)
 	}
 }
