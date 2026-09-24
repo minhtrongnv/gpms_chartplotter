@@ -277,16 +277,42 @@ export class ChartCanvas extends HTMLElement {
     // or built without the catalogue) — fail with a clear message, not a cryptic
     // JSON.parse of the "404 page not found" body.
     const reqJSON = async (name) => {
-      const r = await fetch(assets + name);
+      const r = await fetch(assets + name, { cache: "no-cache" });
       if (!r.ok) throw new Error(`${name} not available (HTTP ${r.status}) — rebuild/restart the server (it generates the S-101 client assets)`);
       return r.json();
     };
-    const [ct, sj, lsj, pj] = await Promise.all([
+
+    // Prefer the standard 2x atlas on HiDPI/scaled displays. The @2x metadata
+    // carries pixelRatio=2, so logical chart-symbol dimensions remain identical;
+    // only the sampled raster density doubles. Hosted/older bundles without @2x
+    // transparently fall back to the 1x pair.
+    const loadSpritePair = async () => {
+      const prefer2x = (window.devicePixelRatio || 1) > 1;
+      const bases = prefer2x ? ["sprite@2x", "sprite"] : ["sprite"];
+      let lastErr = null;
+
+      for (const base of bases) {
+        try {
+          const meta = await reqJSON(base + ".json");
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          img.src = assets + base + ".png";
+          await img.decode();
+          return { meta, img, base };
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      throw lastErr || new Error("sprite atlas unavailable");
+    };
+
+    const [ct, spritePair, lsj, pj] = await Promise.all([
       reqJSON("colortables.json"),
-      reqJSON("sprite.json"),
-      fetch(assets + "linestyles.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})),
-      fetch(assets + "patterns.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})),
+      loadSpritePair(),
+      fetch(assets + "linestyles.json", { cache: "no-cache" }).then((r) => (r.ok ? r.json() : {})).catch(() => ({})),
+      fetch(assets + "patterns.json", { cache: "no-cache" }).then((r) => (r.ok ? r.json() : {})).catch(() => ({})),
     ]);
+    const sj = spritePair.meta;
     this._colortables = ct;
     this._sprite = sj;
     this._linestyles = lsj;
@@ -294,24 +320,13 @@ export class ChartCanvas extends HTMLElement {
     this._atlasPpu = (sj._meta && sj._meta.px_per_unit) || this._atlasPpu;
     this._patternPixelRatio = 0.08 / FEATURE_SCALE;
 
-    // crossOrigin MUST be set (before src) on the atlas images: SpriteBuilder
-    // draws them to a <canvas> and calls getImageData() to cut out each symbol /
-    // fill-pattern cell. Without it, if the assets are served cross-origin (a
-    // different host/port than the page) the canvas is TAINTED and Chrome throws a
-    // SecurityError on getImageData — so EVERY symbol build fails (icons vanish)
-    // and EVERY pattern fails to register (MapLibre paints missing fill-patterns
-    // as black boxes). The server sends Access-Control-Allow-Origin:* so anonymous
-    // CORS succeeds for both same- and cross-origin.
-    this._spriteImg = new Image();
-    this._spriteImg.crossOrigin = "anonymous";
-    this._spriteImg.src = assets + "sprite.png";
+    // crossOrigin MUST be set (before src) on atlas images used with canvas
+    // getImageData(). loadSpritePair already decoded the selected 1x/2x image.
+    this._spriteImg = spritePair.img;
     this._patternsImg = new Image();
     this._patternsImg.crossOrigin = "anonymous";
     this._patternsImg.src = assets + "patterns.png";
-    await Promise.all([
-      this._spriteImg.decode().catch(() => {}),
-      this._patternsImg.decode().catch(() => {}),
-    ]);
+    await this._patternsImg.decode().catch(() => {});
     // Sprite/glyph image SYNTHESIS collaborator (centred symbols, composited
     // sounding glyphs, raw pattern cells). Constructed here — after the atlas
     // metadata + decoded images are all set — so it exists before any
@@ -1215,9 +1230,10 @@ export class ChartCanvas extends HTMLElement {
   }
 
   // -- sprite / pattern registration --------------------------------------
-  addImageData(id, imgData) {
+  addImageData(id, imgData, pixelRatio = 1) {
     if (!imgData || this._map.hasImage(id)) return;
-    try { this._map.addImage(id, imgData, { pixelRatio: 1 }); } catch (e) { console.warn("addImage", id, e); }
+    const ratio = Number.isFinite(pixelRatio) && pixelRatio > 0 ? pixelRatio : 1;
+    try { this._map.addImage(id, imgData, { pixelRatio: ratio }); } catch (e) { console.warn("addImage", id, e); }
   }
   // Black-box triage: dump the GPU texture limit, the renderer, the number of
   // images packed into MapLibre's icon atlas, and the biggest one — plus any
@@ -1261,11 +1277,12 @@ export class ChartCanvas extends HTMLElement {
     try {
       img = this._sprites.imageFor(id);
     } catch (e) { console.warn("registerImage", id, e); }
-    if (window.__chartImgLog) console.log(`[img] symbol ${id} ${img ? img.width + "x" + img.height : "BUILD-FAILED"}`);
+    const pixelRatio = img ? this._sprites.pixelRatioFor(id) : 1;
+    if (window.__chartImgLog) console.log(`[img] symbol ${id} ${img ? img.width + "x" + img.height + " @" + pixelRatio + "x" : "BUILD-FAILED"}`);
     // NEVER leave a referenced icon-image unresolved — MapLibre's symbol
     // renderer can crash on a missing image (the `getx` atlas-lookup crash).
     // A failed/unknown symbol falls back to a blank 1×1 so the layer is inert.
-    this.addImageData(id, img || new ImageData(1, 1));
+    this.addImageData(id, img || new ImageData(1, 1), pixelRatio);
   }
   registerAllSymbols() {
     if (!this._sprites) return;
@@ -1273,7 +1290,7 @@ export class ChartCanvas extends HTMLElement {
       if (name === "_meta" || this._map.hasImage(name)) continue;
       try {
         const img = this._sprites.centredSymbol(name);
-        if (img) this._map.addImage(name, img, { pixelRatio: 1 });
+        if (img) this._map.addImage(name, img, { pixelRatio: this._sprites.pixelRatioFor(name) });
       } catch (e) { /* skip one bad symbol */ }
     }
   }
