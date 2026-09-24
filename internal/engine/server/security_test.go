@@ -81,6 +81,15 @@ func TestHandlerBlocksCrossSiteAndSetsHeaders(t *testing.T) {
 	if got := w.Header().Get("X-Frame-Options"); got != "DENY" {
 		t.Errorf("X-Frame-Options = %q, want DENY", got)
 	}
+	if got := w.Header().Get("Content-Security-Policy"); got != contentSecurityPolicy {
+		t.Errorf("Content-Security-Policy = %q, want %q", got, contentSecurityPolicy)
+	}
+	if got := w.Header().Get("Referrer-Policy"); got != "no-referrer" {
+		t.Errorf("Referrer-Policy = %q, want no-referrer", got)
+	}
+	if got := w.Header().Get("X-Permitted-Cross-Domain-Policies"); got != "none" {
+		t.Errorf("X-Permitted-Cross-Domain-Policies = %q, want none", got)
+	}
 }
 
 // The proxy must refuse a non-provider URL (SSRF).
