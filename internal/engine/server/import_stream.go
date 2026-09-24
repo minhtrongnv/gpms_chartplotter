@@ -28,6 +28,22 @@ type stagedExchangeSet struct {
 	catalog []tile57.CatalogEntry
 }
 
+// cleanupImportScratch removes only chartplotter-owned transient import data
+// left by an interrupted previous process. Source ENC lives under ENC_ROOT and is
+// never touched.
+func cleanupImportScratch(dataDir string) {
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(dataDir, entry.Name(), ".imports"))
+	}
+}
+
 func (s *Server) importScratchDir(provider string) (string, error) {
 	root := filepath.Join(s.providerDataDir(provider), ".imports")
 	if err := os.MkdirAll(root, 0o755); err != nil {
