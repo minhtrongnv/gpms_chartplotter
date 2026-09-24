@@ -239,23 +239,38 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	// operate on already-cached source files and therefore do not need a giant
 	// request-sized buffer.
 	if csv := r.URL.Query().Get("cells"); csv != "" {
-		cells := s.looseCellData(csv)
-		if len(cells) == 0 {
+		stage, err := s.stageLooseCells(
+			r.Context(),
+			provider,
+			csv,
+			applyUpdates,
+		)
+		if err != nil {
+			apiErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		defer os.RemoveAll(stage.dir)
+		if len(stage.stems) == 0 {
 			apiErr(w, http.StatusBadRequest, "no ENC base cells (.000) in input")
 			return
 		}
 		if autoName {
-			set = s.deriveUploadSet(nil, cells)
-		}
-		if !applyUpdates {
-			cells = baseOnly(cells)
+			set = s.deriveUploadSetFromStems(nil, stage.stems)
 		}
 		provider = providerOf(set)
 		district := districtOf(set)
 		if district == "" {
 			district = provider
 		}
-		s.cacheDistrict(provider, district, cells, nil, nil)
+		if err := s.commitStagedExchangeSet(
+			r.Context(),
+			provider,
+			district,
+			stage,
+		); err != nil {
+			apiErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		job, ok := s.startImportJob(provider, func(ctx context.Context, jobID string) {
 			s.runImport(ctx, jobID, provider)
 		})
