@@ -387,7 +387,6 @@ func marinerFromQuery(q url.Values) tile57.Mariner {
 			m.Soundings = tile57.SoundingsHide
 		}
 	}
-	boolP("denseSoundings", &m.DenseSoundings)
 	boolP("dataQuality", &m.DataQuality)
 	boolP("showInformCallouts", &m.ShowInformCallouts)
 	boolP("showMetaBounds", &m.ShowMetaBounds)
