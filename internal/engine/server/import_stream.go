@@ -190,6 +190,132 @@ func copyLimitedContext(
 	}
 }
 
+// stageLooseCells copies already-cached loose cells into disk staging without
+// retaining a potentially large ?cells= selection in memory.
+func (s *Server) stageLooseCells(
+	ctx context.Context,
+	provider, csv string,
+	applyUpdates bool,
+) (stagedExchangeSet, error) {
+	scratch, err := s.importScratchDir(provider)
+	if err != nil {
+		return stagedExchangeSet{}, err
+	}
+	stageDir, err := os.MkdirTemp(scratch, "stage-loose-*")
+	if err != nil {
+		return stagedExchangeSet{}, err
+	}
+	stage := stagedExchangeSet{dir: stageDir}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.RemoveAll(stageDir)
+		}
+	}()
+
+	looseDir := s.looseCellsDir()
+	entries, err := os.ReadDir(looseDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			ok = true
+			return stage, nil
+		}
+		return stagedExchangeSet{}, err
+	}
+
+	seen := map[string]bool{}
+	for raw := range strings.SplitSeq(csv, ",") {
+		if err := ctx.Err(); err != nil {
+			return stagedExchangeSet{}, err
+		}
+		stem := strings.TrimSpace(strings.TrimSuffix(raw, ".000"))
+		if !isCellName(stem) || seen[stem] {
+			continue
+		}
+		basePath := filepath.Join(looseDir, stem+".000")
+		if _, err := os.Stat(basePath); err != nil {
+			continue
+		}
+		if _, err := copyPathToFile(
+			ctx,
+			basePath,
+			filepath.Join(stageDir, stem+".000"),
+			maxImportZipEntryBytes,
+		); err != nil {
+			return stagedExchangeSet{}, err
+		}
+		seen[stem] = true
+		stage.stems = append(stage.stems, stem)
+
+		if !applyUpdates {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if strings.TrimSuffix(name, filepath.Ext(name)) != stem {
+				continue
+			}
+			ext := encExtServer(name)
+			if ext == "" || ext == ".000" {
+				continue
+			}
+			if _, err := copyPathToFile(
+				ctx,
+				filepath.Join(looseDir, name),
+				filepath.Join(stageDir, filepath.Base(name)),
+				maxImportZipEntryBytes,
+			); err != nil {
+				return stagedExchangeSet{}, err
+			}
+		}
+	}
+
+	sort.Strings(stage.stems)
+	ok = true
+	return stage, nil
+}
+
+func copyPathToFile(
+	ctx context.Context,
+	source, dest string,
+	maxBytes int64,
+) (int64, error) {
+	in, err := os.Open(source)
+	if err != nil {
+		return 0, err
+	}
+	defer in.Close()
+
+	tmp, err := os.CreateTemp(filepath.Dir(dest), ".entry-*")
+	if err != nil {
+		return 0, err
+	}
+	tmpPath := tmp.Name()
+	ok := false
+	defer func() {
+		_ = tmp.Close()
+		if !ok {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	n, err := copyLimitedContext(ctx, tmp, in, maxBytes)
+	if err != nil {
+		return n, err
+	}
+	if err := tmp.Close(); err != nil {
+		return n, err
+	}
+	if err := replaceFile(tmpPath, dest); err != nil {
+		return n, err
+	}
+	ok = true
+	return n, nil
+}
+
 func fileIsZip(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
