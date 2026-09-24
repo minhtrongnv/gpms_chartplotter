@@ -13,20 +13,10 @@ export function loadJSON(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key)) || fallback; } catch { return fallback; }
 }
 
-// Web-Mercator denominator at zoom z / latitude lat using the OGC 0.28 mm pixel.
-// Kept for bake/reference math and compatibility. The live chart UI/SCAMIN uses the
-// deterministic 0.2645 mm chartScaleDenom coordinate below. This function matches what
-// MapLibre actually renders (512-tile geometry: ~2× finer per CSS pixel than the
-// classic 256-tile slippy convention, hence the 512 metres-per-pixel constant). It
-// is the single coordinate that SCAMIN gating (chart-sources.mjs / baker), the
-// overscale ×n indication, and go-to-scale all reason in — producer scales (SCAMIN,
-// CSCL) are real 1:N paper scales, so they MUST be compared against this true scale,
-// not a relabelled 2×-coarse one. A single physical coordinate (engine and readout
-// alike) keeps SCAMIN features visible to exactly their stated scale, rather than
-// vanishing at ~½ of it. The BAND zoom ranges (bands.mjs / baker ZoomRange) are raw integer zooms and are
-// independent of this constant — they pin each usage band to a tile-pyramid level.
-// scaleDenomPhysical (below) is the screen-calibrated variant. It must not be used
-// for cross-browser chart scale, SCAMIN or overscale decisions.
+// Legacy/reference Web-Mercator denominator using the OGC 0.28 mm rendering
+// pixel. Retained for bake/reference compatibility. The live chart HUD, SCAMIN,
+// overscale and go-to-scale use chartScaleDenom/zoomForChartScale below, which
+// intentionally share tile57's fixed 0.2645 mm CSS-reference pitch.
 const M_PER_PX_Z0 = 78271.516964020485; // metres/CSS-px at z0, equator (512-tile)
 const OGC_PX_M = 0.00028; // 0.28 mm — the OGC "standardized rendering pixel"
 
@@ -43,16 +33,11 @@ export function zoomForScale(scale, lat) {
   return Math.max(0, Math.min(24, z));
 }
 
-// --- PHYSICAL (ruler-on-glass) scale --------------------------------------
-// Same 512-tile resolution as scaleDenom above (M_PER_PX_Z0), but with a per-screen,
-// calibratable pixel pitch instead of the OGC reference pixel — for an exact
-// ruler-on-glass readout. (512-tile geometry verified by unprojecting two screen
-// points in the running map.) scaleDenom is the deterministic OGC-pixel form the
-// engine/baker share; this is the calibrated readout layered on top.
-// Physical size of one CSS pixel, in mm. The CSS reference pixel is 1/96 inch ≈
-// 0.2645 mm and browsers keep CSS px near that regardless of device-pixel-ratio, so
-// it's a good DEFAULT; a per-screen calibration (settings) overrides it for exact
-// ruler accuracy. Clamped to a sane range so a bad calibration can't break the HUD.
+// --- SCREEN PHYSICAL CALIBRATION -------------------------------------------
+// Same 512-tile geometry, but with a per-screen measured CSS-pixel pitch. This is
+// screen-specific and is used only to make symbols/lines/text physically sized.
+// It is NOT the chart-scale coordinate used for HUD/SCAMIN/overscale.
+// The default CSS reference pixel is 1/96 inch ≈ 0.2645 mm.
 export const DEFAULT_PX_PITCH_MM = 0.2645;
 export function clampPxPitch(mm) {
   const v = Number(mm);
@@ -99,12 +84,8 @@ export const MIN_DETAIL_SCALE = 4000;
 // over-pull a hair past the floor and settle back — a stop with a little give,
 // not a wall that bounces. See WheelZoom.
 export const FLOOR_GIVE = 0.15;
-export function maxZoomForScaleFloor(lat, pxPitchMm = DEFAULT_PX_PITCH_MM) {
-  // Inverse of scaleDenomPhysical: the (fractional) zoom whose physical scale at
-  // `lat` equals the floor (latitude-dependent). Uses the same px pitch as the
-  // scalebar so the cap lands exactly on 1:MIN_DETAIL_SCALE as displayed.
-  const z = Math.log2(M_PER_PX_Z0 * Math.cos((lat * Math.PI) / 180) / ((clampPxPitch(pxPitchMm) / 1000) * MIN_DETAIL_SCALE));
-  return Math.max(1, Math.min(18, z));
+export function maxZoomForScaleFloor(lat) {
+  return Math.max(1, Math.min(18, zoomForChartScale(MIN_DETAIL_SCALE, lat)));
 }
 
 // NOAA ENC freshness from an issue date "YYYY-MM-DD". ENCs have no hard expiry —
