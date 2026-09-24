@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,47 @@ func makeZip(t *testing.T, entries map[string][]byte) []byte {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
+}
+
+func TestReadImportBytesRejectsOversizedPayload(t *testing.T) {
+	_, err := readImportBytes(
+		bytes.NewReader([]byte("12345")),
+		4,
+	)
+	if !errors.Is(err, errRequestBodyTooLarge) {
+		t.Fatalf(
+			"expected request-body-too-large error, got %v",
+			err,
+		)
+	}
+}
+
+func TestReadImportZipEntryRejectsExpandedLimit(t *testing.T) {
+	z := makeZip(
+		t,
+		map[string][]byte{
+			"US5MD1MC.000": bytes.Repeat([]byte("x"), 1024),
+		},
+	)
+
+	zr, err := zip.NewReader(
+		bytes.NewReader(z),
+		int64(len(z)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(zr.File) != 1 {
+		t.Fatalf("zip entries = %d, want 1", len(zr.File))
+	}
+
+	_, err = readImportZipEntry(
+		zr.File[0],
+		100,
+	)
+	if err == nil {
+		t.Fatal("expected expanded zip entry to be rejected")
+	}
 }
 
 func TestExtractZipCells(t *testing.T) {
