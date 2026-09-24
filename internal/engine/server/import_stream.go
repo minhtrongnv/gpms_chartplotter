@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -50,7 +52,7 @@ func (s *Server) spoolImportRequest(
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
 		if err := r.ParseMultipartForm(maxImportMultipartMemory); err != nil {
 			var maxErr *http.MaxBytesError
-			if errorsAsMaxBytes(err, &maxErr) {
+			if errors.As(err, &maxErr) {
 				return "", 0, fmt.Errorf(
 					"%w: import request exceeds %d bytes",
 					errRequestBodyTooLarge,
@@ -82,24 +84,6 @@ func (s *Server) spoolImportRequest(
 		return "", 0, err
 	}
 	return spoolReaderToTemp(ctx, src, scratch, "upload-*.zip", maxImportBytes)
-}
-
-// errorsAsMaxBytes is kept tiny so import_stream.go does not need to duplicate
-// request-body error normalisation logic.
-func errorsAsMaxBytes(err error, target **http.MaxBytesError) bool {
-	for err != nil {
-		if v, ok := err.(*http.MaxBytesError); ok {
-			*target = v
-			return true
-		}
-		type unwrapper interface{ Unwrap() error }
-		u, ok := err.(unwrapper)
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
 }
 
 func spoolReaderToTemp(
