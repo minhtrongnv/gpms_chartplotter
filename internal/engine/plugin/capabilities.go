@@ -18,8 +18,12 @@ import (
 	"github.com/beetlebugorg/chartplotter/internal/engine/nmea"
 )
 
-// maxHTTPBody caps an http.fetch response body (spec §6 "response size caps").
-const maxHTTPBody = 32 << 20
+// Host-mediated I/O limits keep a granted but buggy/malicious plugin from
+// exhausting process resources.
+const (
+	maxHTTPBody      = 32 << 20
+	maxPluginHandles = 64
+)
 
 // capabilities.go implements the plugin→host surface: it dispatches inbound requests
 // and notifications to the granted capability, enforcing the grant set first (spec
@@ -181,7 +185,23 @@ func (b *brokerSession) handleTCPConnect(ctx context.Context, m *Message) {
 		b.replyErr(m.ID, CodeInternalError, "dial: "+err.Error())
 		return
 	}
-	handle := b.addHandle(&ioHandle{conn: conn, cancel: cancel})
+	handle, ok := b.addHandle(
+		&ioHandle{
+			conn:   conn,
+			cancel: cancel,
+		},
+	)
+	if !ok {
+		cancel()
+		_ = conn.Close()
+		b.replyErr(
+			m.ID,
+			CodeInternalError,
+			"too many open plugin I/O handles",
+		)
+		return
+	}
+
 	b.reply(m.ID, HandleResult{Handle: handle})
 	go b.pumpConn(handle, conn)
 }
@@ -244,12 +264,18 @@ func (b *brokerSession) serialOpen(m *Message) {
 
 // --- handle table ----------------------------------------------------------
 
-func (b *brokerSession) addHandle(h *ioHandle) int {
+func (b *brokerSession) addHandle(h *ioHandle) (int, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if len(b.handles) >= maxPluginHandles {
+		return 0, false
+	}
+
 	b.nextH++
 	b.handles[b.nextH] = h
-	return b.nextH
+
+	return b.nextH, true
 }
 
 func (b *brokerSession) getHandle(id int) *ioHandle {
