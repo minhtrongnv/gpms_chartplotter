@@ -2,59 +2,134 @@ package main
 
 import "testing"
 
-func TestRequiresAccessToken(t *testing.T) {
+func TestResolveServeAccessPolicy(t *testing.T) {
 	tests := []struct {
 		name            string
-		allowRemote     bool
+		mode            string
 		trustedProxies  string
 		trustCloudflare bool
-		want            bool
+		wantMode        string
+		wantTrustCF     bool
+		wantErr         bool
 	}{
 		{
-			name:        "loopback development",
-			allowRemote: false,
-			want:        false,
+			name:     "default is local",
+			mode:     "",
+			wantMode: accessModeLocal,
 		},
 		{
-			name:        "direct non-loopback exposure",
-			allowRemote: true,
-			want:        true,
+			name:     "explicit local",
+			mode:     "local",
+			wantMode: accessModeLocal,
 		},
 		{
-			name:           "generic trusted proxy still requires bearer",
-			allowRemote:    true,
+			name:           "local rejects trusted proxies",
+			mode:           "local",
 			trustedProxies: "172.20.0.0/24",
-			want:           true,
+			wantErr:        true,
 		},
 		{
-			name:            "trusted Cloudflare Tunnel may use upstream access policy",
-			allowRemote:     true,
+			name:            "local rejects Cloudflare trust flag",
+			mode:            "local",
+			trustCloudflare: true,
+			wantErr:         true,
+		},
+		{
+			name:           "cloudflare requires trusted proxies",
+			mode:           "cloudflare",
+			trustedProxies: "",
+			wantErr:        true,
+		},
+		{
+			name:           "cloudflare implies CF header trust",
+			mode:           "cloudflare",
+			trustedProxies: "172.20.0.0/24",
+			wantMode:       accessModeCloudflare,
+			wantTrustCF:    true,
+		},
+		{
+			name:            "legacy trust flag remains accepted in cloudflare mode",
+			mode:            "cloudflare",
 			trustedProxies:  "172.20.0.0/24",
 			trustCloudflare: true,
-			want:            false,
+			wantMode:        accessModeCloudflare,
+			wantTrustCF:     true,
 		},
 		{
-			name:            "Cloudflare trust without proxy configuration remains protected",
-			allowRemote:     true,
-			trustCloudflare: true,
-			want:            true,
+			name:    "unknown mode",
+			mode:    "public",
+			wantErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := requiresAccessToken(
-				tt.allowRemote,
+			got, err := resolveServeAccessPolicy(
+				tt.mode,
 				tt.trustedProxies,
 				tt.trustCloudflare,
 			)
 
-			if got != tt.want {
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if got.mode != tt.wantMode {
 				t.Fatalf(
-					"requiresAccessToken() = %v, want %v",
-					got,
-					tt.want,
+					"mode = %q, want %q",
+					got.mode,
+					t.wantMode,
 				)
+			}
+
+			if got.trustCloudflare != tt.wantTrustCF {
+				t.Fatalf(
+					"trustCloudflare = %v, want %v",
+					got.trustCloudflare,
+					t.wantTrustCF,
+				)
+			}
+		})
+	}
+}
+
+func TestValidateLocalBindHost(t *testing.T) {
+	tests := []struct {
+		host    string
+		wantErr bool
+	}{
+		{host: "127.0.0.1"},
+		{host: "localhost"},
+		{host: "0.0.0.0"},
+		{host: "::"},
+		{host: "192.168.210.10"},
+		{host: "10.0.0.10"},
+		{host: "172.20.0.5"},
+		{host: "169.254.10.20"},
+		{host: "fc00::10"},
+		{host: "fe80::1"},
+		{host: "chartplotter"},
+		{host: "8.8.8.8", wantErr: true},
+		{host: "2001:4860:4860::8888", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			err := validateLocalBindHost(tt.host)
+
+			if tt.wantErr && err == nil {
+				t.Fatal("expected error")
+			}
+
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
 			}
 		})
 	}
