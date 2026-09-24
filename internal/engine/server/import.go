@@ -530,6 +530,12 @@ func (s *Server) runImportFetch(
 		fail(fmt.Errorf("no cells downloaded"))
 		return
 	}
+	if req.ZipURL == "" {
+		if err := s.markProviderDirty(provider); err != nil {
+			fail(err)
+			return
+		}
+	}
 	if req.DownloadOnly {
 		log.Printf(
 			"import %s: downloaded %d cell(s) into %s",
