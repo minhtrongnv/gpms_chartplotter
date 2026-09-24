@@ -6,8 +6,18 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+)
+
+const (
+	// Directory sections are normally tiny relative to tile data. Keep a generous
+	// hard ceiling so a corrupt/hand-dropped archive cannot ask the server to
+	// allocate gigabytes before any tile request is served.
+	maxReaderDirectoryBytes uint64 = 256 << 20
+	maxReaderMetadataBytes  uint64 = 1 << 20
+	maxReaderTileBytes      uint64 = 64 << 20
 )
 
 // Reader provides random tile access to a PMTiles v3 archive written by Builder.
@@ -25,6 +35,7 @@ type Reader struct {
 	leaves  []byte // raw leaf-directory section (parsed on demand)
 	leafOff uint64
 	dataOff uint64
+	dataLen uint64
 	tileGz  bool
 	meta    TileMeta
 }
@@ -79,9 +90,33 @@ func NewReader(src io.ReaderAt, size int64) (*Reader, error) {
 	metaOff := binary.LittleEndian.Uint64(h[24:32])
 	metaLen := binary.LittleEndian.Uint64(h[32:40])
 	leafOff := binary.LittleEndian.Uint64(h[40:48])
+	leafLen := binary.LittleEndian.Uint64(h[48:56])
 	dataOff := binary.LittleEndian.Uint64(h[56:64])
+	dataLen := binary.LittleEndian.Uint64(h[64:72])
+	fileSize := uint64(size)
 
-	rootBytes := make([]byte, rootLen)
+	rootEnd, rootOK := checkedSectionEnd(fileSize, rootOff, rootLen)
+	metaEnd, metaOK := checkedSectionEnd(fileSize, metaOff, metaLen)
+	leafEnd, leafOK := checkedSectionEnd(fileSize, leafOff, leafLen)
+	_, dataOK := checkedSectionEnd(fileSize, dataOff, dataLen)
+	if !rootOK || !metaOK || !leafOK || !dataOK ||
+		rootOff < 127 || rootEnd > metaOff || metaEnd > leafOff || leafEnd > dataOff {
+		return nil, errors.New("pmtiles: invalid or overlapping header sections")
+	}
+	if rootLen > maxReaderDirectoryBytes || leafLen > maxReaderDirectoryBytes {
+		return nil, fmt.Errorf("pmtiles: directory section exceeds %d bytes", maxReaderDirectoryBytes)
+	}
+	if metaLen > maxReaderMetadataBytes {
+		return nil, fmt.Errorf("pmtiles: metadata exceeds %d bytes", maxReaderMetadataBytes)
+	}
+	if h[97] != compressionNone {
+		return nil, fmt.Errorf("pmtiles: unsupported directory compression %d", h[97])
+	}
+	if h[98] != compressionNone && h[98] != compressionGzip {
+		return nil, fmt.Errorf("pmtiles: unsupported tile compression %d", h[98])
+	}
+
+	rootBytes := make([]byte, int(rootLen))
 	if _, err := src.ReadAt(rootBytes, int64(rootOff)); err != nil {
 		return nil, err
 	}
@@ -95,6 +130,7 @@ func NewReader(src io.ReaderAt, size int64) (*Reader, error) {
 		root:    root,
 		leafOff: leafOff,
 		dataOff: dataOff,
+		dataLen: dataLen,
 		tileGz:  h[98] == compressionGzip,
 		meta: TileMeta{
 			MinZoom:  h[100],
@@ -110,8 +146,8 @@ func NewReader(src io.ReaderAt, size int64) (*Reader, error) {
 	// JSON metadata (between metaOff and leafOff): parse the SCAMIN manifest so the
 	// client can build per-SCAMIN bucket layers at load. Best-effort — absence just
 	// means the older runtime-collection path is used.
-	if metaLen > 0 && metaLen < 1<<20 {
-		mb := make([]byte, metaLen)
+	if metaLen > 0 {
+		mb := make([]byte, int(metaLen))
 		if _, err := src.ReadAt(mb, int64(metaOff)); err == nil {
 			var md struct {
 				Scamin []uint32 `json:"scamin"`
@@ -121,14 +157,21 @@ func NewReader(src io.ReaderAt, size int64) (*Reader, error) {
 			}
 		}
 	}
-	// Leaf section sits between leafOff and dataOff; load it once if present.
-	if dataOff > leafOff {
-		rd.leaves = make([]byte, dataOff-leafOff)
+	// Leaf directory bytes are bounded and header-validated above.
+	if leafLen > 0 {
+		rd.leaves = make([]byte, int(leafLen))
 		if _, err := src.ReadAt(rd.leaves, int64(leafOff)); err != nil {
 			return nil, err
 		}
 	}
 	return rd, nil
+}
+
+func checkedSectionEnd(size, off, length uint64) (uint64, bool) {
+	if off > size || length > size-off {
+		return 0, false
+	}
+	return off + length, true
 }
 
 // Meta returns the archive's header metadata.
@@ -152,7 +195,11 @@ func (rd *Reader) Tile(z uint8, x, y uint32) ([]byte, error) {
 		return nil, nil
 	}
 	if e.runLength == 0 { // leaf pointer: descend one level
-		leaf, err := deserializeDir(rd.leaves[e.offset : e.offset+e.length])
+		leafEnd, ok := checkedSectionEnd(uint64(len(rd.leaves)), e.offset, e.length)
+		if !ok {
+			return nil, errors.New("pmtiles: leaf pointer outside directory section")
+		}
+		leaf, err := deserializeDir(rd.leaves[int(e.offset):int(leafEnd)])
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +209,13 @@ func (rd *Reader) Tile(z uint8, x, y uint32) ([]byte, error) {
 		}
 	}
 
-	body := make([]byte, e.length)
+	if e.length > maxReaderTileBytes {
+		return nil, fmt.Errorf("pmtiles: tile exceeds %d bytes", maxReaderTileBytes)
+	}
+	if _, ok := checkedSectionEnd(rd.dataLen, e.offset, e.length); !ok {
+		return nil, errors.New("pmtiles: tile points outside data section")
+	}
+	body := make([]byte, int(e.length))
 	if _, err := rd.src.ReadAt(body, int64(rd.dataOff+e.offset)); err != nil {
 		return nil, err
 	}
@@ -205,7 +258,12 @@ func deserializeDir(buf []byte) ([]entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]entry, n)
+	// Each entry needs at least one varint in each of the four encoded arrays.
+	// Reject an impossible count before converting it to int or allocating.
+	if n > uint64(len(buf))/4 {
+		return nil, errors.New("pmtiles: impossible directory entry count")
+	}
+	entries := make([]entry, int(n))
 
 	var prev uint64
 	for i := range entries { // delta-encoded tile ids
@@ -235,8 +293,15 @@ func deserializeDir(buf []byte) ([]entry, error) {
 		if err != nil {
 			return nil, err
 		}
-		if v == 0 && i > 0 {
-			entries[i].offset = entries[i-1].offset + entries[i-1].length
+		if v == 0 {
+			if i == 0 {
+				return nil, errors.New("pmtiles: first directory offset cannot be contiguous")
+			}
+			prev := entries[i-1]
+			if prev.length > ^uint64(0)-prev.offset {
+				return nil, errors.New("pmtiles: directory offset overflow")
+			}
+			entries[i].offset = prev.offset + prev.length
 		} else {
 			entries[i].offset = v - 1
 		}

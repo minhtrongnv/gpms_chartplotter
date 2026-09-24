@@ -90,3 +90,70 @@ func TestReaderMeta(t *testing.T) {
 		t.Fatalf("W = %v, want -76.5", m.W)
 	}
 }
+
+
+type sparseReaderAt struct {
+	header [127]byte
+}
+
+func (r sparseReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	if off < int64(len(r.header)) && off+int64(len(p)) > 0 {
+		start := max(int64(0), off)
+		end := min(int64(len(r.header)), off+int64(len(p)))
+		copy(p[start-off:end-off], r.header[start:end])
+	}
+	return len(p), nil
+}
+
+func TestReaderRejectsOversizedDirectoryBeforeAllocation(t *testing.T) {
+	var h [127]byte
+	copy(h[0:7], "PMTiles")
+	h[7] = 3
+	binary.LittleEndian.PutUint64(h[8:16], 127)
+	binary.LittleEndian.PutUint64(h[16:24], maxReaderDirectoryBytes+1)
+	metaOff := uint64(127) + maxReaderDirectoryBytes + 1
+	binary.LittleEndian.PutUint64(h[24:32], metaOff)
+	binary.LittleEndian.PutUint64(h[40:48], metaOff)
+	binary.LittleEndian.PutUint64(h[56:64], metaOff)
+	h[97] = compressionNone
+	h[98] = compressionNone
+
+	_, err := NewReader(
+		sparseReaderAt{header: h},
+		int64(metaOff),
+	)
+	if err == nil {
+		t.Fatal("NewReader accepted oversized root directory")
+	}
+}
+
+func TestDeserializeDirRejectsImpossibleCount(t *testing.T) {
+	if _, err := deserializeDir([]byte{100}); err == nil {
+		t.Fatal("deserializeDir accepted impossible entry count")
+	}
+}
+
+func TestDeserializeDirRejectsFirstContiguousOffset(t *testing.T) {
+	// n=1, tile delta=0, run=1, length=1, offset=0 (invalid for first entry).
+	if _, err := deserializeDir([]byte{1, 0, 1, 1, 0}); err == nil {
+		t.Fatal("deserializeDir accepted a contiguous first offset")
+	}
+}
+
+func TestReaderRejectsOversizedTileBeforeAllocation(t *testing.T) {
+	rd := &Reader{
+		src: sparseReaderAt{},
+		root: []entry{{
+			tileID:    ZxyToTileID(0, 0, 0),
+			length:    maxReaderTileBytes + 1,
+			runLength: 1,
+		}},
+		dataLen: maxReaderTileBytes + 1,
+	}
+	if _, err := rd.Tile(0, 0, 0); err == nil {
+		t.Fatal("Tile accepted oversized tile payload")
+	}
+}

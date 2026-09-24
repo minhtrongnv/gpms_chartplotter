@@ -404,6 +404,11 @@ var chartHTTPClient = func() *http.Client {
 	// Bound only the connection/setup phases here; body progress has its own
 	// no-progress watchdog in fetchURLProgress.
 	transport.ResponseHeaderTimeout = 60 * time.Second
+	// /api/proxy legitimately performs many Range reads, but an unbounded number
+	// of client requests must not turn into unbounded upstream sockets.
+	transport.MaxConnsPerHost = 32
+	transport.MaxIdleConnsPerHost = 16
+	transport.MaxIdleConns = 64
 
 	return &http.Client{
 		Transport: transport,

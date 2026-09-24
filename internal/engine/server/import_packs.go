@@ -1,9 +1,7 @@
 package server
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -48,8 +46,8 @@ func (s *Server) handleImportPacks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req importPacksReq
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-		apiErr(w, http.StatusBadRequest, "bad JSON: "+err.Error())
+	if err := decodeJSONBody(w, r, &req, 1<<20); err != nil {
+		writeJSONBodyError(w, err)
 		return
 	}
 	if len(req.Packs) == 0 {
