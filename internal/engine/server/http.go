@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -312,12 +313,35 @@ func apiErr(w http.ResponseWriter, status int, msg string) {
 	fmt.Fprintf(w, `{"ok":false,"error":%q}`, msg)
 }
 
-// hostIsLocal reports whether the request Host is a loopback name — the
-// DNS-rebind defence for the local webapp.
-func hostIsLocal(host string) bool {
-	return strings.HasPrefix(host, "127.0.0.1") ||
-		strings.HasPrefix(host, "localhost") ||
-		strings.HasPrefix(host, "[::1]")
+// hostIsLocal reports whether the request Host is an exact localhost name or a
+// loopback IP. Parse the host component instead of using string prefixes: values
+// such as "localhost.evil.example" and "127.0.0.1.evil.example" must never pass
+// the DNS-rebinding guard.
+func hostIsLocal(hostport string) bool {
+	host := strings.TrimSpace(hostport)
+	if host == "" {
+		return false
+	}
+
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	} else if strings.HasPrefix(host, "[") &&
+		strings.HasSuffix(host, "]") {
+		host = strings.TrimSuffix(
+			strings.TrimPrefix(host, "["),
+			"]",
+		)
+	}
+
+	host = strings.TrimSuffix(host, ".")
+
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+
+	return ip != nil && ip.IsLoopback()
 }
 
 const contentSecurityPolicy = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; connect-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; manifest-src 'self'; form-action 'self'"
