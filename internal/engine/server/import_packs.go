@@ -279,5 +279,10 @@ func (s *Server) fetchPackCells(
 		}
 		s.imports.update(jobID, func(j *importJob) { j.Done = i + 1 })
 	}
+	if count > 0 {
+		if err := s.markProviderDirty(provider); err != nil {
+			return count, err
+		}
+	}
 	return count, nil
 }
