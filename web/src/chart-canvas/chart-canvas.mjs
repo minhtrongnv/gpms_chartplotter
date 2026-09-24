@@ -282,17 +282,13 @@ export class ChartCanvas extends HTMLElement {
       return r.json();
     };
 
-    // Prefer the standard 2x atlas even on a 1x display. The old hosted demo
-    // effectively supersampled symbols (a much larger source atlas scaled down),
-    // which is one reason its edges looked cleaner. Current tile57's drawn-scale
-    // atlas is dramatically smaller, so 2x restores useful sampling headroom while
-    // still staying well below the historical generic-atlas pixel cost.
-    //
-    // pixelRatio=2 keeps the LOGICAL/physical S-52 size identical. ?sprite1x
-    // is an escape hatch for unusually memory-constrained ship hardware.
+    // Prefer the HQ atlas whose raster density matches the older hosted demo.
+    // tile57 metadata carries the non-integer pixelRatio (~2.82224), so MapLibre
+    // keeps the SAME logical/physical S-52 size while sampling far more source
+    // pixels. ?sprite1x is the low-memory escape hatch for ship hardware.
     const loadSpritePair = async () => {
       const force1x = new URLSearchParams(location.search).has("sprite1x");
-      const bases = force1x ? ["sprite"] : ["sprite@2x", "sprite"];
+      const bases = force1x ? ["sprite"] : ["sprite-hq", "sprite"];
       let lastErr = null;
 
       for (const base of bases) {
@@ -1261,8 +1257,16 @@ export class ChartCanvas extends HTMLElement {
         maxW = Math.max(maxW, w); maxH = Math.max(maxH, h);
         if (w * h > bw * bh) { big = id; bw = w; bh = h; }
       }
+      const canvas = map.getCanvas && map.getCanvas();
+      const cssW = canvas && canvas.clientWidth || 0;
+      const cssH = canvas && canvas.clientHeight || 0;
+      const backW = canvas && canvas.width || 0;
+      const backH = canvas && canvas.height || 0;
+      const backingRatio = cssW > 0 ? backW / cssW : 0;
       console.log(
         `[gldiag] MAX_TEXTURE_SIZE=${maxTex} renderer="${renderer}" | ` +
+        `DPR=${window.devicePixelRatio || 1} canvas=${backW}x${backH}/${cssW}x${cssH} ` +
+        `backingRatio=${backingRatio.toFixed(2)} | ` +
         `images=${n} widest=${maxW} tallest=${maxH} biggest=${big}(${bw}x${bh})`
       );
       if (maxW > maxTex || maxH > maxTex) {

@@ -599,8 +599,8 @@ var tile57PortrayalAssets = map[string]struct{}{
 	"linestyles.json":  {},
 	"sprite.json":      {},
 	"sprite.png":       {},
-	"sprite@2x.json":   {},
-	"sprite@2x.png":    {},
+	"sprite-hq.json":   {},
+	"sprite-hq.png":    {},
 	"patterns.json":    {},
 	"patterns.png":     {},
 }
@@ -617,7 +617,7 @@ func isTile57PortrayalAsset(name string) bool {
 // explicit --assets directory for those six files only. This prevents a stale
 // dev-time sprite.png/json (for example, from an older tile57 commit) from being
 // paired with a newer style whose atlas normalization changed. The generated
-// 1x/2x sprite pairs are both covered by this rule.
+// 1x/high-quality sprite pairs are both covered by this rule.
 //
 // All other files keep the normal development precedence:
 //   1. explicit --assets dir

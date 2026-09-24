@@ -32,18 +32,18 @@ func emitS101Assets(catalogDir, dir string) ([]string, error) {
 		return nil, err
 	}
 
-	// Also emit the standard Retina/HiDPI pair. tile57 rasterizes the SAME
-	// logical S-52 symbol at 2 device pixels per reference pixel and writes
-	// pixelRatio=2 into the metadata, so MapLibre keeps the exact same chart
-	// symbol size while sampling a much sharper texture.
+	// Restore the SOURCE raster density of the older hosted demo without
+	// restoring its oversized on-screen symbols. The old tile57 atlas rasterized
+	// at 0.08 catalogue units; current tile57 rasterizes at the actual drawn scale
+	// 0.02834627777338028. Their ratio is ~2.82224.
 	//
-	// This does not reintroduce the old oversized atlas: current tile57 bakes at
-	// the drawn scale (~0.354 of the historical linear size), so a 2x drawn-scale
-	// sprite still carries roughly half the pixel area of the old generic 1x
-	// sheet while materially improving edge/text/sounding sharpness.
-	sprite2xJSON, sprite2xPNG, err := tile57.BakeMapLibreSprite(
+	// Baking the current atlas at this ratio and preserving pixelRatio in MapLibre
+	// gives the same logical/physical S-52 symbol size as the current engine, but
+	// roughly the same source sampling density/sharpness as the old demo.
+	const sharpSpriteRatio = 2.82224003587262
+	sharpSpriteJSON, sharpSpritePNG, err := tile57.BakeMapLibreSprite(
 		catalogDir,
-		2,
+		sharpSpriteRatio,
 		tile57.SchemeDay,
 	)
 	if err != nil {
@@ -61,8 +61,8 @@ func emitS101Assets(catalogDir, dir string) ([]string, error) {
 		{"linestyles.json", a.Linestyles},
 		{"sprite.json", spriteJSON},
 		{"sprite.png", spritePNG},
-		{"sprite@2x.json", sprite2xJSON},
-		{"sprite@2x.png", sprite2xPNG},
+		{"sprite-hq.json", sharpSpriteJSON},
+		{"sprite-hq.png", sharpSpritePNG},
 		{"patterns.json", a.PatternJSON},
 		{"patterns.png", a.PatternPNG},
 	}
