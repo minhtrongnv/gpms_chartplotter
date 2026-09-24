@@ -3,6 +3,7 @@ package pmtiles
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/binary"
 	"fmt"
 	"testing"
 )
