@@ -70,3 +70,11 @@ func TestMarinerFromQueryDisplayCategory(t *testing.T) {
 		t.Fatalf("other category = base:%v standard:%v other:%v", other.DisplayBase, other.DisplayStandard, other.DisplayOther)
 	}
 }
+
+
+func TestMarinerFromQueryPhysicalSizeScale(t *testing.T) {
+	m := marinerFromQuery(url.Values{"sizeScale": {"0.977"}})
+	if m.SizeScale < 0.9769 || m.SizeScale > 0.9771 {
+		t.Fatalf("sizeScale=%v, want 0.977", m.SizeScale)
+	}
+}
