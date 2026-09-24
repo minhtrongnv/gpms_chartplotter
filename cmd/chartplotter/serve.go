@@ -292,8 +292,11 @@ func (c serveCmd) Run() error {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		MaxHeaderBytes:    64 << 10,
 
+		// ReadTimeout and WriteTimeout intentionally stay at zero. ENC/plugin
+		// uploads can be large, while SSE and Range responses are long-lived.
+		// Individual request bodies are size-capped by their handlers instead.
 		BaseContext: func(
 			net.Listener,
 		) context.Context {
