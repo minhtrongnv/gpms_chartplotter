@@ -106,7 +106,14 @@ func readAuxDirIndex(indexPath string, out map[string]auxLoc) {
 	}
 	dir := filepath.Dir(indexPath)
 	for name, e := range man.Files {
-		out[strings.ToUpper(name)] = auxLoc{dir: dir, stored: e.Stored, typ: e.Type}
+		if !safeAuxStoredName(e.Stored) {
+			continue
+		}
+		out[strings.ToUpper(name)] = auxLoc{
+			dir:    dir,
+			stored: e.Stored,
+			typ:    e.Type,
+		}
 	}
 }
 
@@ -133,7 +140,14 @@ func readAuxZipIndex(path string, out map[string]auxLoc) {
 			return
 		}
 		for name, e := range man.Files {
-			out[strings.ToUpper(name)] = auxLoc{zip: path, stored: e.Stored, typ: e.Type}
+			if !safeAuxStoredName(e.Stored) {
+				continue
+			}
+			out[strings.ToUpper(name)] = auxLoc{
+				zip:    path,
+				stored: e.Stored,
+				typ:    e.Type,
+			}
 		}
 		return
 	}
@@ -197,10 +211,26 @@ func (s *Server) serveAux(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func safeAuxStoredName(name string) bool {
+	if name == "" ||
+		name == "." ||
+		name == ".." ||
+		strings.ContainsAny(name, "/\\") {
+
+		return false
+	}
+
+	return filepath.Base(name) == name
+}
+
 // writeAuxEntry streams one stored aux file to w with the indexed MIME type — a loose
 // file read straight off disk (current layout), or, for a legacy companion, the entry
 // extracted from its zip.
 func writeAuxEntry(w http.ResponseWriter, loc auxLoc) error {
+	if !safeAuxStoredName(loc.stored) {
+		return fmt.Errorf("unsafe aux filename %q", loc.stored)
+	}
+
 	if loc.dir != "" {
 		b, err := os.ReadFile(filepath.Join(loc.dir, loc.stored))
 		if err != nil {
