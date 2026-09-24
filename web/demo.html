@@ -59,20 +59,7 @@
 </head>
 <body>
   <div id="splash"><div class="spinner"></div><div>Loading charts…</div></div>
-  <script>
-    (function () {
-      var done = false;
-      function hide() {
-        if (done) return; done = true;
-        var s = document.getElementById("splash");
-        if (!s) return;
-        s.classList.add("hide");
-        setTimeout(function () { s.remove(); }, 500);
-      }
-      addEventListener("ready", hide, { once: true });
-      setTimeout(hide, 20000);
-    })();
-  </script>
+  <script src="./src/splash.js"></script>
 
   <!-- `widget` → read-only viewer; no `pmtiles=` attribute, so the per-band archives
        are discovered from charts-index.json in this directory. Centred on Annapolis
