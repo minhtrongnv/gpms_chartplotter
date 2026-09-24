@@ -6,6 +6,84 @@ import (
 	"testing"
 )
 
+func TestHostIsLocal(t *testing.T) {
+	cases := []struct {
+		host string
+		want bool
+	}{
+		{"127.0.0.1", true},
+		{"127.0.0.1:8080", true},
+		{"127.0.0.2:8080", true},
+		{"localhost", true},
+		{"LOCALHOST:8080", true},
+		{"localhost.", true},
+		{"[::1]", true},
+		{"[::1]:8080", true},
+		{"::1", true},
+		{"localhost.evil.example", false},
+		{"127.0.0.1.evil.example", false},
+		{"evil.example", false},
+		{"", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.host, func(t *testing.T) {
+			if got := hostIsLocal(tc.host); got != tc.want {
+				t.Fatalf(
+					"hostIsLocal(%q) = %v, want %v",
+					tc.host,
+					got,
+					tc.want,
+				)
+			}
+		})
+	}
+}
+
+func TestLoopbackHostGuardRejectsPrefixSpoof(t *testing.T) {
+	s := New("", t.TempDir(), t.TempDir(), false, "")
+	defer s.Close()
+
+	r := httptest.NewRequest(
+		http.MethodGet,
+		"http://127.0.0.1:8080/api/health",
+		nil,
+	)
+	r.Host = "localhost.evil.example"
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf(
+			"prefix-spoofed Host status = %d, want 403",
+			w.Code,
+		)
+	}
+}
+
+func TestSSEHeadersDoNotAllowCrossOrigin(t *testing.T) {
+	w := httptest.NewRecorder()
+
+	if _, ok := sseStart(w); !ok {
+		t.Fatal("expected httptest recorder to support streaming")
+	}
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf(
+			"Access-Control-Allow-Origin = %q, want empty for live SSE",
+			got,
+		)
+	}
+
+	if got := w.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf(
+			"Content-Type = %q, want text/event-stream",
+			got,
+		)
+	}
+}
+
 func TestAllowedChartURL(t *testing.T) {
 	cases := []struct {
 		url  string
