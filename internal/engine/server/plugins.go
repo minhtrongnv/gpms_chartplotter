@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,7 +24,11 @@ import (
 // per-plugin /plugins/<id>/{ui,serve}/* static surface (spec §11, Appendix A.2).
 
 // maxPluginUpload caps an uploaded plugin archive.
-const maxPluginUpload = 64 << 20
+const (
+	maxPluginUpload      int64 = 64 << 20 // 64 MiB actual plugin ZIP
+	maxPluginRequestBody int64 = 65 << 20 // allow multipart overhead
+	maxMultipartMemory   int64 = 8 << 20  // spill larger multipart data to disk
+)
 
 // initPlugins builds the Manager rooted at the data dir and starts enabled plugins.
 func (s *Server) initPlugins() {
@@ -74,9 +79,35 @@ func (s *Server) servePluginInstall(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	if err := r.ParseMultipartForm(maxPluginUpload); err != nil {
-		apiErr(w, http.StatusBadRequest, "bad upload: "+err.Error())
+
+	r.Body = http.MaxBytesReader(
+		w,
+		r.Body,
+		maxPluginRequestBody,
+	)
+
+	if err := r.ParseMultipartForm(maxMultipartMemory); err != nil {
+		var maxErr *http.MaxBytesError
+
+		if errors.As(err, &maxErr) {
+			apiErr(
+				w,
+				http.StatusRequestEntityTooLarge,
+				"plugin upload request too large",
+			)
+			return
+		}
+
+		apiErr(
+			w,
+			http.StatusBadRequest,
+			"bad upload: "+err.Error(),
+		)
 		return
+	}
+
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
 	file, _, err := r.FormFile("plugin")
 	if err != nil {
@@ -90,9 +121,33 @@ func (s *Server) servePluginInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.Remove(tmp.Name())
-	if _, err := io.Copy(tmp, io.LimitReader(file, maxPluginUpload)); err != nil {
+	written, err := io.Copy(
+		tmp,
+		io.LimitReader(
+			file,
+			maxPluginUpload+1,
+		),
+	)
+
+	if err != nil {
 		tmp.Close()
-		apiErr(w, http.StatusInternalServerError, err.Error())
+
+		apiErr(
+			w,
+			http.StatusInternalServerError,
+			err.Error(),
+		)
+		return
+	}
+
+	if written > maxPluginUpload {
+		tmp.Close()
+
+		apiErr(
+			w,
+			http.StatusRequestEntityTooLarge,
+			"plugin file exceeds 64 MiB limit",
+		)
 		return
 	}
 	tmp.Close()
@@ -131,15 +186,26 @@ func (s *Server) servePluginItem(w http.ResponseWriter, r *http.Request) {
 			Grants []plugin.Capability `json:"grants"`
 			Config map[string]any      `json:"config"`
 		}
-		if err := decodeJSON(r, &body); err != nil {
-			apiErr(w, http.StatusBadRequest, err.Error())
+		if err := decodeJSONBody(
+			w,
+			r,
+			&body,
+			maxAPIJSONBody,
+		); err != nil {
+			writeJSONBodyError(w, err)
 			return
 		}
 		s.pluginErr(w, s.pluginMgr.SetGrants(id, body.Grants, body.Config))
 	case action == "config" && (r.Method == http.MethodPut || r.Method == http.MethodPost):
 		var cfg map[string]any
-		if err := decodeJSON(r, &cfg); err != nil {
-			apiErr(w, http.StatusBadRequest, err.Error())
+
+		if err := decodeJSONBody(
+			w,
+			r,
+			&cfg,
+			maxAPIJSONBody,
+		); err != nil {
+			writeJSONBodyError(w, err)
 			return
 		}
 		s.pluginErr(w, s.pluginMgr.SetConfig(id, cfg)) // config-only update keeps grants
@@ -230,10 +296,6 @@ func (s *Server) pluginErr(w http.ResponseWriter, err error) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true})
-}
-
-func decodeJSON(r *http.Request, v any) error {
-	return json.NewDecoder(io.LimitReader(r.Body, maxConnBody)).Decode(v)
 }
 
 // validPluginID accepts the reverse-DNS ids the manifest allows — a safe path

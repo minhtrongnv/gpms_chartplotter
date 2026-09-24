@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,9 +21,6 @@ import (
 // survive a baked-tile cache wipe). Each parsed sentence flows into one shared
 // vessel-state Store, streamed to every screen via /api/vessel/stream; raw
 // sentences fan out to /api/connections/<id>/raw for the wiring sniffer.
-
-// maxConnBody caps a POSTed/PUT connection config — small JSON.
-const maxConnBody = 64 << 10
 
 // initNMEA builds the shared store + manager, loads persisted connections, and
 // starts a live runner for each. Called once from New.
@@ -206,9 +202,9 @@ func (s *Server) serveConnections(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"ok": true, "connections": out})
 	case http.MethodPost:
-		src, err := decodeSource(r)
+		src, err := decodeSource(w, r)
 		if err != nil {
-			apiErr(w, http.StatusBadRequest, err.Error())
+			writeJSONBodyError(w, err)
 			return
 		}
 		stored := s.conns.add(src)
@@ -245,9 +241,9 @@ func (s *Server) serveConnection(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"ok": true, "connection": s.dto(src)})
 	case http.MethodPut, http.MethodPatch:
-		src, err := decodeSource(r)
+		src, err := decodeSource(w, r)
 		if err != nil {
-			apiErr(w, http.StatusBadRequest, err.Error())
+			writeJSONBodyError(w, err)
 			return
 		}
 		stored, ok := s.conns.update(id, src)
@@ -271,10 +267,19 @@ func (s *Server) serveConnection(w http.ResponseWriter, r *http.Request) {
 
 // decodeSource reads + validates a connection config from the request body,
 // applying v1 defaults (tcp-client / nmea0183 / in).
-func decodeSource(r *http.Request) (nmea.Source, error) {
+func decodeSource(
+	w http.ResponseWriter,
+	r *http.Request,
+) (nmea.Source, error) {
 	var src nmea.Source
-	if err := json.NewDecoder(io.LimitReader(r.Body, maxConnBody)).Decode(&src); err != nil {
-		return nmea.Source{}, fmt.Errorf("bad JSON: %w", err)
+
+	if err := decodeJSONBody(
+		w,
+		r,
+		&src,
+		maxAPIJSONBody,
+	); err != nil {
+		return nmea.Source{}, err
 	}
 	if src.Transport == "" {
 		src.Transport = nmea.TransportTCPClient

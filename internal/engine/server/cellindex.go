@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/beetlebugorg/chartplotter/internal/engine/tile57gate"
 	tile57 "github.com/beetlebugorg/tile57/bindings/go"
 )
 
@@ -171,12 +172,27 @@ func (ci *cellIndex) scan() {
 		if _, ok := ci.get(name); ok {
 			return nil // already indexed (forget() drops a re-imported cell so it re-parses)
 		}
-		infos, err := tile57.Charts(path)
-		if err != nil || len(infos) == 0 {
+		var bbox [4]float64
+		hasBBox := false
+		func() {
+			tile57gate.Lock()
+			defer tile57gate.Unlock()
+
+			infos, err := tile57.Charts(path)
+			if err != nil || len(infos) == 0 {
+				return
+			}
+
+			bbox = infos[0].BBox
+			hasBBox = true
+		}()
+
+		if !hasBBox {
 			return nil
 		}
+
 		ci.mu.Lock()
-		ci.bbox[name] = infos[0].BBox
+		ci.bbox[name] = bbox
 		ci.mu.Unlock()
 		added++
 		if added%200 == 0 {

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/beetlebugorg/chartplotter/internal/engine/tile57gate"
 	tile57 "github.com/beetlebugorg/tile57/bindings/go"
 )
 
@@ -16,8 +17,21 @@ import (
 // writes and frees each archive as it goes, so this never holds N archives in memory (peak ~
 // workers). `workers` bounds concurrency (a MEMORY bound). `onProgress(done, total)` fires per baked
 // cell for the import UI (may be called concurrently). Returns the number of cells baked this pass.
-func PrepareLive(input, cellsDir string, workers int, onProgress func(done, total int)) (int, error) {
-	return tile57.BakeTree(input, cellsDir, workers, onProgress)
+func PrepareLive(
+	input string,
+	cellsDir string,
+	workers int,
+	onProgress func(done, total int),
+) (int, error) {
+	tile57gate.Lock()
+	defer tile57gate.Unlock()
+
+	return tile57.BakeTree(
+		input,
+		cellsDir,
+		workers,
+		onProgress,
+	)
 }
 
 // ListCells returns every base cell (.000) path under `root` (a single file or a directory),
