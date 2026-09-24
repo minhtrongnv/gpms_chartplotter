@@ -40,3 +40,33 @@ func TestMarinerFromQuerySoundingsOverride(t *testing.T) {
 		)
 	}
 }
+
+
+func TestMarinerFromQueryDisplayCategory(t *testing.T) {
+	base := marinerFromQuery(url.Values{
+		"displayBase":     {"1"},
+		"displayStandard": {"0"},
+		"displayOther":    {"0"},
+	})
+	if !base.DisplayBase || base.DisplayStandard || base.DisplayOther {
+		t.Fatalf("base category = base:%v standard:%v other:%v", base.DisplayBase, base.DisplayStandard, base.DisplayOther)
+	}
+
+	standard := marinerFromQuery(url.Values{
+		"displayBase":     {"1"},
+		"displayStandard": {"1"},
+		"displayOther":    {"0"},
+	})
+	if !standard.DisplayBase || !standard.DisplayStandard || standard.DisplayOther {
+		t.Fatalf("standard category = base:%v standard:%v other:%v", standard.DisplayBase, standard.DisplayStandard, standard.DisplayOther)
+	}
+
+	other := marinerFromQuery(url.Values{
+		"displayBase":     {"1"},
+		"displayStandard": {"1"},
+		"displayOther":    {"1"},
+	})
+	if !other.DisplayBase || !other.DisplayStandard || !other.DisplayOther {
+		t.Fatalf("other category = base:%v standard:%v other:%v", other.DisplayBase, other.DisplayStandard, other.DisplayOther)
+	}
+}
