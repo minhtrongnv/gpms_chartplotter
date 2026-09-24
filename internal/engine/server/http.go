@@ -398,17 +398,26 @@ func crossSiteWrite(r *http.Request) bool {
 // chartHTTPClient fetches ENC data from the allowed chart hosts, re-validating the
 // host on every redirect hop so a redirect can't bounce the fetch to an internal
 // address (SSRF defence-in-depth, on top of the caller's initial host check).
-var chartHTTPClient = &http.Client{
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 10 {
-			return fmt.Errorf("stopped after 10 redirects")
-		}
-		if providerForHost(req.URL.Hostname()) == nil {
-			return fmt.Errorf("redirect to disallowed host %q", req.URL.Hostname())
-		}
-		return nil
-	},
-}
+var chartHTTPClient = func() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// District bundles are large, so do not use a short whole-request timeout.
+	// Bound only the connection/setup phases here; body progress has its own
+	// no-progress watchdog in fetchURLProgress.
+	transport.ResponseHeaderTimeout = 60 * time.Second
+
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			if providerForHost(req.URL.Hostname()) == nil {
+				return fmt.Errorf("redirect to disallowed host %q", req.URL.Hostname())
+			}
+			return nil
+		},
+	}
+}()
 
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	if !s.allowRemote && !hostIsLocal(r.Host) {
