@@ -142,3 +142,22 @@ func TestCloseCancelsTrackedImportJob(t *testing.T) {
 		t.Fatalf("job after shutdown = state %q error %q", got.State, got.Err)
 	}
 }
+
+
+func TestNewCleansInterruptedImportScratch(t *testing.T) {
+	dir := t.TempDir()
+	scratch := filepath.Join(dir, "USER", ".imports")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "partial.zip"), []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(dir, dir, dir, false, "")
+	defer s.Close()
+
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("stale import scratch survived New: %v", err)
+	}
+}
