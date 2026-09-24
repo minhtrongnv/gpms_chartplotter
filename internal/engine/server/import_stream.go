@@ -336,6 +336,26 @@ func (s *Server) downloadURLToTemp(
 	raw, provider string,
 	onProgress func(done, total int),
 ) (string, error) {
+	return s.downloadURLToTempWithTimeout(
+		ctx,
+		raw,
+		provider,
+		chartHTTPClient,
+		chartDownloadNoProgressTimeout,
+		onProgress,
+	)
+}
+
+func (s *Server) downloadURLToTempWithTimeout(
+	ctx context.Context,
+	raw, provider string,
+	client *http.Client,
+	noProgressTimeout time.Duration,
+	onProgress func(done, total int),
+) (string, error) {
+	if noProgressTimeout <= 0 {
+		noProgressTimeout = chartDownloadNoProgressTimeout
+	}
 	scratch, err := s.importScratchDir(provider)
 	if err != nil {
 		return "", err
@@ -348,7 +368,7 @@ func (s *Server) downloadURLToTemp(
 	if err != nil {
 		return "", err
 	}
-	resp, err := chartHTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -381,11 +401,11 @@ func (s *Server) downloadURLToTemp(
 	var done int64
 	buf := make([]byte, 256<<10)
 
-	stallTimer := time.AfterFunc(chartDownloadNoProgressTimeout, func() {
+	stallTimer := time.AfterFunc(noProgressTimeout, func() {
 		cancel(fmt.Errorf(
 			"%w: no bytes received for %s",
 			errChartDownloadStalled,
-			chartDownloadNoProgressTimeout,
+			noProgressTimeout,
 		))
 	})
 	defer stallTimer.Stop()
@@ -393,7 +413,7 @@ func (s *Server) downloadURLToTemp(
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
-			stallTimer.Reset(chartDownloadNoProgressTimeout)
+			stallTimer.Reset(noProgressTimeout)
 			done += int64(n)
 			if done > maxImportBytes {
 				return "", fmt.Errorf("download exceeds %d bytes", maxImportBytes)
