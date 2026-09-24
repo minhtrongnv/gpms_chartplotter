@@ -150,6 +150,9 @@ func TestNewCleansInterruptedImportScratch(t *testing.T) {
 	if err := os.MkdirAll(scratch, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(scratch, importScratchMarker), []byte("owned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(scratch, "partial.zip"), []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
