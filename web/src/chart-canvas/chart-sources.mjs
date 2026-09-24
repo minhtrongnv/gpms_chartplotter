@@ -15,7 +15,7 @@
 // Where a method used to do `this._map.setStyle(this.buildStyle(), …)` it calls
 // `this.rebuild()`; where it needs the map it calls `this.getMap()`.
 import { PMTilesArchive, MultiArchive } from "./pmtiles-source.mjs";
-import { zoomForChartScale } from "../lib/util.mjs";
+import { zoomForScalePhysical } from "../lib/util.mjs";
 
 // NOAA ENC navigational-purpose bands (the rescheming standard) → one vector
 // source each, baked over [min,max] and overzoomed above max (see bake.zig
@@ -79,9 +79,9 @@ const SCAMIN_LAT_REBUILD_DEG = 2;
 // This is a deterministic chart-scale coordinate: fixed 0.2645 mm CSS-reference
 // pitch, matching tile57's scaminDisplayZoom/scaminGateK. Per-screen calibration
 // affects physical feature size only and MUST NOT move SCAMIN boundaries.
-export function scaminDisplayZoom(scamin, lat) {
+export function scaminDisplayZoom(scamin, lat, pxPitch) {
   if (!scamin) return 0;
-  return zoomForChartScale(scamin, lat);
+  return zoomForScalePhysical(scamin, lat, pxPitch);
 }
 
 // Server sets are baked PER BAND, named "<district>-<band>" (e.g. noaa-d5-general).
@@ -141,10 +141,11 @@ export function engineStamp(metas) {
 }
 
 export class ChartSources {
-  constructor({ assets, getMap, rebuild }) {
+  constructor({ assets, getMap, rebuild, getPxPitch }) {
     this.assets = assets;     // resolved assets base URL (trailing "/")
     this.getMap = getMap;     // () => live MapLibre map (or null)
     this.rebuild = rebuild;   // () => map.setStyle(buildStyle(), {diff:false,validate:false})
+    this.getPxPitch = getPxPitch || (() => undefined);
     this._ver = 0;            // chart-tile cache-bust token (see refresh)
     this._srcEncoding = {};   // source id ("chart-<slug>") → the tile encoding ("mvt"/"mlt") BAKED into the live style. MapLibre reads a vector source's `encoding` only at CREATION, so a decoder switch (an MLT archive loading after the initial mvt-default style) needs a full rebuild, not an in-place mutation (see _updateSourceZoom → rebuild).
     this._bands = {};         // band slug → MultiArchive of that band's loaded packs (chart-<slug> source)
@@ -301,12 +302,13 @@ export class ChartSources {
     const m = this.getMap();
     if (!m) return;
     const lat = m.getCenter().lat;
+    const pitch = this.getPxPitch();
     let style;
     try { style = m.getStyle(); } catch (e) { return; }
     for (const L of (style && style.layers) || []) {
       const hit = /#sm(\d+(?:\.\d+)?)$/.exec(L.id);
       if (!hit) continue;
-      try { m.setLayerZoomRange(L.id, scaminDisplayZoom(+hit[1], lat), L.maxzoom != null ? L.maxzoom : 24); } catch (e) { /* layer removed mid-update */ }
+      try { m.setLayerZoomRange(L.id, scaminDisplayZoom(+hit[1], lat, pitch), L.maxzoom != null ? L.maxzoom : 24); } catch (e) { /* layer removed mid-update */ }
     }
     this._scaminLat = lat;
   }
