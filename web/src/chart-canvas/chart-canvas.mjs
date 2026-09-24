@@ -1743,6 +1743,15 @@ export class ChartCanvas extends HTMLElement {
     const to = this._marinerQuery();
     const from = this._lastMariner != null ? this._lastMariner : to;
     if (from === to) { this._lastMariner = to; return; }
+
+    // The server diff endpoint is intentionally single-set. With multiple active
+    // packs, posting a CSV set list can only return 404, so skip the guaranteed
+    // failed request/log noise and go straight to the supported full rebuild.
+    if ((this._engineSets || []).length !== 1) {
+      await this._engineRebuild();
+      return;
+    }
+
     try {
       const r = await fetch(this._assets + "api/style-diff", {
         method: "POST", headers: { "Content-Type": "application/json" },
