@@ -76,6 +76,7 @@ func New(assetsDir, cacheDir, dataDir string, allowRemote bool, engineCommit str
 	}
 	migrateLegacyENCRoot(dataDir)             // one-time: retired flat ENC_ROOT → loose/cells (before indexing)
 	migrateProviderEncRoot(dataDir, cacheDir) // one-time: per-district-pack layout → per-provider ENC_ROOT
+	cleanupImportScratch(dataDir)              // discard only transient files from an interrupted prior import
 	s := &Server{
 		assetsDir:   assetsDir,
 		cacheDir:    cacheDir,
