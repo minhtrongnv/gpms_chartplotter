@@ -2123,8 +2123,15 @@ export class ChartCanvas extends HTMLElement {
 // Returns true if a clause was found. Mutates `node` in place.
 function setScaminDenom(node, denom, detectOnly) {
   if (!Array.isArray(node)) return false;
-  if (node[0] === ">=" && Array.isArray(node[1]) && node[1][0] === "coalesce"
-      && Array.isArray(node[1][1]) && node[1][1][0] === "get" && node[1][1][1] === "scamin") {
+  const isScaminCoalesce = (x) => Array.isArray(x) && x[0] === "coalesce"
+      && Array.isArray(x[1]) && x[1][0] === "get" && x[1][1] === "scamin";
+  if (node[0] === ">=" && (
+      isScaminCoalesce(node[1])
+      // Dense SOUNDG uses ["*", coalesce(scamin,...), 4] >= curDenom so the
+      // engine can admit those depths two zoom levels earlier without dropping
+      // SCAMIN altogether. The live exact-gate still rewrites the same RHS.
+      || (Array.isArray(node[1]) && node[1][0] === "*" && isScaminCoalesce(node[1][1]))
+  )) {
     if (!detectOnly) node[2] = denom;
     return true;
   }
