@@ -771,9 +771,9 @@ export class ChartCanvas extends HTMLElement {
     for (const k in osmPaint) setIf("osm", k, osmPaint[k]);
   }
 
-  // Feature-size multiplier that renders baked (point-pixel) sizes at true physical
-  // size on this screen: 0.35278 mm/baked-px ÷ the (calibrated) CSS-pixel pitch. On
-  // the default CSS pixel (0.2645 mm) ≈1.333×; calibration makes it exact.
+  // Feature-size multiplier that renders baked reference-pixel sizes at true
+  // physical size on this screen: 0.26458 mm/reference-px divided by the
+  // calibrated CSS-pixel pitch. A 0.26458 mm CSS pixel is exactly 1×.
   _featureSizeScale() {
     return BAKED_FEATURE_PITCH_MM / clampPxPitch(this._pxPitch || DEFAULT_PX_PITCH_MM);
   }
