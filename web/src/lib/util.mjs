@@ -13,8 +13,9 @@ export function loadJSON(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key)) || fallback; } catch { return fallback; }
 }
 
-// Web-Mercator map scale denominator at zoom z / latitude lat (OGC 0.28mm pixel).
-// This is the app's ONE display scale — the PHYSICAL on-screen scale, matching what
+// Web-Mercator denominator at zoom z / latitude lat using the OGC 0.28 mm pixel.
+// Kept for bake/reference math and compatibility. The live chart UI/SCAMIN uses the
+// deterministic 0.2645 mm chartScaleDenom coordinate below. This function matches what
 // MapLibre actually renders (512-tile geometry: ~2× finer per CSS pixel than the
 // classic 256-tile slippy convention, hence the 512 metres-per-pixel constant). It
 // is the single coordinate that SCAMIN gating (chart-sources.mjs / baker), the
@@ -24,9 +25,8 @@ export function loadJSON(key, fallback) {
 // alike) keeps SCAMIN features visible to exactly their stated scale, rather than
 // vanishing at ~½ of it. The BAND zoom ranges (bands.mjs / baker ZoomRange) are raw integer zooms and are
 // independent of this constant — they pin each usage band to a tile-pyramid level.
-// scaleDenomPhysical (below) is the same physical scale but with a per-screen,
-// calibratable pixel pitch for an exact ruler-on-glass readout; this OGC-pixel form
-// is the deterministic version the baker (which has no screen to measure) shares.
+// scaleDenomPhysical (below) is the screen-calibrated variant. It must not be used
+// for cross-browser chart scale, SCAMIN or overscale decisions.
 const M_PER_PX_Z0 = 78271.516964020485; // metres/CSS-px at z0, equator (512-tile)
 const OGC_PX_M = 0.00028; // 0.28 mm — the OGC "standardized rendering pixel"
 
@@ -59,11 +59,10 @@ export function clampPxPitch(mm) {
   return isFinite(v) && v >= 0.05 && v <= 1 ? v : DEFAULT_PX_PITCH_MM;
 }
 
-// PHYSICAL paper-scale denominator — what a ruler laid on the screen measures.
-// Uses MapLibre's real per-CSS-pixel resolution and the (calibrated) physical size
-// of a CSS pixel. This is the user-facing readout / "go to scale": it differs from
-// scaleDenom only by the calibrated px pitch (vs the OGC 0.28mm reference) — both are
-// now the same true 512-tile scale, since the engine moved onto the physical scale.
+// PHYSICAL paper-scale denominator — what a ruler laid on THIS calibrated screen
+// measures. This is screen-specific and is reserved for physical feature sizing /
+// calibration diagnostics; it is intentionally not the navigational chart 1:N
+// coordinate shown in the HUD.
 export function scaleDenomPhysical(z, lat, pxPitchMm = DEFAULT_PX_PITCH_MM) {
   const mPerCssPx = M_PER_PX_Z0 * Math.cos((lat * Math.PI) / 180) / Math.pow(2, z);
   return mPerCssPx / (clampPxPitch(pxPitchMm) / 1000);
@@ -91,9 +90,9 @@ export function zoomForChartScale(scale, lat) {
   return zoomForScalePhysical(scale, lat, DEFAULT_PX_PITCH_MM);
 }
 
-// Finest map scale we allow: don't magnify charts past 1:MIN_DETAIL_SCALE (past
-// this it's just blocky overzoom). The cap is a PHYSICAL scale — the 1:N a ruler
-// laid on the screen measures (scaleDenomPhysical) — so it matches the HUD readout.
+// Finest deterministic chart scale we allow: don't magnify charts past
+// 1:MIN_DETAIL_SCALE. Callers use the default fixed 0.2645 mm reference so the cap
+// is identical across browsers/screens.
 export const MIN_DETAIL_SCALE = 4000;
 // A sliver of zoom headroom kept above the scale floor (set as the map's real
 // maxZoom in _applyScaleFloor) so the wheel-zoom handler can let a hard-in scroll
