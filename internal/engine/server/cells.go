@@ -2,9 +2,9 @@ package server
 
 import (
 	"archive/zip"
+	"context"
 	"bytes"
 	"fmt"
-	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -45,10 +45,22 @@ func ClearCache(cacheDir string) (int, error) {
 
 // fetchCellBase downloads a NOAA ENC zip and returns the first base cell's bytes.
 func fetchCellBase(client *http.Client, url string) ([]byte, error) {
+	return fetchCellBaseContext(context.Background(), client, url)
+}
+
+func fetchCellBaseContext(
+	ctx context.Context,
+	client *http.Client,
+	url string,
+) ([]byte, error) {
 	if url == "" {
 		return nil, fmt.Errorf("cell not cached and no download url given")
 	}
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +68,7 @@ func fetchCellBase(client *http.Client, url string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("http %d", resp.StatusCode)
 	}
-	zipBytes, err := io.ReadAll(resp.Body)
+	zipBytes, err := readImportBytes(resp.Body, maxImportZipEntryBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -65,15 +77,13 @@ func fetchCellBase(client *http.Client, url string) ([]byte, error) {
 		return nil, err
 	}
 	for _, zf := range zr.File {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if !isBaseCell(zf.Name) {
 			continue
 		}
-		rc, err := zf.Open()
-		if err != nil {
-			return nil, err
-		}
-		defer rc.Close()
-		return io.ReadAll(rc)
+		return readImportZipEntry(zf, maxImportZipEntryBytes)
 	}
 	return nil, fmt.Errorf("no base cell in zip")
 }
@@ -82,27 +92,56 @@ func fetchCellBase(client *http.Client, url string) ([]byte, error) {
 // destDir/<name>.000 so re-baking doesn't re-download. destDir is the target cells/
 // dir — a pack's cells/ for a district fetch, or the loose-cell dir for the /api/cell
 // download proxy. name is already validated (validCell), so it's a safe path component.
-func loadCellCached(client *http.Client, destDir, name, url string) (data []byte, hit bool, err error) {
+func loadCellCached(
+	client *http.Client,
+	destDir, name, url string,
+) (data []byte, hit bool, err error) {
+	return loadCellCachedContext(
+		context.Background(),
+		client,
+		destDir,
+		name,
+		url,
+	)
+}
+
+func loadCellCachedContext(
+	ctx context.Context,
+	client *http.Client,
+	destDir, name, url string,
+) (data []byte, hit bool, err error) {
 	cpath := filepath.Join(destDir, name+".000")
 	if b, e := os.ReadFile(cpath); e == nil {
 		return b, true, nil
 	}
-	// Retry transient download failures (NOAA occasionally 5xx / resets under
-	// load) so a single hiccup doesn't drop a cell from the region.
+
 	var b []byte
 	for attempt := 1; ; attempt++ {
-		b, err = fetchCellBase(client, url)
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		b, err = fetchCellBaseContext(ctx, client, url)
 		if err == nil {
 			break
 		}
-		if attempt >= 3 {
+		if ctx.Err() != nil || attempt >= 3 {
 			return nil, false, err
 		}
-		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		delay := time.Duration(attempt) * 500 * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, false, ctx.Err()
+		case <-timer.C:
+		}
 	}
-	// Cache best-effort (destDir/<name>.000); a write failure just means we re-fetch.
+
 	if e := os.MkdirAll(destDir, 0o755); e == nil {
 		_ = os.WriteFile(cpath, b, 0o644)
 	}
 	return b, false, nil
 }
+

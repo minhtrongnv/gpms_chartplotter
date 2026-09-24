@@ -45,6 +45,7 @@ type Server struct {
 	ready          atomic.Bool
 	sets           *tileSets         // registry of ENABLED tile sets served at /tiles/{set}/…
 	imports        *importJobs       // background server-side bake jobs (POST /api/import)
+	jobsCtl        *jobLifecycle     // owns user-triggered import goroutines until server shutdown
 	bakeMu         sync.Mutex        // serializes bakes: two imports must not interleave cross-pack peer rewrites / shared context
 	bakeWG         sync.WaitGroup    // tracks the New-triggered self-heal bake goroutine so Close can drain it (its asset writes must not race a test/temp-dir teardown)
 	packsMu        sync.Mutex        // guards packs
@@ -75,6 +76,7 @@ func New(assetsDir, cacheDir, dataDir string, allowRemote bool, engineCommit str
 	}
 	migrateLegacyENCRoot(dataDir)             // one-time: retired flat ENC_ROOT → loose/cells (before indexing)
 	migrateProviderEncRoot(dataDir, cacheDir) // one-time: per-district-pack layout → per-provider ENC_ROOT
+	cleanupImportScratch(dataDir)              // discard only transient files from an interrupted prior import
 	s := &Server{
 		assetsDir:   assetsDir,
 		cacheDir:    cacheDir,
@@ -82,6 +84,7 @@ func New(assetsDir, cacheDir, dataDir string, allowRemote bool, engineCommit str
 		allowRemote: allowRemote,
 		sets:        newTileSets(),
 		imports:     newImportJobs(),
+		jobsCtl:     newJobLifecycle(),
 		auxIdx:      newAuxIndex(),
 		cellIdx:     newCellIndex(dataDir),
 		clientIPs:   &ClientIPResolver{},
@@ -134,6 +137,10 @@ func (s *Server) SetReady(ready bool) {
 func (s *Server) rebakeMissingProviders() {
 	var missing []string
 	for _, prov := range s.installedProviders() {
+		if s.providerDirty(prov) {
+			missing = append(missing, prov)
+			continue
+		}
 		if _, live := s.sets.get(prov); live {
 			// Serving, but from another engine build's archives: re-bake to a staging
 			// tree and swap when done (prepareLiveProvider) — the old tiles keep
@@ -169,7 +176,16 @@ func (s *Server) rebakeMissingProviders() {
 func (s *Server) Close() error {
 	s.ready.Store(false)
 
+	if s.jobsCtl != nil {
+		s.jobsCtl.beginShutdown()
+	}
+	// Self-heal and user-triggered imports can both contend on bakeMu. Let the
+	// boot-time self-heal finish/release it, then drain cancelled user jobs before
+	// closing the tile registry they may register into.
 	s.bakeWG.Wait()
+	if s.jobsCtl != nil {
+		s.jobsCtl.wait()
+	}
 
 	if s.nmeaMgr != nil {
 		s.nmeaMgr.Close()

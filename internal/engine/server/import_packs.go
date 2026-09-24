@@ -1,14 +1,14 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 
-	"github.com/beetlebugorg/chartplotter/internal/engine/baker"
-	tile57 "github.com/beetlebugorg/tile57/bindings/go"
 )
 
 // Multi-district import (POST /api/import/packs). The chart-library selects SEVERAL
@@ -79,8 +79,13 @@ func (s *Server) handleImportPacks(w http.ResponseWriter, r *http.Request) {
 	if len(req.Packs) > 1 {
 		label = fmt.Sprintf("%d packs", len(req.Packs))
 	}
-	job := s.imports.create(label)
-	go s.runImportPacks(job.ID, req)
+	job, ok := s.startImportJob(label, func(ctx context.Context, jobID string) {
+		s.runImportPacks(ctx, jobID, req)
+	})
+	if !ok {
+		apiErr(w, http.StatusServiceUnavailable, "server shutting down")
+		return
+	}
 
 	w.Header().Set("Content-Type", jsonCT)
 	w.WriteHeader(http.StatusAccepted)
@@ -90,115 +95,194 @@ func (s *Server) handleImportPacks(w http.ResponseWriter, r *http.Request) {
 // runImportPacks downloads each selected district's cells into its ENC_ROOT subfolder,
 // then bakes each touched provider ONCE from its whole ENC_ROOT. A district whose
 // download fails is skipped, not fatal.
-func (s *Server) runImportPacks(jobID string, req importPacksReq) {
+func (s *Server) runImportPacks(
+	ctx context.Context,
+	jobID string,
+	req importPacksReq,
+) {
 	fail := func(err error) {
 		log.Printf("import %s (packs): %v", jobID, err)
-		s.imports.update(jobID, func(j *importJob) { j.State = "error"; j.Err = err.Error() })
+		s.imports.update(jobID, func(j *importJob) {
+			if j.State == "running" {
+				j.State = "error"
+				j.Err = err.Error()
+			}
+		})
 	}
 
-	// 1. Download each district's cells into <data>/<provider>/ENC_ROOT/<district>/.
 	providers := map[string]bool{}
-	for i, p := range req.Packs {
-		provider, district := providerOf(p.Set), districtOf(p.Set)
-		s.imports.update(jobID, func(j *importJob) { j.Pack, j.PackNum, j.PackTotal = p.Set, i+1, len(req.Packs) })
-		cells, aux, cat, err := s.fetchPackCells(jobID, p)
+	for i, pack := range req.Packs {
+		if ctx.Err() != nil {
+			return
+		}
+		s.imports.update(jobID, func(j *importJob) {
+			j.Pack, j.PackNum, j.PackTotal = pack.Set, i+1, len(req.Packs)
+		})
+		count, err := s.fetchPackCells(ctx, jobID, pack)
 		if err != nil {
-			log.Printf("import %s: pack %s download: %v", jobID, p.Set, err) // skip, keep going
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("import %s: pack %s download: %v", jobID, pack.Set, err)
 			continue
 		}
-		if len(cells) == 0 {
-			log.Printf("import %s: pack %s: no cells", jobID, p.Set)
+		if count == 0 {
+			log.Printf("import %s: pack %s: no cells", jobID, pack.Set)
 			continue
 		}
-		if p.Updates != nil && !*p.Updates {
-			cells = baseOnly(cells)
-		}
-		s.cacheDistrict(provider, district, cells, aux, cat)
-		providers[provider] = true
+		providers[providerOf(pack.Set)] = true
 	}
 	if len(providers) == 0 {
 		fail(fmt.Errorf("no cells downloaded for any pack"))
 		return
 	}
+	if ctx.Err() != nil {
+		return
+	}
 
-	// 2. Bake each touched provider once (serialized: a bake rewrites bundle output in
-	// place, which concurrent bakes must not interleave). Downloads above run unlocked.
 	s.bakeMu.Lock()
 	defer s.bakeMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 	s.imports.update(jobID, func(j *importJob) {
-		j.Phase, j.Unit, j.Note, j.Done, j.Total = "bake", "cells", "Preparing charts", 0, 0
+		j.Phase, j.Unit, j.Note, j.Done, j.Total =
+			"bake", "cells", "Preparing charts", 0, 0
 	})
+
 	names := make([]string, 0, len(providers))
-	for prov := range providers {
-		names = append(names, prov)
+	for provider := range providers {
+		names = append(names, provider)
 	}
 	sort.Strings(names)
+
 	baked := 0
-	for _, prov := range names {
-		if s.bakeProvider(jobID, prov) {
+	for _, provider := range names {
+		if ctx.Err() != nil {
+			return
+		}
+		if s.bakeProvider(jobID, provider) {
 			baked++
 		}
 	}
 	if baked == 0 {
-		return // bakeProvider recorded the error
+		return
 	}
 	s.imports.update(jobID, func(j *importJob) {
 		j.Pack, j.Band, j.Phase, j.State, j.Note = "", "", "done", "done", ""
 		j.PackNum, j.PackTotal = 0, 0
 	})
-	log.Printf("import %s: baked %d provider(s) from %d district(s)", jobID, baked, len(req.Packs))
+	log.Printf(
+		"import %s: baked %d provider(s) from %d district(s)",
+		jobID,
+		baked,
+		len(req.Packs),
+	)
 }
 
-// fetchPackCells downloads ONE district's cells (bulk zipUrl or per-cell) into memory,
-// reporting download progress on the job. It does not persist or bake — the caller
-// writes them to the district's ENC_ROOT subfolder (cacheDistrict) and bakes the
-// provider. The per-cell path streams each cell straight into the district dir as it
-// goes (via loadCellCached) so a re-run resumes from what's already on disk.
-func (s *Server) fetchPackCells(jobID string, p importPackSpec) (map[string]baker.CellData, map[string][]byte, []tile57.CatalogEntry, error) {
-	if p.ZipURL != "" {
-		name := p.ZipURL[strings.LastIndexByte(p.ZipURL, '/')+1:]
+// fetchPackCells downloads one district directly into its ENC_ROOT storage.
+// Bulk ZIPs are downloaded and extracted through disk staging; per-cell fetches
+// release each cell's bytes after it is cached instead of retaining the batch in RAM.
+func (s *Server) fetchPackCells(
+	ctx context.Context,
+	jobID string,
+	pack importPackSpec,
+) (int, error) {
+	provider, district := providerOf(pack.Set), districtOf(pack.Set)
+	applyUpdates := pack.Updates == nil || *pack.Updates
+
+	if pack.ZipURL != "" {
+		name := pack.ZipURL[strings.LastIndexByte(pack.ZipURL, '/')+1:]
 		s.imports.update(jobID, func(j *importJob) {
-			j.Pack, j.Phase, j.Unit, j.Note, j.Done, j.Total = p.Set, "download", "bytes", "Downloading "+name, 0, 0
+			j.Pack, j.Phase, j.Unit, j.Note, j.Done, j.Total =
+				pack.Set, "download", "bytes", "Downloading "+name, 0, 0
 		})
-		data, err := fetchURLProgress(p.ZipURL, func(done, total int) {
-			s.imports.update(jobID, func(j *importJob) { j.Done, j.Total = done, total })
-		})
+		zipPath, err := s.downloadURLToTemp(
+			ctx,
+			pack.ZipURL,
+			provider,
+			func(done, total int) {
+				s.imports.update(jobID, func(j *importJob) {
+					j.Done, j.Total = done, total
+				})
+			},
+		)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("download %s: %w", p.ZipURL, err)
+			return 0, fmt.Errorf("download %s: %w", pack.ZipURL, err)
 		}
+		defer os.Remove(zipPath)
+
 		s.imports.update(jobID, func(j *importJob) {
-			j.Phase, j.Unit, j.Note, j.Done, j.Total = "extract", "cells", "Extracting "+name, 0, 0
+			j.Phase, j.Unit, j.Note, j.Done, j.Total =
+				"extract", "cells", "Extracting "+name, 0, 0
 		})
-		cells, aux, cat, err := extractZipCells(data)
+		stage, err := s.stageExchangeSetZip(
+			ctx,
+			zipPath,
+			provider,
+			pack.Names,
+			applyUpdates,
+		)
 		if err != nil {
-			return nil, nil, nil, err
+			return 0, err
 		}
-		if len(p.Names) > 0 {
-			cells = filterCells(cells, p.Names)
+		defer os.RemoveAll(stage.dir)
+		if len(stage.stems) == 0 {
+			return 0, nil
 		}
-		return cells, aux, cat, nil
+		if err := s.commitStagedExchangeSet(
+			ctx,
+			provider,
+			district,
+			stage,
+		); err != nil {
+			return 0, err
+		}
+		return len(stage.stems), nil
 	}
 
-	// Per-cell: download each into the district's ENC_ROOT subfolder, then bake from there.
-	cells := map[string]baker.CellData{}
-	dir := s.districtDir(providerOf(p.Set), districtOf(p.Set))
-	total := len(p.Cells)
-	s.imports.update(jobID, func(j *importJob) { j.Pack, j.Phase, j.Unit, j.Total = p.Set, "download", "cells", total })
-	for i, c := range p.Cells {
-		if !isCellName(c.Name) {
+	dir := s.districtDir(provider, district)
+	total := len(pack.Cells)
+	s.imports.update(jobID, func(j *importJob) {
+		j.Pack, j.Phase, j.Unit, j.Total =
+			pack.Set, "download", "cells", total
+	})
+	count := 0
+	for i, cell := range pack.Cells {
+		if ctx.Err() != nil {
+			return count, ctx.Err()
+		}
+		if !isCellName(cell.Name) {
 			continue
 		}
-		if c.URL != "" && !allowedChartURL(c.URL) {
+		if cell.URL != "" && !allowedChartURL(cell.URL) {
 			continue
 		}
-		s.imports.update(jobID, func(j *importJob) { j.Note = "Downloading " + c.Name; j.Done = i })
-		base, _, err := loadCellCached(chartHTTPClient, dir, c.Name, c.URL)
+		s.imports.update(jobID, func(j *importJob) {
+			j.Note = "Downloading " + cell.Name
+			j.Done = i
+		})
+		_, _, err := loadCellCachedContext(
+			ctx,
+			chartHTTPClient,
+			dir,
+			cell.Name,
+			cell.URL,
+		)
 		if err != nil {
-			log.Printf("import %s: download %s: %v", jobID, c.Name, err) // skip, keep going
+			if ctx.Err() != nil {
+				return count, ctx.Err()
+			}
+			log.Printf("import %s: download %s: %v", jobID, cell.Name, err)
 		} else {
-			cells[c.Name+".000"] = baker.CellData{Base: base}
+			count++
 		}
 		s.imports.update(jobID, func(j *importJob) { j.Done = i + 1 })
 	}
-	return cells, nil, nil, nil
+	if count > 0 {
+		if err := s.markProviderDirty(provider); err != nil {
+			return count, err
+		}
+	}
+	return count, nil
 }
