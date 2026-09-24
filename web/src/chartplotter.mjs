@@ -133,7 +133,7 @@ const LS_VIEW = "chartplotter:view";
 const LS_SOURCE = "chartplotter:source"; // {type:"blob"} or {type:"url",file}
 const LS_BANDS_OFF = "chartplotter:bands-off"; // usage bands the user turned off (array of slugs)
 const LS_HIDDEN_CELLS = "chartplotter:hidden-cells"; // individual chart cells the user hid (array of cell names)
-const LS_PX_PITCH = "chartplotter:px-pitch-mm"; // calibrated physical size of a CSS pixel (mm) for the on-screen scale readout
+const LS_PX_PITCH = "chartplotter:px-pitch-mm"; // per-browser monitor calibration for physical feature sizing only
 // The NOAA ENC User Agreement gate (LS_AGREE) + agreement URLs now live in the
 // <chart-library> component, which owns the download flow; NOAA_ENC_URL is
 // imported above for the bottom-right attribution link the shell still renders.
@@ -595,8 +595,8 @@ export class ChartPlotter extends HTMLElement {
     // Apply persisted display prefs.
     if (this._scheme !== "day") this._plotter.setScheme(this._scheme);
     this.setAttribute("data-scheme", this._scheme);
-    // Calibrated CSS-pixel pitch drives true-physical feature sizing in the renderer
-    // (the same calibration the scale readout uses). Push it before the first frame.
+    // Calibrated CSS-pixel pitch drives true-physical feature sizing only.
+    // The chart 1:N readout/SCAMIN coordinate is deterministic and does not use it.
     if (typeof this._pxPitch === "number" && this._plotter.setPxPitch) {
       try { this._plotter.setPxPitch(this._pxPitch); } catch (e) { console.warn(e); }
     }
