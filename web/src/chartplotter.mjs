@@ -662,6 +662,7 @@ export class ChartPlotter extends HTMLElement {
       cellMeta: (name) => this._byName.get(name),
       serverSetMetas: () => (this._plotter && this._plotter.serverSetMetas) ? this._plotter.serverSetMetas() : [],
       noChartsEnabled: () => this._noChartsEnabled(),
+      getPxPitch: () => this._pxPitch,
     });
 
     // Scroll-wheel zoom: owns the wheel (native scrollZoom off) to give the band
@@ -669,8 +670,10 @@ export class ChartPlotter extends HTMLElement {
     // the detent from the HUD; own-ship registers a follow anchor below.
     this._wheelZoom = new WheelZoom({
       map,
-      getDetent: () => this._hud.getDetentZoom(),
-      getFloor: () => maxZoomForScaleFloor(map.getCenter().lat), // live 1:MIN_DETAIL_SCALE floor (matches _applyScaleFloor)
+      // OpenCPN-style continuous zoom: do not park at the native chart scale.
+      // Overscale is still shown by the HUD, but the user may zoom through it.
+      getDetent: () => null,
+      getFloor: () => maxZoomForScaleFloor(map.getCenter().lat, this._pxPitch),
       getAnchor: () => this._zoomAnchor(), // plugins contribute where zoom should anchor (vessel while following, else cursor)
     });
 
