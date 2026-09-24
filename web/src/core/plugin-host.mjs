@@ -35,6 +35,7 @@ export class PluginHost {
     this._loaded = new Map(); // id -> { controller, cleanups }
     this._installed = new Set(); // ids loaded dynamically from installed archives
     this._syncTimer = null;
+    this._syncStopped = true;
   }
 
   // register loads a controller for a plugin: builds its ctx, instantiates the
@@ -63,13 +64,26 @@ export class PluginHost {
   // Plugin enable/disable is not latency-critical, so a 5 s visible-page poll is
   // cheaper operationally than permanently pinning another browser socket.
   start() {
-    this._syncInstalled();
-    if (this._syncTimer) return;
+    if (!this._syncStopped) return;
+    this._syncStopped = false;
 
-    this._syncTimer = setInterval(() => {
-      if (document.visibilityState === "hidden") return;
-      this._syncInstalled();
-    }, 5000);
+    // Schedule the next poll only AFTER the previous request finishes. setInterval
+    // can otherwise accumulate overlapping fetches when the local server/network is
+    // temporarily slow — exactly the kind of socket pressure this path is meant to
+    // avoid on HTTP/1.1.
+    const poll = async () => {
+      if (this._syncStopped) return;
+
+      if (document.visibilityState !== "hidden") {
+        await this._syncInstalled();
+      }
+
+      if (!this._syncStopped) {
+        this._syncTimer = setTimeout(poll, 5000);
+      }
+    };
+
+    void poll();
   }
 
   async _syncInstalled(list) {
@@ -135,7 +149,8 @@ export class PluginHost {
   }
 
   destroy() {
-    if (this._syncTimer) clearInterval(this._syncTimer);
+    this._syncStopped = true;
+    if (this._syncTimer) clearTimeout(this._syncTimer);
     this._syncTimer = null;
     for (const id of [...this._loaded.keys()]) this.unregister(id);
     this._ais.destroy();
