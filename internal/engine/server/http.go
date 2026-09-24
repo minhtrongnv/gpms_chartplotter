@@ -45,6 +45,7 @@ type Server struct {
 	ready          atomic.Bool
 	sets           *tileSets         // registry of ENABLED tile sets served at /tiles/{set}/…
 	imports        *importJobs       // background server-side bake jobs (POST /api/import)
+	jobsCtl        *jobLifecycle     // owns user-triggered import goroutines until server shutdown
 	bakeMu         sync.Mutex        // serializes bakes: two imports must not interleave cross-pack peer rewrites / shared context
 	bakeWG         sync.WaitGroup    // tracks the New-triggered self-heal bake goroutine so Close can drain it (its asset writes must not race a test/temp-dir teardown)
 	packsMu        sync.Mutex        // guards packs
@@ -82,6 +83,7 @@ func New(assetsDir, cacheDir, dataDir string, allowRemote bool, engineCommit str
 		allowRemote: allowRemote,
 		sets:        newTileSets(),
 		imports:     newImportJobs(),
+		jobsCtl:     newJobLifecycle(),
 		auxIdx:      newAuxIndex(),
 		cellIdx:     newCellIndex(dataDir),
 		clientIPs:   &ClientIPResolver{},
@@ -169,7 +171,16 @@ func (s *Server) rebakeMissingProviders() {
 func (s *Server) Close() error {
 	s.ready.Store(false)
 
+	if s.jobsCtl != nil {
+		s.jobsCtl.beginShutdown()
+	}
+	// Self-heal and user-triggered imports can both contend on bakeMu. Let the
+	// boot-time self-heal finish/release it, then drain cancelled user jobs before
+	// closing the tile registry they may register into.
 	s.bakeWG.Wait()
+	if s.jobsCtl != nil {
+		s.jobsCtl.wait()
+	}
 
 	if s.nmeaMgr != nil {
 		s.nmeaMgr.Close()
