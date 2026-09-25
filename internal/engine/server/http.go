@@ -360,6 +360,24 @@ func hostIsLocal(hostport string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// peerIsLoopback reports whether the TCP peer connected from loopback. This is
+// intentionally based on RemoteAddr, not X-Forwarded-For/CF-Connecting-IP: forwarded
+// headers are client-controlled unless a proxy trust chain is configured. It lets a
+// local reverse proxy such as cloudflared terminate a public hostname while the
+// chartplotter itself remains bound to 127.0.0.1.
+func peerIsLoopback(remoteAddr string) bool {
+	host := strings.TrimSpace(remoteAddr)
+	if host == "" {
+		return false
+	}
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSuffix(host, "]"), "["), ".")
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 const contentSecurityPolicy = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; connect-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; manifest-src 'self'; form-action 'self'"
 
 // setSecurityHeaders applies defence-in-depth headers to every response.
@@ -441,7 +459,11 @@ var chartHTTPClient = func() *http.Client {
 }()
 
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
-	if !s.allowRemote && !hostIsLocal(r.Host) {
+	// Loopback-only deployments are commonly exposed through a local reverse
+	// proxy (for example cloudflared). In that case the public Host is intentionally
+	// non-local, but the actual TCP peer is still loopback. Accept that topology
+	// without weakening the DNS-rebinding guard for direct remote connections.
+	if !s.allowRemote && !hostIsLocal(r.Host) && !peerIsLoopback(r.RemoteAddr) {
 		apiErr(w, http.StatusForbidden, "non-local host")
 		return
 	}
