@@ -6,11 +6,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -366,4 +368,45 @@ func auxStr(m map[string][]byte) map[string]string {
 		out[k] = ""
 	}
 	return out
+}
+
+
+func TestChunkedImportUploadAppendsByOffset(t *testing.T) {
+	s := New("", t.TempDir(), t.TempDir(), false, "")
+	defer s.Close()
+
+	do := func(offset int, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(
+			http.MethodPost,
+			fmt.Sprintf("http://127.0.0.1/api/import/upload?upload=abcdefgh1234&set=auto&offset=%d&final=0", offset),
+			strings.NewReader(body),
+		)
+		r.Host = "127.0.0.1"
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, r)
+		return w
+	}
+
+	if w := do(0, "abc"); w.Code != http.StatusOK {
+		t.Fatalf("first chunk status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w := do(3, "def"); w.Code != http.StatusOK {
+		t.Fatalf("second chunk status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w := do(2, "x"); w.Code != http.StatusConflict {
+		t.Fatalf("bad offset status=%d, want 409; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestValidImportUploadID(t *testing.T) {
+	for _, id := range []string{"abcdefgh", "A1_b-cdef", "0123456789abcdef"} {
+		if !validImportUploadID(id) {
+			t.Fatalf("valid id rejected: %q", id)
+		}
+	}
+	for _, id := range []string{"short", "../escape", "space bad", ""} {
+		if validImportUploadID(id) {
+			t.Fatalf("invalid id accepted: %q", id)
+		}
+	}
 }

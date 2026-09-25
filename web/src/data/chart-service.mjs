@@ -73,17 +73,55 @@ export class ChartService {
     return this.pollJob(job, opts);
   }
 
-  // POST /api/import?set=auto (multipart) — upload a whole ENC exchange-set zip;
-  // the server parses its CATALOG.031, names the pack from its identity, bakes it,
-  // and writes the metadata sidecar. Returns {job, set} (the server-derived name).
-  // `set` defaults to "auto"; pass a name to override.
+  // Upload an ENC exchange-set ZIP. Small files use the normal multipart route;
+  // larger files are sent as bounded raw chunks so Cloudflare Tunnel / reverse
+  // proxies never have to accept one giant request body. The server assembles the
+  // chunks on disk and runs the exact same staging/bake path on the final chunk.
   async importZip(file, { set = "auto" } = {}) {
+    const CHUNK_THRESHOLD = 8 * 1024 * 1024;
+    if (file && file.size > CHUNK_THRESHOLD) return this._importZipChunked(file, set);
+
     const form = new FormData();
     form.append("file", file, file.name || "upload.zip");
     const res = await fetch(this._url(`api/import?set=${encodeURIComponent(set)}`), { method: "POST", body: form });
     const j = await res.json().catch(() => ({}));
     if (!res.ok || !j.job) throw new Error(j.error || `import HTTP ${res.status}`);
     return j; // {ok, job, set}
+  }
+
+  async _importZipChunked(file, set) {
+    const CHUNK_BYTES = 8 * 1024 * 1024;
+    const upload = (globalThis.crypto && crypto.randomUUID)
+      ? crypto.randomUUID().replace(/-/g, "")
+      : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+
+    let offset = 0;
+    while (offset < file.size) {
+      const end = Math.min(file.size, offset + CHUNK_BYTES);
+      const final = end === file.size;
+      const q = new URLSearchParams({
+        upload,
+        set,
+        offset: String(offset),
+        final: final ? "1" : "0",
+      });
+      const res = await fetch(this._url("api/import/upload?" + q.toString()), {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: file.slice(offset, end),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j.error || `upload HTTP ${res.status}`);
+      if (final) {
+        if (!j.job) throw new Error(j.error || "upload completed without an import job");
+        return j;
+      }
+      if (Number(j.received) !== end) {
+        throw new Error(`upload offset mismatch: server=${j.received}, expected=${end}`);
+      }
+      offset = end;
+    }
+    throw new Error("empty ZIP upload");
   }
 
   // upload a zip and wait for the bake. Resolves with { status, set } so the

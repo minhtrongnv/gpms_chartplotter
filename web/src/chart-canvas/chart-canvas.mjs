@@ -181,22 +181,15 @@ export class ChartCanvas extends HTMLElement {
       try { return !new URLSearchParams(location.search).has("noScaminGate"); }
       catch (e) { return true; }
     })();
-    // SCAMIN merged mode is the DEFAULT: collapse the SCAMIN filter-gate/bucket
-    // layer explosion (~18 kinds × up to 33 SCAMIN values × N packs) down to ~1
-    // layer per kind by asking the engine for its MERGED zoom-expression gate
-    // (empty manifest → style.zig zoom_gate). That clause self-gates on the live
-    // zoom, so the entire client SCAMIN injection path (_scaminUpdate /
-    // _scaminApplySettled / _scaminForceWhenReady + the straggler sweep) is
-    // UNNECESSARY and disabled below — no setFilter, no source reload on zoom,
-    // which is what killed the "tiles crawl in a second after you stop scrolling"
-    // lag. Trade-off: integer-zoom snap (the clause steps at whole zoom levels, not
-    // the exact physical crossing) — imperceptible in practice since tiles are
-    // integer-zoom quantized anyway. Opt OUT to the exact per-value filter-gate
-    // (client-injected physical display denominator, no integer snap) with
-    // ?scaminexact — for side-by-side comparison or exact-declutter needs.
+    // Exact raw SCAMIN is the DEFAULT. The wheel now lands on discrete ECDIS
+    // viewing-scale stops, so the display denominator changes only when the camera
+    // commits a new semantic scale. That makes the exact feature.SCamin >= 1:N
+    // gate deterministic without the old continuous-zoom churn. The historical
+    // merged precomputed-vz path remains available only for A/B diagnosis via
+    // ?scaminmerged.
     this._scaminMerged = (() => {
-      try { return !new URLSearchParams(location.search).has("scaminexact"); }
-      catch (e) { return true; }
+      try { return new URLSearchParams(location.search).has("scaminmerged"); }
+      catch (e) { return false; }
     })();
     this._engineScaminValues = []; // SCAMIN ladder (from the set tilejson) — the crossing boundaries
     this._scaminBandLast = -1;     // last-applied band index (count of ladder values below curDenom)
@@ -472,12 +465,10 @@ export class ChartCanvas extends HTMLElement {
       // rAF (it rebuilds DOM, and _renderScalebar skips when the bar is unchanged
       // — which it usually is, since the bar only steps at zoom boundaries).
       if (!this._scalebarRaf) this._scalebarRaf = requestAnimationFrame(() => { this._scalebarRaf = 0; this._renderScalebar(); });
-      // While ZOOMING (only — pans wait for settle), a crossed ladder boundary
-      // applies at most every 500ms so a long continuous zoom doesn't render a
-      // stale cutoff all the way to moveend. _scaminUpdate early-returns when
-      // no boundary was crossed, so this is cheap per frame; the settle pass
-      // below still runs the final exact apply.
-      if (map.isZooming() && performance.now() - (this._scaminLastApply || 0) >= 500) this._scaminUpdate();
+      // Do not mutate SCAMIN while the camera is between semantic viewing-scale
+      // stops. The previous buckets stay visible during the short transition and
+      // the exact denominator is committed once at moveend below, preventing the
+      // chart/icon blink that a mid-animation source reload creates.
     });
     // SCAMIN filter-gate: apply ladder crossings only once the camera SETTLES.
     // Each setFilter on a gated layer forces MapLibre to re-parse every loaded

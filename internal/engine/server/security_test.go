@@ -62,6 +62,80 @@ func TestLoopbackHostGuardRejectsPrefixSpoof(t *testing.T) {
 	}
 }
 
+func TestPeerIsLoopback(t *testing.T) {
+	cases := []struct {
+		addr string
+		want bool
+	}{
+		{"127.0.0.1:50000", true},
+		{"[::1]:50000", true},
+		{"127.0.0.1", true},
+		{"192.168.1.10:50000", false},
+		{"203.0.113.10:50000", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := peerIsLoopback(tc.addr); got != tc.want {
+			t.Errorf("peerIsLoopback(%q) = %v, want %v", tc.addr, got, tc.want)
+		}
+	}
+}
+
+func TestLoopbackReverseProxyMayUsePublicHost(t *testing.T) {
+	s := New("", t.TempDir(), t.TempDir(), false, "")
+	defer s.Close()
+
+	r := httptest.NewRequest(http.MethodGet, "http://chartplotter.trongnguyenlabs.cloud/api/health", nil)
+	r.Host = "chartplotter.trongnguyenlabs.cloud"
+	r.RemoteAddr = "127.0.0.1:54321"
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("loopback reverse-proxy status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestConfiguredProxyPeerMayUsePublicHost(t *testing.T) {
+	s := New("", t.TempDir(), t.TempDir(), false, "")
+	defer s.Close()
+
+	resolver, err := NewClientIPResolver("172.18.0.0/16", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetClientIPResolver(resolver)
+
+	r := httptest.NewRequest(http.MethodGet, "http://chartplotter.trongnguyenlabs.cloud/api/health", nil)
+	r.Host = "chartplotter.trongnguyenlabs.cloud"
+	r.RemoteAddr = "172.18.0.5:54321"
+	r.Header.Set("CF-Connecting-IP", "203.0.113.20")
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("trusted reverse-proxy status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestPublicHostStillRejectedFromNonLoopbackPeer(t *testing.T) {
+	s := New("", t.TempDir(), t.TempDir(), false, "")
+	defer s.Close()
+
+	r := httptest.NewRequest(http.MethodGet, "http://chartplotter.trongnguyenlabs.cloud/api/health", nil)
+	r.Host = "chartplotter.trongnguyenlabs.cloud"
+	r.RemoteAddr = "192.168.1.50:54321"
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback public-host status = %d, want 403", w.Code)
+	}
+}
+
 func TestSSEHeadersDoNotAllowCrossOrigin(t *testing.T) {
 	w := httptest.NewRecorder()
 
