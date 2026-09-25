@@ -80,6 +80,17 @@ func NewClientIPResolver(
 //
 //   - Invalid/malformed proxy headers:
 //     fall back to RemoteAddr.
+// trustedPeer reports whether RemoteAddr belongs to an explicitly configured
+// reverse-proxy CIDR. It is deliberately based only on the TCP peer address; proxy
+// headers are not consulted here.
+func (c *ClientIPResolver) trustedPeer(remoteAddr string) bool {
+	if c == nil {
+		return false
+	}
+	ip, ok := remoteAddrIP(remoteAddr)
+	return ok && c.isTrustedProxy(ip)
+}
+
 func (c *ClientIPResolver) ClientIP(
 	r *http.Request,
 ) string {
