@@ -72,6 +72,57 @@ export function zoomForChartScale(scale, lat) {
   return zoomForScalePhysical(scale, lat, DEFAULT_PX_PITCH_MM);
 }
 
+// Canonical ECDIS/S-101 viewing-scale ladder (coarse -> fine). These are the
+// semantic camera stops: the user selects a viewing scale and MapLibre zoom is
+// derived from it. Feature visibility still uses each feature's raw SCAMIN /
+// scaleMinimum, which may sit between these stops (e.g. 259999 or 59999).
+export const ECDIS_DISPLAY_SCALES = Object.freeze([
+  10_000_000,
+  3_500_000,
+  1_500_000,
+  700_000,
+  350_000,
+  180_000,
+  90_000,
+  45_000,
+  22_000,
+  12_000,
+  8_000,
+  4_000,
+  3_000,
+  2_000,
+  1_000,
+]);
+
+// Nearest semantic viewing scale to an arbitrary physical denominator.
+export function nearestDisplayScale(denom, steps = ECDIS_DISPLAY_SCALES) {
+  const d = Number(denom);
+  if (!(d > 0) || !steps.length) return steps[steps.length - 1] || 1;
+  let best = steps[0], bestErr = Math.abs(Math.log(d / best));
+  for (let i = 1; i < steps.length; i++) {
+    const s = steps[i], err = Math.abs(Math.log(d / s));
+    if (err < bestErr) { best = s; bestErr = err; }
+  }
+  return best;
+}
+
+// Return the adjacent semantic scale. zoomingIn means a smaller denominator.
+// If the current camera is between stops, choose the first stop in the requested
+// direction rather than snapping backwards to the mathematically nearest one.
+export function stepDisplayScale(denom, zoomingIn, steps = ECDIS_DISPLAY_SCALES) {
+  const d = Number(denom);
+  if (!(d > 0) || !steps.length) return d;
+  const eps = 1e-6;
+  if (zoomingIn) {
+    for (const s of steps) if (s < d * (1 - eps)) return s;
+    return steps[steps.length - 1];
+  }
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const s = steps[i];
+    if (s > d * (1 + eps)) return s;
+  }
+  return steps[0];
+}
 // Finest physical chart scale we allow: don't magnify charts past
 // 1:MIN_DETAIL_SCALE. The live caller passes the calibrated screen pitch so the
 // limit is expressed in the same true 1:N coordinate as the HUD.
