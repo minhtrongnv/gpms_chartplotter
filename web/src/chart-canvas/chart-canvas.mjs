@@ -1508,6 +1508,27 @@ export class ChartCanvas extends HTMLElement {
   // Probe + adopt the engine style at boot: if /api/style.json serves one (a -tags tile57
   // backend), cache it + record the mariner it reflects. 501/error → Go path (no-op).
   async _initEngineStyle(setNames) {
+    // Live/server mode defaults to the SAME chart-layer expansion used by the
+    // working static demo: per-set sources + native fractional-minzoom SCAMIN
+    // buckets from each TileJSON manifest. The server still uses libtile57 for
+    // decode/bake/compose; only the final MapLibre layer expansion stays client-
+    // side so SCAMIN is a native minzoom, not a runtime setFilter mutation.
+    //
+    // ?engineStyle=1 is retained as an A/B escape hatch for the old server-engine
+    // style path while this behavior is validated.
+    if (this._sources && this._sources.server) {
+      let forceEngine = false;
+      try { forceEngine = new URLSearchParams(location.search).has("engineStyle"); } catch {}
+      if (!forceEngine) {
+        this._engineMode = false;
+        this._engineStyle = null;
+        this._engineSet = null;
+        this._engineSets = [];
+        this._engineScaminValues = [];
+        return;
+      }
+    }
+
     // libtile57 is the sole engine, so render ALL active packs from the engine style —
     // the server composes a multi-source style (one chart-<set> source per pack). The
     // ?set query is a CSV of the active sets; the server 404s only when nothing is
