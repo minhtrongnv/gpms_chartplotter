@@ -9,6 +9,15 @@ import (
 // live counterpart of a prebaked .pmtiles archive — no district bake; tiles are built as the
 // camera asks (a classify + one decode/clip or a decompress per tile). Serve is serialised
 // inside tile57.ComposeSource, so this satisfies TileSource with no extra locking.
+type PickedFeature = tile57.PickedFeature
+
+// FeatureQuerier is implemented by live tile57 compositors and is used only by
+// debug/inspection endpoints. Query itself is serialized inside tile57, so this
+// adds no synchronization to the normal tile hot path.
+type FeatureQuerier interface {
+	Query(lon, lat, zoom float64) ([]PickedFeature, error)
+}
+
 type Composer struct {
 	src  *tile57.ComposeSource
 	meta TileMeta
@@ -75,6 +84,13 @@ func (c *Composer) Tile(z uint8, x, y uint32) ([]byte, error) {
 // TileOwned is Tile plus the ownership flag (implements OwnershipTiler).
 func (c *Composer) TileOwned(z uint8, x, y uint32) (body []byte, owned bool, err error) {
 	return c.src.Tile(z, x, y)
+}
+
+// Query returns the composed S-52 pick at one point/zoom. Native tile57 also
+// prints its ownership explanation for the same call, which makes this useful for
+// diagnosing chart handoff without changing the render path.
+func (c *Composer) Query(lon, lat, zoom float64) ([]PickedFeature, error) {
+	return c.src.Query(lon, lat, zoom)
 }
 
 // Meta returns the compositor's display metadata (zoom range + coverage bounds).
