@@ -13,7 +13,6 @@ import {
   FLOOR_GIVE,
   scaleDenomPhysical,
   zoomForScalePhysical,
-  nearestDisplayScale,
   stepDisplayScale,
 } from "../lib/util.mjs";
 
@@ -63,8 +62,11 @@ export class WheelZoom {
     const pitch = this._getPxPitch();
 
     if (newGesture || dir !== this._lastDir || this._targetScale == null) {
-      const live = scaleDenomPhysical(map.getZoom(), center.lat, pitch);
-      this._targetScale = nearestDisplayScale(live);
+      // Re-base on the live physical denominator. If it sits between two
+      // canonical stops (initial load, pinch/flyTo, restored view), the first wheel
+      // action lands on the adjacent stop in the requested direction rather than
+      // skipping over it.
+      this._targetScale = scaleDenomPhysical(map.getZoom(), center.lat, pitch);
       this._accum = 0;
     }
     this._lastDir = dir;
