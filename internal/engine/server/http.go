@@ -463,7 +463,8 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	// proxy (for example cloudflared). In that case the public Host is intentionally
 	// non-local, but the actual TCP peer is still loopback. Accept that topology
 	// without weakening the DNS-rebinding guard for direct remote connections.
-	if !s.allowRemote && !hostIsLocal(r.Host) && !peerIsLoopback(r.RemoteAddr) {
+	trustedProxy := s.clientIPs != nil && s.clientIPs.trustedPeer(r.RemoteAddr)
+	if !s.allowRemote && !hostIsLocal(r.Host) && !peerIsLoopback(r.RemoteAddr) && !trustedProxy {
 		apiErr(w, http.StatusForbidden, "non-local host")
 		return
 	}
