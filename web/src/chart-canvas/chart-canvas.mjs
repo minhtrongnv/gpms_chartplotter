@@ -194,6 +194,7 @@ export class ChartCanvas extends HTMLElement {
     this._engineScaminValues = []; // SCAMIN ladder (from the set tilejson) — the crossing boundaries
     this._scaminBandLast = -1;     // last-applied band index (count of ladder values below curDenom)
     this._scaminApplyT = 0;        // settle timer for the deferred gate apply (see _scaminUpdate)
+    this._scaminZoomDirty = false;    // zoom changed physical 1:N; force exact gate at settle even if live TileJSON has no scamin[] manifest
     this._scaminLightApplied = false; // a mid-zoom LIGHT apply ran — the settle pass must do a real reload
     this._scaminLayersCache = null; this._chartLayerIdsCache = null; // cached ids of the gated chart layers (filter carries the scamin clause)
     this._layerBase = {};    // chart layer id → intrinsic (pre-category) filter
@@ -481,7 +482,16 @@ export class ChartCanvas extends HTMLElement {
     // the reload happens. movestart cancels a pending apply so a resumed
     // gesture never reloads underneath itself.
     map.on("movestart", () => clearTimeout(this._scaminApplyT));
-    map.on("moveend", () => this._scaminApplySettled(120));
+    // Live compositor TileJSON currently has no union scamin[] manifest, so ladder-
+    // crossing dedup alone cannot detect a 90k -> 45k zoom. Track zoom gestures
+    // explicitly and force one exact denominator commit after the camera settles.
+    // Pure pans keep the cheap boundary-dedup path and do not reload chart sources.
+    map.on("zoomstart", () => { this._scaminZoomDirty = true; });
+    map.on("moveend", () => {
+      const force = this._scaminZoomDirty;
+      this._scaminZoomDirty = false;
+      this._scaminApplySettled(120, force);
+    });
 
     // Surface MapLibre's own errors (style/source/tile/WebGL) to the console —
     // otherwise a failed texture upload is silent (renders black).
@@ -1794,14 +1804,14 @@ export class ChartCanvas extends HTMLElement {
   // mid-load when the timer fires (tiles streaming right after a zoom gesture),
   // _scaminUpdate's isStyleLoaded guard would silently drop the crossing — so poll
   // until the style is ready. movestart clears the timer (gesture resumed).
-  _scaminApplySettled(delay) {
+  _scaminApplySettled(delay, force = false) {
     clearTimeout(this._scaminApplyT);
     if (this._scaminMerged) return; // merged mode self-gates on zoom — no settle apply
     this._scaminApplyT = setTimeout(() => {
       const m = this._map;
       if (!this._scaminGate || !this._engineMode || !m) return;
       if (!m.isStyleLoaded || !m.isStyleLoaded()) { this._scaminApplySettled(250); return; }
-      this._scaminUpdate();
+      this._scaminUpdate(force);
     }, delay);
   }
 
