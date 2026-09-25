@@ -61,6 +61,7 @@ func newComposerFrom(src *tile57.ComposeSource) *Composer {
 			E:        m.East,
 			N:        m.North,
 			Gzipped:  false, // Serve returns decompressed MLT; the HTTP layer gzips on the wire
+			Scamin:    append([]uint32(nil), m.Scamin...),
 			TileType: "mlt",
 		},
 	}
