@@ -139,6 +139,10 @@ func (j *importJobs) runningFor(set string) bool {
 
 // handleImport routes the import endpoints (already past the /api host check).
 func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/api/import/upload" {
+		s.handleImportUploadChunk(w, r)
+		return
+	}
 	if r.URL.Path == "/api/import/status" {
 		s.importStatus(w, r)
 		return
