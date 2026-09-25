@@ -97,6 +97,29 @@ func TestLoopbackReverseProxyMayUsePublicHost(t *testing.T) {
 	}
 }
 
+func TestConfiguredProxyPeerMayUsePublicHost(t *testing.T) {
+	s := New("", t.TempDir(), t.TempDir(), false, "")
+	defer s.Close()
+
+	resolver, err := NewClientIPResolver("172.18.0.0/16", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetClientIPResolver(resolver)
+
+	r := httptest.NewRequest(http.MethodGet, "http://chartplotter.trongnguyenlabs.cloud/api/health", nil)
+	r.Host = "chartplotter.trongnguyenlabs.cloud"
+	r.RemoteAddr = "172.18.0.5:54321"
+	r.Header.Set("CF-Connecting-IP", "203.0.113.20")
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("trusted reverse-proxy status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestPublicHostStillRejectedFromNonLoopbackPeer(t *testing.T) {
 	s := New("", t.TempDir(), t.TempDir(), false, "")
 	defer s.Close()
