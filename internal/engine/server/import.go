@@ -344,6 +344,157 @@ func (s *Server) uniqueDistrict(provider, base string) string {
 	return base
 }
 
+const maxImportChunkBytes int64 = 16 << 20 // 16 MiB: comfortably below reverse-proxy upload caps
+
+func validImportUploadID(id string) bool {
+	if len(id) < 8 || len(id) > 80 {
+		return false
+	}
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// handleImportUploadChunk assembles a browser-selected ZIP from small same-origin
+// requests so Cloudflare/reverse proxies never receive one giant request body.
+func (s *Server) handleImportUploadChunk(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		apiErr(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+
+	q := r.URL.Query()
+	uploadID := q.Get("upload")
+	if !validImportUploadID(uploadID) {
+		apiErr(w, http.StatusBadRequest, "invalid upload id")
+		return
+	}
+
+	set := q.Get("set")
+	autoName := set == "" || set == "auto"
+	if !autoName && !isSetName(set) {
+		apiErr(w, http.StatusBadRequest, "set must be a valid name")
+		return
+	}
+
+	offset, err := strconv.ParseInt(q.Get("offset"), 10, 64)
+	if err != nil || offset < 0 || offset > maxImportBytes {
+		apiErr(w, http.StatusBadRequest, "invalid upload offset")
+		return
+	}
+	final := q.Get("final") == "1"
+	applyUpdates := q.Get("updates") != "0"
+
+	scratch, err := s.importScratchDir("user")
+	if err != nil {
+		apiErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	uploadPath := filepath.Join(scratch, "chunk-"+uploadID+".zip")
+
+	flags := os.O_CREATE | os.O_WRONLY
+	if offset == 0 {
+		flags |= os.O_TRUNC
+	} else {
+		flags |= os.O_APPEND
+	}
+	out, err := os.OpenFile(uploadPath, flags, 0o600)
+	if err != nil {
+		apiErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	stat, statErr := out.Stat()
+	if statErr != nil {
+		_ = out.Close()
+		apiErr(w, http.StatusInternalServerError, statErr.Error())
+		return
+	}
+	if stat.Size() != offset {
+		_ = out.Close()
+		apiErr(w, http.StatusConflict,
+			fmt.Sprintf("upload offset mismatch: server has %d bytes, client sent %d", stat.Size(), offset))
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxImportChunkBytes)
+	written, err := copyLimitedContext(r.Context(), out, r.Body, maxImportChunkBytes)
+	closeErr := out.Close()
+	if err != nil {
+		writeJSONBodyError(w, err)
+		return
+	}
+	if closeErr != nil {
+		apiErr(w, http.StatusInternalServerError, closeErr.Error())
+		return
+	}
+
+	total := offset + written
+	if total > maxImportBytes {
+		_ = os.Remove(uploadPath)
+		apiErr(w, http.StatusRequestEntityTooLarge, "import payload exceeds server limit")
+		return
+	}
+
+	if !final {
+		w.Header().Set("Content-Type", jsonCT)
+		fmt.Fprintf(w, `{"ok":true,"upload":%q,"received":%d}`, uploadID, total)
+		return
+	}
+
+	if total == 0 || !fileIsZip(uploadPath) {
+		_ = os.Remove(uploadPath)
+		apiErr(w, http.StatusBadRequest, "uploaded file is not a ZIP exchange set")
+		return
+	}
+
+	provider := "user"
+	if !autoName {
+		provider = providerOf(set)
+	}
+	stage, err := s.stageExchangeSetZip(r.Context(), uploadPath, provider, nil, applyUpdates)
+	if err != nil {
+		_ = os.Remove(uploadPath)
+		writeJSONBodyError(w, err)
+		return
+	}
+	defer os.RemoveAll(stage.dir)
+	_ = os.Remove(uploadPath)
+
+	if len(stage.stems) == 0 {
+		apiErr(w, http.StatusBadRequest, "no ENC base cells (.000) in input")
+		return
+	}
+	if autoName {
+		set = s.deriveUploadSetFromStems(stage.catalog, stage.stems)
+	}
+	provider = providerOf(set)
+	district := districtOf(set)
+	if district == "" {
+		district = provider
+	}
+	if err := s.commitStagedExchangeSet(r.Context(), provider, district, stage); err != nil {
+		apiErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	job, ok := s.startImportJob(provider, func(ctx context.Context, jobID string) {
+		s.runImport(ctx, jobID, provider)
+	})
+	if !ok {
+		apiErr(w, http.StatusServiceUnavailable, "server shutting down")
+		return
+	}
+	w.Header().Set("Content-Type", jsonCT)
+	w.WriteHeader(http.StatusAccepted)
+	fmt.Fprintf(w, `{"ok":true,"job":%q,"set":%q}`, job.ID, provider)
+}
+
 // importFetchReq is the JSON body of a server-side download+bake. Either zipURL
 // (one NOAA exchange-set/district zip the server fetches + extracts) or cells (a
 // list of per-cell NOAA zip URLs) supplies the cells; the server downloads them
