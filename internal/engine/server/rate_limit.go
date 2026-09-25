@@ -211,6 +211,12 @@ func classifyRateLimitedRequest(r *http.Request) rateLimitClass {
 	p := r.URL.Path
 
 	switch {
+	case r.Method == http.MethodPost && p == "/api/import/upload":
+		// Chunk requests are bounded (16 MiB) and sequential; treat them as ordinary
+		// mutations so a normal proxy-safe upload does not exhaust the expensive-job
+		// bucket before the final bake even starts.
+		return rateLimitMutation
+
 	case r.Method == http.MethodPost &&
 		(p == "/api/import" ||
 			p == "/api/import/packs" ||
