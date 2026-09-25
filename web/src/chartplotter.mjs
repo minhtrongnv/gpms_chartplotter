@@ -672,16 +672,15 @@ export class ChartPlotter extends HTMLElement {
       getPxPitch: () => this._pxPitch,
     });
 
-    // Scroll-wheel zoom: owns the wheel (native scrollZoom off) to give the band
-    // overscale cap a soft detent and the scale floor a small elastic stop. Reads
-    // the detent from the HUD; own-ship registers a follow anchor below.
+    // ECDIS-style viewing-scale wheel: each wheel step selects the adjacent
+    // canonical physical 1:N scale; MapLibre zoom is derived from that scale.
+    // The camera animates between stops while SCAMIN commits after moveend.
     this._wheelZoom = new WheelZoom({
       map,
-      // OpenCPN-style continuous zoom: do not park at the native chart scale.
-      // Overscale is still shown by the HUD, but the user may zoom through it.
       getDetent: () => null,
       getFloor: () => maxZoomForScaleFloor(map.getCenter().lat, this._pxPitch),
-      getAnchor: () => this._zoomAnchor(), // plugins contribute where zoom should anchor (vessel while following, else cursor)
+      getAnchor: () => this._zoomAnchor(), // vessel while following, otherwise cursor
+      getPxPitch: () => this._pxPitch,
     });
 
     // Compass / orientation control: a round button in the top-right group; tap to
